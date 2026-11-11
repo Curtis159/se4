@@ -1,0 +1,14 @@
+node_modules/
+build-*/
+**/build-*/
+**/node_modules/
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+**/push-private.env
+**/private/
+**/.tmp/
+.DS_Store
+Thumbs.db

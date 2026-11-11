@@ -1,0 +1,1 @@
+The OpenSE4 engine/browser integration is GPL-3.0. Original game artwork and rules data retain their original licenses. source/ contains the cumulative source overlay and build information.
