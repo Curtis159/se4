@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "runtime": "jsdom + actual standalone WASM worker; real native design commands",
+  "evidence": [
+    "Edit and Retrofit actions save an unbuilt prototype in place with researched components",
+    "obsolete, show/restore, cancel deletion and confirm deletion work through real native commands",
+    "queued design deletion is disabled; editing creates a separate revision without changing the queued original"
+  ]
+}

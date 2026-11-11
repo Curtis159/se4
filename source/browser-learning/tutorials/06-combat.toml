@@ -1,0 +1,29 @@
+# Browser adaptation of OpenSE4 learning topics; original sources retained upstream.
+title = "Strategic combat"
+summary = "Give attack orders and inspect automatic battle results."
+minutes = 15
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+starting_ships = ["Attack Ship", "Attack Ship"]
+[[step]]
+title = "Prepare"
+text = "This browser lesson uses strategic combat. Build and equip combat ships with weapons suited to their targets. All multiplayer combat resolves automatically."
+[[step]]
+title = "Find an opponent"
+text = "Select a combat ship and Explore until you meet another empire."
+done = { empires_met = 1 }
+[[step]]
+title = "Attack"
+text = "Select a combat ship, choose Attack, and tap a visible enemy ship or colony. The native engine checks the order and may ask before entering a hostile sector."
+done = { order = "attack" }
+[[step]]
+title = "Resolve"
+text = "End a turn. Ships travel toward their target; combat resolves when opposing forces meet."
+done = { turns_passed = 1 }
+[[step]]
+title = "Battle reports"
+text = "Open Log to inspect movement and combat reports. An armed ship is not guaranteed to win: design, defenses, damage and supplies matter."
+done = { window = "log" }

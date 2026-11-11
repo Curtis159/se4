@@ -1,0 +1,17 @@
+{
+  "passed": true,
+  "runtime": "local HTTP, actual compressed WASM worker and service-worker handlers; not visual browser/device QA",
+  "size": {
+    "totalBytes": 26336074,
+    "largestBytes": 2883845,
+    "files": 2062,
+    "indexBytes": 3453,
+    "engineCompression": "gzip chunks, browser DecompressionStream, SHA-256 verification"
+  },
+  "evidence": [
+    "engine gzip chunks download, decompress and verify SHA-256",
+    "same native campaign checksum as baseline engine",
+    "Hegemon conversion back to AI, genuine decisions without fallback",
+    "all offline assets cached; offline navigation and code retrieved"
+  ]
+}

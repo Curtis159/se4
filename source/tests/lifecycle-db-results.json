@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "runtime": "isolated PostgreSQL via PGlite, real migrations and RLS, no production deployment",
+  "evidence": [
+    "restored checkpoint and empire invitations",
+    "unauthorized delete/restore/cleanup denied",
+    "leave hides game and pauses; replacement resumes same save",
+    "host transfer required",
+    "end stops turns; export preserves campaign",
+    "delete cascades game data",
+    "one checkpoint replaced per handoff",
+    "90-day inactive and 30-day closed cleanup with at least seven days warning"
+  ]
+}

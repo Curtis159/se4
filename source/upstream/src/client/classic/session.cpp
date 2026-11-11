@@ -1,0 +1,1318 @@
+#include "client/classic/session.hpp"
+
+#include "client/app_settings.hpp"
+#include "client/classic/screens/setup_model.hpp"
+#include "client/classic/settings.hpp"
+#include "core/log.hpp"
+#include "game/ai.hpp"
+#include "game/classic_save.hpp"
+#include "game/diplomacy.hpp"
+#include "game/serialize.hpp"
+#include "game/setup.hpp"
+#include "game/players.hpp"
+#include "game/turn.hpp"
+#include "net/auth.hpp"
+#include "sdk/worker.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <exception>
+#include <format>
+#include <fstream>
+#include <map>
+#include <random>
+#include <string_view>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace opense4::client::classic {
+
+namespace {
+
+// Human players' statistics, history and log text files (spec 05 §3.4, §5,
+// §8 step 2; docs/spec/06 §6.1): the lines the engine made, in
+// History/plr_<N>_stats.txt, plr_<N>_events.txt and plr_<N>_log.txt. The
+// original keeps History/ in its installation; ours is in the user data
+// folder, and saves carry copies (copyHistoryNextTo, restoreHistoryFrom).
+// Statistics and history are appended, the history file opened only when
+// there is a line; the log copy is rewritten whenever the engine made it. A
+// new game's first turn starts the files afresh.
+void writePlayerRecords(const std::vector<game::score::PlayerRecords>& records) {
+    if (records.empty()) return;
+    std::error_code ec;
+    const std::filesystem::path dir = historyDir();
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        log::warn("Cannot create {}: {}", dir.string(), ec.message());
+        return;
+    }
+    // CR LF line ends on every platform, as the original's Windows text files
+    // (the log copy's are confirmed, docs/spec/06 §6.1; the others inferred),
+    // written in binary so that Linux and Windows give the same bytes.
+    auto write = [&](const std::filesystem::path& file, const std::vector<std::string>& lines, bool fresh) {
+        if (lines.empty()) {
+            if (fresh) std::filesystem::remove(file, ec);
+            return;
+        }
+        std::ofstream out(file, (fresh ? std::ios::trunc : std::ios::app) | std::ios::binary);
+        for (const std::string& line : lines) out << line << "\r\n";
+        if (!out) log::warn("Cannot write {}", file.string());
+    };
+    for (const game::score::PlayerRecords& rec : records) {
+        const bool fresh = rec.turn == 0;
+        write(dir / historyFileName(rec.empire, "stats.txt"), rec.statistics, fresh);
+        write(dir / historyFileName(rec.empire, "events.txt"), rec.history, fresh);
+        if (!rec.log.empty()) write(dir / historyFileName(rec.empire, "log.txt"), rec.log, true);
+        else if (fresh) std::filesystem::remove(dir / historyFileName(rec.empire, "log.txt"), ec);
+    }
+}
+
+std::string lowerPassword(std::string p) {
+    for (char& c : p)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return p;
+}
+
+} // namespace
+
+// A password as the sign-in windows compare it (spec 06 §1.2.1, confirmed:
+// binary): without the spaces (and other control characters) before and
+// after it, and for Login To Game in small letters.
+std::string trimPassword(std::string_view p) {
+    size_t a = 0, b = p.size();
+    while (a < b && static_cast<unsigned char>(p[a]) <= ' ') ++a;
+    while (b > a && static_cast<unsigned char>(p[b - 1]) <= ' ') --b;
+    return std::string(p.substr(a, b - a));
+}
+
+// The forms of a typed password to try against a stored hash, best first,
+// each once: OpenSE4 keeps only the hash of the password as it was set.
+std::vector<std::string> passwordForms(std::string_view typed, bool foldCase) {
+    std::vector<std::string> out;
+    auto add = [&](std::string p) {
+        if (std::find(out.begin(), out.end(), p) == out.end()) out.push_back(std::move(p));
+    };
+    const std::string trimmed = trimPassword(typed);
+    if (foldCase) add(lowerPassword(trimmed));
+    add(trimmed);
+    add(std::string(typed));
+    return out;
+}
+
+std::expected<bool, std::string> storedPasswordOpens(const std::string& stored, std::string_view typed, bool foldCase, bool verifier,
+                                                    uint64_t gameId) {
+    for (const std::string& form : passwordForms(typed, foldCase)) {
+        if (form.empty()) continue;
+        if (verifier) {
+            try {
+                if (net::checkPassword(stored, form, gameId)) return true;
+            } catch (const net::PasswordWorkError& error) {
+                return std::unexpected(std::string(error.what()));
+            }
+        } else if (game::hashPassword(form) == stored) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A simultaneous turn processed on a thread of its own (setBackground): the
+// engine works on a copy of the game, with the answers given so far; the
+// session takes the copy and the results when it is done (pollJob).
+struct ClassicSession::Job {
+    std::thread thread;
+    std::atomic<bool> finished{false};
+    std::atomic<int> stepsDone{0}, stepsTotal{0};
+    game::GameState state;
+    game::TurnResult result;
+    std::vector<game::MovementStep> steps;   // as the processing made them (only its thread writes them)
+    std::exception_ptr failure;
+};
+
+uint64_t ClassicSession::nextSessionSerial() {
+    static std::atomic<uint64_t> next{1};
+    return next++;
+}
+
+ClassicSession::ClassicSession(std::shared_ptr<const game::Rules> rules, game::GameState state, game::EmpireId player, SessionKind kind)
+    : rules_(std::move(rules)), state_(std::move(state)), player_(player), kind_(kind) {
+    ended_.assign(state_.empires.size(), 0);
+    // The game turn the session begins in has no autosave of its own: its
+    // first human turn may already be under way, and a game loaded from its
+    // autosave must not write it again (inferred).
+    autosavedTurn_ = state_.turn;
+    // A PBEM game file already holds the player's turn (loadPbemGame).
+    if (turnBased() && kind_ != SessionKind::NetworkClient && kind_ != SessionKind::Pbem) resumeTurnBased();
+    if (turnBased() && kind_ == SessionKind::NetworkClient) waiting_ = !myTurn();
+}
+
+std::unique_ptr<ClassicSession> ClassicSession::pbem(std::shared_ptr<const game::Rules> rules, PbemGame game, PbemTurn turn,
+                                                     std::filesystem::path draftsDir) {
+    const game::EmpireId player = turn.empire;
+    auto session = std::make_unique<ClassicSession>(std::move(rules), std::move(game.state), player, SessionKind::Pbem);
+    session->multiplayerGameId_ = turn.info.gameId;  // salts the passwords this session makes
+    session->pbem_ = std::move(turn);
+    session->pbemDrafts_ = std::move(draftsDir);
+    session->masterVerifier_ = game.info.masterPasswordVerifier;
+    session->waiting_ = session->turnBased() && !session->myTurn();
+    // A turn saved earlier: its commands again, in order (the game is the same, so they play the same).
+    if (!session->waiting_ && !session->pbemDrafts_.empty())
+        if (auto commands = readPbemDraft(*session->pbem_, session->pbemDrafts_)) {
+            for (game::Command& c : *commands) session->issue(std::move(c));
+            session->pbemResumed_ = commands->size();
+            session->strategic_.clear();  // battles of the replayed commands were seen when they were given
+        }
+    return session;
+}
+
+std::expected<std::filesystem::path, std::string> ClassicSession::savePbemDraft() const {
+    if (!pbem_) return std::unexpected(std::string("This is not a play-by-e-mail game."));
+    if (!ordersFile_.empty()) return std::unexpected(std::string("The orders of this turn are already saved for the host."));
+    if (pbemDrafts_.empty()) return std::unexpected(std::string("No folder to save the turn in."));
+    return writePbemDraft(*pbem_, pbemDrafts_, orders_);
+}
+
+bool ClassicSession::myTurn() const {
+    return turnBased() && !state_.gameOver && state_.playerTurn.started && state_.playerTurn.empire == player_;
+}
+
+const std::vector<game::EntryQuestion>& ClassicSession::questions() const {
+    static const std::vector<game::EntryQuestion> none;
+    if (!entryStop_.empty()) return entryStop_;
+    return myTurn() ? state_.playerTurn.questions : none;
+}
+
+void ClassicSession::record(game::Command c) {
+    // The Empire Options are replaced as a whole: only the last change counts.
+    if (std::holds_alternative<game::cmd::SetInterfaceOptions>(c))
+        std::erase_if(orders_, [](const game::Command& o) { return std::holds_alternative<game::cmd::SetInterfaceOptions>(o); });
+    orders_.push_back(std::move(c));
+}
+
+game::CommandResult ClassicSession::issue(game::Command c) {
+    // What the command changes is read before it runs (a disbanded fleet's members, say).
+    std::optional<Changed> changed;
+    bool minister = false;
+    if (marksChanges()) {
+        changed = changedBy(c);
+        minister = std::holds_alternative<game::cmd::SetMinister>(c);
+    }
+    std::optional<game::Command> copy;
+    if (onIssued) copy = c;
+    game::CommandResult r = issueCommand(std::move(c));
+    if (!r.ok) return r;
+    if (copy) onIssued(*copy);
+    if (changed) {
+        // Toggle Minister Control carries its own flag.
+        if (minister && switchedOwn_) {
+            flagged_.insert(flagged_.end(), changed->vehicles.begin(), changed->vehicles.end());
+            flaggedPlanets_.insert(flaggedPlanets_.end(), changed->planets.begin(), changed->planets.end());
+        }
+        markChanged(changed->vehicles, changed->planets);
+    }
+    return r;
+}
+
+// Which commands mark which objects changed this turn (spec 06 §7 Q99(d),
+// confirmed: binary): order lists (a fleet's: every member), fleet
+// membership, Change Name, Toggle Minister Control, Cloak and Decloak,
+// construction queues, colony types, the Scrap window's actions and Cargo
+// Transfer. Launching and recovering units are order lists here.
+ClassicSession::Changed ClassicSession::changedBy(const game::Command& c) const {
+    Changed out;
+    const game::GameState& s = state_;
+    auto fleet = [&](game::FleetId id) {
+        if (const game::Fleet* f = s.fleet(id)) out.vehicles.insert(out.vehicles.end(), f->members.begin(), f->members.end());
+    };
+    auto vehicle = [&](game::VehicleId id) {
+        if (id.valid()) out.vehicles.push_back(id);
+    };
+    auto planet = [&](game::ObjectId id) {
+        if (id.valid()) out.planets.push_back(id);
+    };
+    auto queue = [&](const game::cmd::QueueTarget& q) {
+        vehicle(q.vehicle);
+        planet(q.planet);
+    };
+    std::visit(
+        [&]<class T>(const T& x) {
+            using namespace game::cmd;
+            if constexpr (std::is_same_v<T, SetOrders>) {
+                vehicle(x.vehicle);
+                // A fleet's orders, given to the fleet or to a member: every member.
+                const game::Vehicle* addressed = x.vehicle.valid() ? s.vehicle(x.vehicle) : nullptr;
+                fleet(x.fleet.valid() ? x.fleet : addressed ? addressed->fleet : game::FleetId{});
+                planet(x.planet);
+            } else if constexpr (std::is_same_v<T, OrderTagged>) {
+                out.vehicles = game::taggedVehicles(s, player_, x.vehicles);
+            } else if constexpr (std::is_same_v<T, CloakVehicles>) {
+                out.vehicles = game::taggedVehicles(s, player_, x.vehicles);
+                if (const game::Fleet* f = s.fleet(x.fleet)) {
+                    const std::vector<game::VehicleId> group = game::fleetGroup(s, *f);
+                    out.vehicles.insert(out.vehicles.end(), group.begin(), group.end());
+                }
+            } else if constexpr (std::is_same_v<T, CreateFleet>) {
+                out.vehicles = x.members;
+            } else if constexpr (std::is_same_v<T, JoinFleet> || std::is_same_v<T, LeaveFleet> || std::is_same_v<T, Mothball> ||
+                                 std::is_same_v<T, Analyze> || std::is_same_v<T, SelfDestruct> || std::is_same_v<T, FireOn> ||
+                                 std::is_same_v<T, Retrofit>) {
+                vehicle(x.vehicle);
+            } else if constexpr (std::is_same_v<T, DisbandFleet>) {
+                fleet(x.fleet);
+            } else if constexpr (std::is_same_v<T, Scrap>) {
+                vehicle(x.vehicle);
+                planet(x.facilityPlanet);
+            } else if constexpr (std::is_same_v<T, Rename>) {
+                vehicle(x.vehicle);   // a fleet's new name marks no ship (the order button marks the selected one)
+                planet(x.planet);
+            } else if constexpr (std::is_same_v<T, SetMinister>) {
+                if (!x.empireWide) {
+                    vehicle(x.vehicle);
+                    if (const game::Fleet* f = s.fleet(x.fleet)) {
+                        const std::vector<game::VehicleId> group = game::fleetGroup(s, *f);   // those that get the flag
+                        out.vehicles.insert(out.vehicles.end(), group.begin(), group.end());
+                    }
+                    planet(x.planet);
+                }
+            } else if constexpr (std::is_same_v<T, QueueAdd> || std::is_same_v<T, QueueRemove> || std::is_same_v<T, QueueMove> ||
+                                 std::is_same_v<T, QueueSetCount> || std::is_same_v<T, QueueFlags> || std::is_same_v<T, QueueReplaceFacility>) {
+                queue(x.target);
+            } else if constexpr (std::is_same_v<T, SetColonyType> || std::is_same_v<T, CloakColony>) {
+                planet(x.planet);
+            } else if constexpr (std::is_same_v<T, TransferCargo>) {
+                vehicle(x.fromVehicle);
+                vehicle(x.toVehicle);
+                planet(x.fromPlanet);
+                planet(x.toPlanet);
+            }
+        },
+        c);
+    return out;
+}
+
+void ClassicSession::markChanged(std::span<const game::VehicleId> vehicles, std::span<const game::ObjectId> planets) {
+    if (!marksChanges()) return;
+    for (game::VehicleId id : vehicles)
+        if (std::find(changed_.begin(), changed_.end(), id) == changed_.end()) changed_.push_back(id);
+    for (game::ObjectId id : planets)
+        if (std::find(changedPlanets_.begin(), changedPlanets_.end(), id) == changedPlanets_.end()) changedPlanets_.push_back(id);
+    carryFlags();
+}
+
+// After a Players-window switch of our own empire on a player's copy, an
+// object changed this turn carries its minister flag to the host with the
+// orders (spec 06 §7 Q84, Q99(d), confirmed: binary), once.
+void ClassicSession::carryFlags() {
+    if (!switchedOwn_ || !marksChanges()) return;
+    // Each flag is noted as carried before it is issued: issuing marks again.
+    for (size_t i = 0; i < changed_.size(); ++i) {
+        const game::VehicleId id = changed_[i];
+        const game::Vehicle* v = state_.vehicle(id);
+        if (!v || v->owner != player_ || std::find(flagged_.begin(), flagged_.end(), id) != flagged_.end()) continue;
+        flagged_.push_back(id);
+        issue(game::cmd::SetMinister{id, {}, false, v->minister});
+    }
+    for (size_t i = 0; i < changedPlanets_.size(); ++i) {
+        const game::ObjectId id = changedPlanets_[i];
+        const game::Colony* col = state_.colony(id);
+        if (!col || col->owner != player_ || std::find(flaggedPlanets_.begin(), flaggedPlanets_.end(), id) != flaggedPlanets_.end()) continue;
+        flaggedPlanets_.push_back(id);
+        issue(game::cmd::SetMinister{{}, id, false, col->minister});
+    }
+}
+
+void ClassicSession::clearOrders() {
+    orders_.clear();
+    switchedOwn_ = false;
+    changed_.clear();
+    changedPlanets_.clear();
+    flagged_.clear();
+    flaggedPlanets_.clear();
+}
+
+game::CommandResult ClassicSession::issueCommand(game::Command c) {
+    if (waiting_ && kind_ == SessionKind::Pbem)
+        return game::CommandResult::fail(ordersFile_.empty() ? "It is not your turn." : "This turn's orders are saved; the turn is over here.");
+    if (waiting_) return game::CommandResult::fail("Waiting for the other players");
+    if (turnBased() && kind_ == SessionKind::NetworkClient) {
+        // The host carries the command out; our copy shows it at once and is
+        // replaced by the host's result when that arrives.
+        if (!myTurn()) return game::CommandResult::fail("It is not your turn.");
+        game::CommandResult r = game::apply(*rules_, state_, player_, c);
+        // As the engine does: an answer (even a refused one), or new orders, drop the group's question.
+        const size_t open = state_.playerTurn.questions.size();
+        game::dropSettledQuestions(state_, c, r.ok);
+        if (state_.playerTurn.questions.size() != open) ++revision_;
+        if (!r.ok) return r;
+        if (transport_) transport_->playCommand(c);
+        record(std::move(c));
+        ++revision_;
+        return r;
+    }
+    if (turnBased()) {
+        if (kind_ == SessionKind::Pbem && !myTurn()) return game::CommandResult::fail("It is not your turn.");
+        if (call_ != Call::None) return game::CommandResult::fail("A battle waits to be fought first.");
+        issued_ = {};
+        beginCall(Call::Issue, std::move(c));
+        // While a battle waits for its answer the order is under way; a refusal shows up as a notice.
+        return issued_;
+    }
+    if (call_ != Call::None) return game::CommandResult::fail("A battle waits to be fought first.");
+    game::CommandResult r = game::apply(*rules_, state_, player_, c);
+    if (r.ok) {
+        record(std::move(c));
+        ++revision_;
+    }
+    return r;
+}
+
+std::expected<std::string, std::string> ClassicSession::empirePasswordValue(std::string_view password) const {
+    if (password.empty()) return std::string{};
+    if (kind_ == SessionKind::NetworkClient || kind_ == SessionKind::Pbem || multiplayerGameId_ != 0) {
+        try {
+            return net::passwordVerifier(password, multiplayerGameId_);
+        } catch (const net::PasswordWorkError& e) {
+            return std::unexpected(std::string(e.what()));
+        }
+    }
+    return game::hashPassword(password);
+}
+
+std::expected<bool, std::string> ClassicSession::storedPasswordMatches(const std::string& stored, std::string_view password, bool foldCase) const {
+    const bool verifier = kind_ == SessionKind::NetworkClient || kind_ == SessionKind::Pbem || multiplayerGameId_ != 0;
+    return storedPasswordOpens(stored, password, foldCase, verifier, multiplayerGameId_);
+}
+
+bool ClassicSession::dataSetMatches() const { return savedDataSetMatches(loadedInfo_, *rules_); }
+
+bool savedDataSetMatches(const game::SaveInfo& info, const game::Rules& rules) {
+    if (info.dataSet.find('#') == std::string::npos) return true;
+    return game::sameDataSet(info, rules);
+}
+
+bool ClassicSession::passwordAsked(const game::Empire& e) const {
+    if (e.passwordHash.empty()) return false;
+    if (kind_ == SessionKind::NetworkClient || kind_ == SessionKind::Pbem || multiplayerGameId_ != 0) return true;
+    // "master" in every mix of capitals and small letters.
+    static const std::vector<std::string> masters = [] {
+        std::vector<std::string> out;
+        constexpr std::string_view word = "master";
+        for (unsigned bits = 0; bits < (1u << word.size()); ++bits) {
+            std::string w(word);
+            for (size_t i = 0; i < w.size(); ++i)
+                if ((bits >> i) & 1u) w[i] = static_cast<char>(w[i] - 'a' + 'A');
+            out.push_back(game::hashPassword(w));
+        }
+        return out;
+    }();
+    return std::find(masters.begin(), masters.end(), e.passwordHash) == masters.end();
+}
+
+std::expected<bool, std::string> ClassicSession::passwordMatches(const game::Empire& e, std::string_view password) const {
+    if (e.passwordHash.empty()) return true;
+    return storedPasswordMatches(e.passwordHash, password, false);
+}
+
+std::expected<bool, std::string> ClassicSession::loginPasswordMatches(const game::Empire& e, std::string_view password) const {
+    if (e.passwordHash.empty()) return true;
+    return storedPasswordMatches(e.passwordHash, password, true);
+}
+
+std::expected<bool, std::string> ClassicSession::masterLoginMatches(std::string_view password) const {
+    if (masterVerifier_.empty()) return trimPassword(password).empty();
+    for (const std::string& form : passwordForms(password, true)) {
+        if (form.empty()) continue;
+        try {
+            if (net::checkPassword(masterVerifier_, form, multiplayerGameId_)) return true;
+        } catch (const net::PasswordWorkError& e) {
+            return std::unexpected(std::string(e.what()));
+        }
+    }
+    return false;
+}
+
+void ClassicSession::answer(bool enter) {
+    if (!entryStop_.empty()) {
+        // The call stopped at the question: made again with the answer, it
+        // carries the group on (or fails its order) and then the rest of the
+        // turn's start (spec 03 §6.2, spec 06 §2.4).
+        if (call_ == Call::None) return;
+        entryStop_.clear();
+        game::BattleAnswer a;
+        a.enter = enter;
+        answers_.push_back(std::move(a));
+        runCall();
+        return;
+    }
+    if (questions().empty()) return;
+    const game::EntryQuestion q = questions().front();  // the answer drops it (applyLive, or issue() on a network copy)
+    issue(game::cmd::EnterSector{q.vehicle, q.fleet, q.where, enter, q.tagged});
+}
+
+std::vector<size_t> ClassicSession::takeStrategicBattles() {
+    std::vector<size_t> out;
+    for (const auto& [who, index] : std::exchange(strategic_, {}))
+        if (who == player_) out.push_back(index);
+    return out;
+}
+
+void ClassicSession::queueTurnBattles() {
+    if (turnBased() || !game::simultaneousBattlesShown(*rules_)) return;
+    for (size_t i = 0; i < state_.combats.size(); ++i) {
+        const auto& who = state_.combats[i].participants;
+        if (std::find(who.begin(), who.end(), player_) != who.end()) strategic_.emplace_back(player_, i);
+    }
+}
+
+void ClassicSession::takeResult(const game::TurnResult& result) {
+    notices_.clear();
+    for (const auto& [empire, text] : result.rejected)
+        if (empire == player_) notices_.push_back(text);
+}
+
+void ClassicSession::queueMoves(const game::TurnResult& res, bool turnStart, bool provisional) {
+    // The view follows only the local player's own groups, while its turn is
+    // in progress (spec 06 §2.7), and those groups' steps are the only ones
+    // the original animates (§2.4); the messages its own orders raise come
+    // in their place (spec 03 §8). Each LiveStep and message goes before the
+    // steps made after it (MovementStep::liveSteps, messages), and a message
+    // before the LiveSteps made after it (PlayerMessage::liveSteps).
+    // A call a battle stopped hands on what it made before the stop; the call
+    // made again with the answers makes the same again first, and only the
+    // rest is handed on then (queuedSteps_ and the rest).
+    const bool follows = turnBased() && myTurn();
+    size_t live = queuedLive_, said = queuedMessages_;
+    auto upTo = [&](size_t lives, size_t messages) {
+        for (;;) {
+            const bool nextLive = live < lives && live < res.liveSteps.size();
+            const bool nextMessage = said < messages && said < res.messages.size();
+            if (!nextLive && !nextMessage) return;
+            if (nextMessage && (!nextLive || res.messages[said].liveSteps <= live)) {
+                if (const game::PlayerMessage& m = res.messages[said]; follows && m.empire == player_)
+                    moves_.push_back(ShownMove{std::nullopt, std::nullopt, false, false, m, provisional});
+                ++said;
+            } else {
+                if (const game::LiveStep& st = res.liveSteps[live]; follows && st.empire == player_)
+                    moves_.push_back(ShownMove{std::nullopt, st, turnStart, true, std::nullopt, provisional});
+                ++live;
+            }
+        }
+    };
+    for (size_t i = queuedSteps_; i < callSteps_.size(); ++i) {
+        game::MovementStep& st = callSteps_[i];
+        upTo(st.liveSteps, st.messages);
+        const bool own = follows && st.owner == player_;
+        moves_.push_back(ShownMove{std::move(st), std::nullopt, false, own, std::nullopt, provisional});
+    }
+    upTo(res.liveSteps.size(), res.messages.size());
+    if (provisional) {
+        queuedSteps_ = callSteps_.size();
+        queuedLive_ = live;
+        queuedMessages_ = said;
+    } else {
+        forgetQueued();
+    }
+    callSteps_.clear();
+    // Nobody takes them in a session without a main window (tests, automation): only the newest are kept.
+    constexpr size_t kKept = 30'000;
+    if (moves_.size() > kKept) moves_.erase(moves_.begin(), moves_.begin() + std::ptrdiff_t(moves_.size() - kKept));
+}
+
+void ClassicSession::keepOwnVehicles(const game::GameState& before) {
+    // The human players' (hotseat: the session passes to the next one in the call).
+    callBefore_.clear();
+    for (const game::Vehicle& v : before.vehicles)
+        if (v.count > 0 && v.owner.valid() && v.owner.index() < before.empires.size() && before.empire(v.owner).kind == game::PlayerKind::Human)
+            callBefore_.push_back(v);
+}
+
+void ClassicSession::noteGone(const std::vector<game::MovementStep>& steps) {
+    // Where each one's last step took it.
+    std::map<game::VehicleId, game::Location> last;
+    for (const game::MovementStep& st : steps)
+        if (st.kind == game::MovementStep::Kind::Move)
+            for (const game::VehicleId id : st.members) last[id] = st.to;
+    for (game::Vehicle& v : callBefore_) {
+        const auto to = last.find(v.id);
+        if (v.owner != player_ || to == last.end()) continue;
+        if (const game::Vehicle* now = state_.vehicle(v.id); now && now->count > 0) continue;
+        v.location = to->second;
+        gone_.push_back(std::move(v));
+    }
+    callBefore_.clear();
+    // Nobody takes them in a session without a main window: only the newest are kept.
+    constexpr size_t kKept = 1'000;
+    if (gone_.size() > kKept) gone_.erase(gone_.begin(), gone_.begin() + std::ptrdiff_t(gone_.size() - kKept));
+}
+
+void ClassicSession::resumeTurnBased() { beginCall(Call::Resume); }
+
+// Network and PBEM games (the host's own player included, whose session is a
+// network client too) never stop: their host fights every battle at once
+// (docs/MULTIPLAYER.md).
+bool ClassicSession::showsBattles() const { return kind_ == SessionKind::Local || kind_ == SessionKind::Hotseat; }
+
+game::LiveOptions ClassicSession::liveOptions() {
+    game::LiveOptions o;
+    // OpenSE4's "Explain failed orders" (Options), for the orders this computer carries out.
+    o.explainFailedOrders = settings().explainFailedOrders;
+    // Local and hotseat games stop when no human is left (spec 06 §1.2.1).
+    o.endWithoutHumans = kind_ == SessionKind::Local || kind_ == SessionKind::Hotseat;
+    // The autosave: at the start of the first human player's turn of each new
+    // game turn, before that turn starts (spec 06 §6.1, confirmed: binary).
+    // A call that a battle stops is made again: the game turn's autosave is
+    // written once.
+    if (o.endWithoutHumans)
+        o.beforeHumanTurn = [this](const game::GameState& s) {
+            if (s.turn == autosavedTurn_) return;
+            autosavedTurn_ = s.turn;
+            autosaveOf(s);
+        };
+    return o;
+}
+
+bool ClassicSession::humansGone() const {
+    return (kind_ == SessionKind::Local || kind_ == SessionKind::Hotseat) && !game::ai::anyHumanLeft(state_);
+}
+
+std::expected<bool, std::string> ClassicSession::masterPasswordMatches(std::string_view password) const {
+    if (masterVerifier_.empty()) return false;
+    try {
+        return net::checkPassword(masterVerifier_, password, multiplayerGameId_);
+    } catch (const net::PasswordWorkError& e) {
+        return std::unexpected(std::string(e.what()));
+    }
+}
+
+void ClassicSession::setComputerControl(const std::vector<std::pair<game::EmpireId, bool>>& rows) {
+    // While a battle waits to be shown the game is as before the engine call,
+    // which is made again with the answers: who is human must not change
+    // meanwhile, or the call would stop at other battles than those answered.
+    if (call_ != Call::None) {
+        log::warn("Computer control is not changed while a battle waits to be fought");
+        return;
+    }
+    for (const auto& [empire, computer] : rows) {
+        if (!game::ai::setComputerControl(state_, empire, computer)) continue;
+        // A player's copy of a game on different machines: the orders carry the
+        // empire's own data always (its minister switches, its fleets with
+        // their flags), and of its ships, units and colonies only those changed
+        // this turn, with their flags; never the mark, and nothing about other
+        // empires (spec 06 §1.2.1, §7 Q84, confirmed: binary).
+        if ((kind_ == SessionKind::NetworkClient || kind_ == SessionKind::Pbem) && empire == player_) {
+            game::cmd::SetMinisters m;
+            m.areas = computer ? game::kAllMinisters : 0u;
+            m.fleets = computer;
+            issue(m);
+            issue(game::cmd::SetMinister{{}, {}, true, computer});
+            switchedOwn_ = true;
+            flagged_.clear();
+            flaggedPlanets_.clear();
+            carryFlags();   // the objects changed earlier this turn
+        }
+    }
+    // A second human makes a local game hotseat: End Turn then passes to the
+    // other humans before the turn is processed. A hotseat game stays one, so
+    // the humans left are still asked in turn.
+    if (kind_ == SessionKind::Local) {
+        const auto humans = std::count_if(state_.empires.begin(), state_.empires.end(),
+                                          [](const game::Empire& e) { return e.alive && e.kind == game::PlayerKind::Human; });
+        if (humans > 1) kind_ = SessionKind::Hotseat;
+    }
+    ended_.resize(state_.empires.size(), 0);
+    ++revision_;
+}
+
+void ClassicSession::beginCall(Call call, std::optional<game::Command> command) {
+    call_ = call;
+    forgetQueued();
+    callCommand_ = std::move(command);
+    callBattles_ = state_.combats.size();
+    answers_.clear();
+    fought_.clear();
+    battle_.reset();
+    entryStop_.clear();
+    noteMovesBefore(call);
+    runCall();
+}
+
+void ClassicSession::keepMovesBefore(bool keep) {
+    keepMoves_ = keep;
+    if (!keep) movesBefore_ = {};
+}
+
+void ClassicSession::noteMovesBefore(Call call) {
+    movesBefore_ = {};
+    if (!keepMoves_) return;
+    switch (call) {
+        case Call::Issue: {
+            // Only orders a group carries out at once (spec 03 §6.3, §8): the
+            // game with them given, not yet carried out.
+            if (!turnBased() || !callCommand_) return;
+            const game::Command& c = *callCommand_;
+            const auto* orders = std::get_if<game::cmd::SetOrders>(&c);
+            const bool moves = (orders && (orders->vehicle.valid() || orders->fleet.valid())) || std::holds_alternative<game::cmd::OrderTagged>(c) ||
+                               std::holds_alternative<game::cmd::EnterSector>(c);
+            if (!moves) return;
+            auto given = std::make_shared<game::GameState>(state_);
+            (void)game::apply(*rules_, *given, player_, c);
+            movesBefore_.state = std::move(given);
+            break;
+        }
+        case Call::EndTurn:
+        case Call::Resume:
+            // The next human's turn starts in it: its vehicles get their movement back, then carry their orders out.
+            movesBefore_.state = std::make_shared<const game::GameState>(state_);
+            movesBefore_.turnStart = true;
+            break;
+        case Call::Process: movesBefore_.state = turnStart_; break;
+        case Call::None: break;
+    }
+}
+
+ClassicSession::~ClassicSession() {
+    // A turn being processed cannot be stopped: it is waited for, and dropped.
+    if (job_ && job_->thread.joinable()) job_->thread.join();
+}
+
+std::pair<int, int> ClassicSession::progress() const {
+    if (!job_) return {0, 0};
+    return {job_->stepsDone.load(), job_->stepsTotal.load()};
+}
+
+void ClassicSession::startJob(const std::vector<game::BattleAnswer>* answers) {
+    auto job = std::make_unique<Job>();
+    job->state = state_;
+    Job* j = job.get();
+    std::shared_ptr<const game::Rules> rules = rules_;
+    std::vector<game::EmpireOrders> orders = callOrders_;
+    std::optional<std::vector<game::BattleAnswer>> given;
+    if (answers) given = *answers;
+    const bool explain = settings().explainFailedOrders;   // read here: the settings belong to this thread
+    job->thread = std::thread([j, rules = std::move(rules), orders = std::move(orders), given = std::move(given), explain] {
+        try {
+            // The engine's frames on a stack as large as the script players' own.
+            sdk::Worker worker;
+            worker.run([&] {
+                game::TurnOptions options;
+                options.battles = given ? &*given : nullptr;
+                options.progress = [j](int done, int total) {
+                    j->stepsTotal.store(total);
+                    j->stepsDone.store(done);
+                };
+                options.movementStep = [j](const game::MovementStep& st) { j->steps.push_back(st); };
+                options.explainFailedOrders = explain;
+                j->result = game::processTurn(*rules, j->state, orders, options);
+            });
+        } catch (...) {
+            j->failure = std::current_exception();
+        }
+        j->finished.store(true, std::memory_order_release);
+    });
+    job_ = std::move(job);
+}
+
+void ClassicSession::pollJob() {
+    if (!job_ || !job_->finished.load(std::memory_order_acquire)) return;
+    std::unique_ptr<Job> job = std::move(job_);
+    job->thread.join();
+    if (job->failure) {
+        std::string why = "an unknown exception";
+        try {
+            std::rethrow_exception(job->failure);
+        } catch (const std::exception& e) {
+            why = e.what();
+        } catch (...) {
+        }
+        dropCall(why);
+        std::rethrow_exception(job->failure);
+    }
+    // A battle that stops the processing leaves the game as it was: the copy goes.
+    if (!job->result.battle) keepOwnVehicles(state_);
+    if (!job->result.battle) state_ = std::move(job->state);
+    // A battle's stop: the steps made before it, shown up to the battle.
+    callSteps_ = std::move(job->steps);
+    finishCall(std::move(job->result));
+}
+
+void ClassicSession::runCall() {
+    const std::vector<game::BattleAnswer>* answers = showsBattles() ? &answers_ : nullptr;
+    // The call is made again after each battle's answer: its steps from the start.
+    callSteps_.clear();
+    if (call_ == Call::Process && background_) {
+        ++engineCalls_;
+        startJob(answers);
+        return;
+    }
+    game::TurnResult res;
+    if (call_ != Call::None) ++engineCalls_;
+    keepOwnVehicles(state_);
+    const game::MovementObserver observe = [this](const game::MovementStep& st) { callSteps_.push_back(st); };
+    auto live = [&] {
+        game::LiveOptions o = liveOptions();
+        o.movementStep = observe;
+        return o;
+    };
+    try {
+        switch (call_) {
+            case Call::Issue:
+                res = game::applyLive(*rules_, state_, player_, *callCommand_, answers, observe, settings().explainFailedOrders);
+                break;
+            case Call::EndTurn: res = game::endPlayerTurn(*rules_, state_, player_, live(), answers); break;
+            case Call::Resume: res = game::resumeTurnBased(*rules_, state_, live(), answers); break;
+            case Call::Process: {
+                game::TurnOptions options;
+                options.battles = answers;
+                options.movementStep = observe;
+                options.explainFailedOrders = settings().explainFailedOrders;
+                res = game::processTurn(*rules_, state_, callOrders_, options);
+                break;
+            }
+            case Call::None: return;
+        }
+    } catch (const std::exception& e) {
+        dropCall(e.what());
+        throw;
+    } catch (...) {
+        dropCall("an unknown exception");
+        throw;
+    }
+    finishCall(std::move(res));
+}
+
+void ClassicSession::finishCall(game::TurnResult res) {
+    ++revision_;
+    if (res.battle) {
+        // The game is as before the call; its steps come again with the
+        // answer. Those made before the stop are shown up to the battle first
+        // (spec 06 §2.4 "Order"), and the call made again hands on the rest.
+        queueMoves(res, call_ == Call::EndTurn || call_ == Call::Resume, true);
+        callBefore_.clear();
+        if (res.battle->kind == game::BattleQuestion::Kind::Enter && res.battle->entry) {
+            // The Attack Sector question at the start of the player's turn: asked now (questions()).
+            entryStop_ = {*res.battle->entry};
+            log::info("The Attack Sector question for system {} ({}, {}) stops the turn's start", res.battle->where.system.value,
+                      res.battle->where.sector.x, res.battle->where.sector.y);
+            return;
+        }
+        // The call stopped at a battle (or ground fight) to show; the game is as it was.
+        battle_ = std::move(res.battle);
+        log::info("A battle at system {} ({}, {}) stops the turn to be shown ({} human side(s))", battle_->where.system.value,
+                  battle_->where.sector.x, battle_->where.sector.y, battle_->humans.size());
+        return;
+    }
+    const Call call = std::exchange(call_, Call::None);
+    if (kind_ == SessionKind::Local || kind_ == SessionKind::Hotseat) writePlayerRecords(res.records);
+    // The battles fought in the Tactical Combat window must have come out the
+    // same here. Searched in the whole list: a call that ends the game turn
+    // drops the battles of the turn before (GameState::combats), so the new
+    // ones need not start at the old length.
+    for (const game::CombatRecord& fought : fought_) {
+        const auto same = [&](const game::CombatRecord& r) {
+            return r.location == fought.location && r.turn == fought.turn && r.summary == fought.summary && r.pieces.size() == fought.pieces.size() &&
+                   r.events.size() == fought.events.size();
+        };
+        if (std::none_of(state_.combats.begin(), state_.combats.end(), same))
+            log::warn("The tactical battle at system {} came out differently in the game", fought.location.system.value);
+    }
+    fought_.clear();
+    const bool answered = !answers_.empty();
+    answers_.clear();
+    // A PBEM game never stops: the battles the player's order started are
+    // shown afterwards (spec 06 §1.10.5, "different machines"). Local and
+    // hotseat games showed theirs as they happened. The PBEM copy is the
+    // player's own view, so its battles are a preview: the host fights them
+    // again with the whole game (docs/MULTIPLAYER.md, "Play by e-mail").
+    if (kind_ == SessionKind::Pbem && call == Call::Issue)
+        for (size_t i = std::min(callBattles_, state_.combats.size()); i < state_.combats.size(); ++i) {
+            const auto& who = state_.combats[i].participants;
+            if (std::find(who.begin(), who.end(), player_) != who.end()) strategic_.emplace_back(player_, i);
+        }
+    auto nextHuman = [&] {
+        // The session belongs to the human whose turn it is (hotseat: the next one).
+        if (const game::EmpireId e = game::activePlayer(state_); e.valid() && state_.empire(e).kind == game::PlayerKind::Human) player_ = e;
+    };
+    switch (call) {
+        case Call::Issue: {
+            // Attack Sector questions stay in the game (GameState::playerTurn.questions).
+            // PBEM: the host replays every command given, refused ones too (a
+            // refused answer still settles its question), so all are kept.
+            if (kind_ == SessionKind::Pbem) record(*callCommand_);
+            if (!res.rejected.empty()) {
+                issued_ = game::CommandResult::fail(res.rejected.front().second);
+                if (answered) notices_.push_back(res.rejected.front().second);
+            } else {
+                if (kind_ != SessionKind::Pbem) record(std::move(*callCommand_));
+                issued_ = {};
+            }
+            break;
+        }
+        case Call::EndTurn:
+            nextHuman();
+            takeResult(res);
+            clearOrders();
+            waiting_ = false;
+            if (onNewTurn) onNewTurn();
+            break;
+        case Call::Resume:
+            nextHuman();
+            takeResult(res);
+            break;
+        case Call::Process:
+            // A simultaneous turn: the new turn begins for the first human.
+            writePlayerRecords(res.records);
+            strategic_.clear();
+            takeResult(res);
+            if (kind_ == SessionKind::Hotseat)
+                for (const game::Empire& e : state_.empires)
+                    if (e.alive && e.kind == game::PlayerKind::Human) {
+                        setPlayer(e.id);
+                        break;
+                    }
+            callOrders_.clear();
+            autosave();
+            beginTurn();
+            break;
+        case Call::None: break;
+    }
+    // The moves to show, once the session belongs to the player whose turn it is.
+    noteGone(callSteps_);
+    queueMoves(res, call == Call::EndTurn || call == Call::Resume);
+    callCommand_.reset();
+    movesBefore_.revision = revision_;
+}
+
+void ClassicSession::dropCall(std::string_view why) {
+    log::error("The game could not go on ({}): it stays as it was before the {}", why,
+               call_ == Call::Issue ? "order" : call_ == Call::Resume ? "computer players' turns" : "turn was ended");
+    // processTurn keeps no copy of its own when no battle can stop it.
+    if (call_ == Call::Process && turnStart_) state_ = *turnStart_;
+    call_ = Call::None;
+    movesBefore_ = {};
+    callSteps_.clear();
+    callBefore_.clear();
+    forgetQueued();
+    callCommand_.reset();
+    callOrders_.clear();
+    answers_.clear();
+    fought_.clear();
+    battle_.reset();
+    entryStop_.clear();
+    if (tactical_ && tactical_->kind == TacticalFight::Kind::Game) tactical_.reset();
+    ++revision_;
+}
+
+void ClassicSession::answerBattle(game::BattleAnswer answer) {
+    if (!battle_ || call_ == Call::None) return;
+    answers_.push_back(std::move(answer));
+    battle_.reset();
+    entryStop_.clear();
+    runCall();
+}
+
+void ClassicSession::startTactical(TacticalFight fight) { tactical_ = std::make_unique<TacticalFight>(std::move(fight)); }
+
+void ClassicSession::endTactical() {
+    if (!tactical_) return;
+    std::unique_ptr<TacticalFight> fight = std::move(tactical_);
+    if (fight->kind != TacticalFight::Kind::Game || !fight->battle) return;
+    // Phases left are played by the strategies, as a script that runs out does.
+    fight->battle->finish();
+    fought_.push_back(fight->battle->record());
+    // Fought by hand, or by the strategies while the Strategic Combat window
+    // showed it; the script players' answers, when the window asked them, so
+    // that the battle is fought again with them (docs/sdk/ai-protocol.md §8).
+    std::optional<std::vector<game::JournalEntry>> decisions;
+    if (fight->scriptPlayers) decisions = fight->battle->decisions();
+    game::BattleAnswer answer{fight->players, fight->battle->script(), std::move(decisions)};
+    // The window's players let go of the script runtime (one per program)
+    // before the call made again asks the players: the battle first, then them.
+    fight.reset();
+    answerBattle(std::move(answer));
+}
+
+void ClassicSession::endTurn() {
+    if (waiting_ || call_ != Call::None) return;
+    if (kind_ == SessionKind::Pbem) {
+        // The host processes the turn: write the orders file for it and wait.
+        if (!pbem_ || (turnBased() && !myTurn())) return;
+        auto file = writePbemOrders(*pbem_, orders_);
+        if (!file) {
+            pbemError_ = file.error();
+            log::warn("PBEM: {}", pbemError_);
+            return;
+        }
+        pbemError_.clear();
+        ordersFile_ = *file;
+        waiting_ = true;
+        if (!pbemDrafts_.empty()) removePbemDraft(*pbem_, pbemDrafts_);
+        ++revision_;
+        return;
+    }
+    if (turnBased() && kind_ == SessionKind::NetworkClient) {
+        if (!myTurn()) return;
+        if (transport_) transport_->endPlayerTurn();
+        waiting_ = true;
+        return;
+    }
+    if (turnBased()) {
+        // The player's end-of-turn processing; the computer players' turns;
+        // then the next human's turn starts (after any battles shown).
+        beginCall(Call::EndTurn);
+        return;
+    }
+    if (kind_ == SessionKind::NetworkClient) {
+        if (transport_) transport_->submitOrders(game::EmpireOrders{player_, state_.turn, orders_});
+        waiting_ = true;
+        return;
+    }
+    // The game has ended for lack of humans: no further turn (spec 06 §1.2.1).
+    if (humansGone()) return;
+    if (kind_ == SessionKind::Hotseat) {
+        ended_[player_.index()] = 1;
+        for (const game::Empire& e : state_.empires)
+            if (e.alive && e.kind == game::PlayerKind::Human && !ended_[e.id.index()]) {
+                setPlayer(e.id);
+                clearOrders();
+                reloadGame();
+                ++revision_;
+                return;
+            }
+    }
+    // The original reloads the game file between hotseat players and before
+    // processing the turn (spec 01 §6.9, §14 Q44).
+    reloadGame();
+    // Every human's orders are already applied to this state; an empty list
+    // marks them as submitted so the computer does not play for them. The
+    // turn stops at each battle the Settings show (game::TurnOptions::battles).
+    callOrders_.clear();
+    for (const game::Empire& e : state_.empires)
+        if (e.alive && e.kind == game::PlayerKind::Human) callOrders_.push_back({e.id, state_.turn, {}});
+    // Kept for the movement log replay (docs/spec/06 §7 Q51): played again
+    // without stops, the turn comes out as it does with the battles shown.
+    turnStart_ = std::make_shared<const game::GameState>(state_);
+    turnStartOrders_ = callOrders_;
+    beginCall(Call::Process);
+}
+
+std::optional<std::filesystem::path> ClassicSession::autosave() { return autosaveOf(state_); }
+
+std::optional<std::filesystem::path> ClassicSession::autosaveOf(const game::GameState& s) {
+    if (kind_ == SessionKind::NetworkClient || kind_ == SessionKind::Pbem) return std::nullopt;  // the host keeps the game
+    const auto name = setup::autosaveName(s.options.autosaveTurns, s.turn);
+    if (!name) return std::nullopt;
+    const std::filesystem::path file = savesDir() / (*name + ".gam");
+    if (auto saved = saveState(file, *name, s, true); !saved) {
+        autosaveNote_ = std::format("Autosave failed: {}", saved.error());
+        log::warn("{}", autosaveNote_);
+        return std::nullopt;
+    }
+    copyHistoryNextTo(file);
+    autosaveNote_ = std::format("Saved as {}", *name);
+    return file;
+}
+
+void ClassicSession::poll() {
+    pollJob();
+    if (!transport_) return;
+    auto s = transport_->pollState();
+    if (!s) return;
+    if (!game::turnBased(*s)) {
+        if (s->turn == state_.turn) {
+            // The host sent this turn's game again (our copy differed from
+            // its, a desync): our orders so far go onto the new copy, and an
+            // End Turn already given stays given.
+            state_ = std::move(*s);
+            std::vector<game::Command> again = std::exchange(orders_, {});
+            for (game::Command& c : again)
+                if (game::apply(*rules_, state_, player_, c).ok) record(std::move(c));
+            ++revision_;
+            return;
+        }
+        // Our copy as it was is what the turn's moves began from (movesBefore).
+        auto before = keepMoves_ ? std::make_shared<const game::GameState>(std::move(state_)) : nullptr;
+        state_ = std::move(*s);
+        strategic_.clear();
+        queueTurnBattles();
+        beginTurn();
+        movesBefore_ = before ? MovesBefore{std::move(before), false, revision_} : MovesBefore{};
+        return;
+    }
+    // Turn-based: the host's state after our commands, a battle we fought in
+    // another player's turn, or the turn passing on.
+    const bool wasMine = myTurn();
+    const uint32_t oldTurn = state_.turn;
+    const size_t oldBattles = state_.combats.size();
+    keepOwnVehicles(state_);
+    auto before = keepMoves_ ? std::make_shared<const game::GameState>(std::move(state_)) : nullptr;
+    state_ = std::move(*s);
+    ++revision_;
+    if (state_.turn == oldTurn)
+        for (size_t i = oldBattles; i < state_.combats.size(); ++i) {
+            const auto& who = state_.combats[i].participants;
+            if (std::find(who.begin(), who.end(), player_) != who.end()) strategic_.emplace_back(player_, i);
+        }
+    const bool mine = myTurn();
+    const bool starts = mine && (!wasMine || state_.turn != oldTurn);
+    if (starts) beginTurn();  // our turn starts
+    waiting_ = !mine;
+    // Our own moves the host carried out, for their animation (protocol 10):
+    // our commands', or our turn start's (spec 06 §2.4).
+    net::OwnMoves own = transport_->takeOwnMoves();
+    noteGone(own.steps);
+    callSteps_ = std::move(own.steps);
+    game::TurnResult carried;
+    carried.liveSteps = std::move(own.liveSteps);
+    queueMoves(carried, starts);
+    // Our copy had our commands given, not carried out; at the start of our
+    // turn our vehicles got their movement back first.
+    movesBefore_ = before ? MovesBefore{std::move(before), starts, revision_} : MovesBefore{};
+}
+
+void ClassicSession::beginTurn() {
+    clearOrders();
+    ended_.assign(state_.empires.size(), 0);
+    waiting_ = false;
+    ++revision_;
+    if (onNewTurn) onNewTurn();
+}
+
+bool ClassicSession::setAutosaveTurns(int everyTurns) {
+    if (kind_ == SessionKind::NetworkClient || kind_ == SessionKind::Pbem) return false;
+    if (std::find(setup::kAutosaveTurns.begin(), setup::kAutosaveTurns.end(), everyTurns) == setup::kAutosaveTurns.end()) return false;
+    state_.options.autosaveTurns = everyTurns;
+    ++revision_;
+    return true;
+}
+
+bool ClassicSession::replayLastTurn(const std::function<void(int day, const game::GameState&)>& day,
+                                    const std::function<void(const game::MovementStep&)>& step) const {
+    if (!turnStart_) return false;
+    game::GameState again = *turnStart_;
+    // The computer players give the answers they gave (docs/sdk/ai-protocol.md §8).
+    game::replayJournal(again, state_);
+    game::TurnOptions options;
+    options.movementDay = day;
+    options.movementStep = step;
+    options.explainFailedOrders = settings().explainFailedOrders;
+    game::processTurn(*rules_, again, turnStartOrders_, options);
+    return true;
+}
+
+void ClassicSession::reloadGame() {
+    game::diplomacy::recalculateColonies(*rules_, state_);
+    state_.pendingMood.clear();
+    // Nor are the computer players' demand lists in the game file (spec 05 §7.4, question 83).
+    game::ai::forgetUnsavedLists(state_);
+    // Loading disbands the fleets left without a member (spec 03 §9; game::loadGame).
+    state_.tidyFleets(false);
+}
+
+void ClassicSession::setPlayer(game::EmpireId e) {
+    player_ = e;
+    ++revision_;
+}
+
+void ClassicSession::replaceState(game::GameState s) {
+    if (job_) {
+        // A turn processed in the background is dropped with the game it was for.
+        if (job_->thread.joinable()) job_->thread.join();
+        job_.reset();
+    }
+    state_ = std::move(s);
+    turnStart_.reset();
+    movesBefore_ = {};
+    callSteps_.clear();
+    callBefore_.clear();
+    forgetQueued();
+    gone_.clear();
+    moves_.clear();   // the moves of the game it replaces
+    strategic_.clear();
+    call_ = Call::None;
+    battle_.reset();
+    entryStop_.clear();
+    answers_.clear();
+    callOrders_.clear();
+    tactical_.reset();
+    if (turnBased() && kind_ != SessionKind::NetworkClient && kind_ != SessionKind::Pbem) resumeTurnBased();
+    beginTurn();
+}
+
+void ClassicSession::simulateTurns(int n) {
+    if (kind_ == SessionKind::Pbem) return;  // only the host plays PBEM turns
+    // A turn-based game plays whole game turns the same way (processTurn).
+    game::TurnOptions options;
+    options.explainFailedOrders = settings().explainFailedOrders;
+    for (int i = 0; i < n && !state_.gameOver; ++i) {
+        const game::TurnResult result = game::processTurn(*rules_, state_, {}, options);
+        if (kind_ != SessionKind::NetworkClient) writePlayerRecords(result.records);
+    }
+    if (n > 0 && turnBased() && kind_ != SessionKind::NetworkClient) resumeTurnBased();
+    if (n > 0) beginTurn();
+}
+
+std::expected<void, std::string> ClassicSession::save(const std::filesystem::path& file, const std::string& gameName) const {
+    return saveState(file, gameName, state_, false);
+}
+
+std::expected<void, std::string> ClassicSession::saveState(const std::filesystem::path& file, const std::string& gameName, const game::GameState& s,
+                                                           bool autosave) const {
+    game::SaveInfo info;
+    info.gameName = gameName;
+    info.gameId = multiplayerGameId_;  // a network or PBEM game stays one: its passwords are verifiers
+    info.masterPasswordVerifier = masterVerifier_;
+    info.dataSet = rules_->data().dataDir.parent_path().filename().string();
+    info.turn = s.turn;
+    info.autosave = autosave;
+    for (const game::Empire& e : s.empires) info.empires.push_back(e.name);
+    auto saved = game::saveGame(file, s, info);
+    // Every game saved, Save Game and every autosave alike, becomes the one
+    // Resume Game loads (docs/spec/06 §6.1, §7 Q53).
+    if (saved) rememberSavedGame(file.string());
+    return saved;
+}
+
+namespace {
+
+// Writes what an import or export approximated to the log file.
+void logReport(std::string_view what, const std::filesystem::path& file, const game::classic::ConversionReport& report) {
+    log::info("{} {}", what, file.string());
+    for (const std::string& n : report.notes) log::info("  {}", n);
+    for (const std::string& d : report.details) log::info("  detail: {}", d);
+}
+
+} // namespace
+
+std::expected<std::vector<std::string>, std::string> ClassicSession::exportClassic(const std::filesystem::path& file, std::vector<std::string> scriptedMods,
+                                                                                   std::function<bool(std::string_view)> installHasPicture) const {
+    if (kind_ != SessionKind::Local && kind_ != SessionKind::Hotseat)
+        return std::unexpected(std::string("Only a local or hotseat game can be saved for Space Empires IV: this copy of a network or "
+                                           "play-by-e-mail game holds only what your empire knows."));
+    game::classic::ConversionReport report;
+    game::classic::ExportOptions options;
+    options.scriptedMods = std::move(scriptedMods);
+    options.installHasPicture = std::move(installHasPicture);
+    options.keySeed = std::random_device{}();
+    options.gameName = file.stem().string();
+    auto written = game::classic::writeClassicGame(*rules_, state_, file, report, options);
+    if (!written) return std::unexpected(written.error());
+    // The players' History files go beside it, as the original's own saves
+    // keep them (spec 08 §1.2): the original's Scores and History windows
+    // read them, so the graphs are not lost after all.
+    copyHistoryNextTo(file);
+    std::erase_if(report.notes, [](const std::string& n) { return n.starts_with("History and score graphs"); });
+    logReport("Saved for Space Empires IV:", file, report);
+    return report.notes;
+}
+
+std::expected<std::unique_ptr<ClassicSession>, std::string> ClassicSession::load(std::shared_ptr<const game::Rules> rules,
+                                                                                 const std::filesystem::path& file,
+                                                                                 const game::ClassicScenarioState* scenario) {
+    std::vector<std::string> importNotes;
+    std::expected<std::pair<game::GameState, game::SaveInfo>, std::string> loaded;
+    if (auto bytes = game::readFileBytes(file); bytes && game::classic::looksLikeClassicSave(*bytes)) {
+        // A saved game of the original: imported (docs/spec/08).
+        game::classic::ConversionReport report;
+        auto imported = game::classic::readClassicGame(*rules, file, report);
+        if (!imported) return std::unexpected(imported.error());
+        logReport("Imported the Space Empires IV saved game", file, report);
+        importNotes = std::move(report.notes);
+        loaded = std::pair<game::GameState, game::SaveInfo>{std::move(*imported), game::SaveInfo{}};
+    } else {
+        loaded = game::loadGame(file);
+    }
+    if (!loaded) return std::unexpected(loaded.error());
+    game::GameState& s = loaded->first;
+    game::upgradeLoadedGame(*rules, s, loaded->second.formatVersion);
+    // A game made with mods that change the game plays only with the same
+    // ones (asset-only and interface-only mods may differ).
+    if (const auto mods = game::modDifferences(s.mods, *rules, "the saved game"); !mods.empty()) {
+        std::string why = std::format("{} was played with other mods than the ones in use:", file.filename().string());
+        for (const std::string& m : mods) why += "\n  " + m;
+        why += "\nChoose the same ones in the main menu's Mods window (or start OpenSE4 with them: --mod).";
+        return std::unexpected(why);
+    }
+    // A scenario of the original starts from its Starting Game, which the
+    // normal loader reads: the file decides the players, the turn style, the
+    // options and the victory conditions, and the scenario adds only its own
+    // state, every empire at its first page (docs/spec/06 §5.6).
+    if (scenario) {
+        s.classicScenario = *scenario;
+        for (game::Empire& e : s.empires) e.interfaceOptions.scenarioPage = 1;
+    }
+    // Reading a game file recalculates every colony's cloak and sensor levels,
+    // a colony that can no longer cloak decloaking as by Decloak (spec 01
+    // §6.9, §14 Q44, confirmed: binary).
+    game::diplomacy::recalculateColonies(*rules, s);
+    game::EmpireId player;
+    int humans = 0;
+    for (const game::Empire& e : s.empires)
+        if (e.alive && e.kind == game::PlayerKind::Human) {
+            if (!player.valid()) player = e.id;
+            ++humans;
+        }
+    if (!player.valid()) player = game::EmpireId{0u};
+    const SessionKind kind = humans > 1 ? SessionKind::Hotseat : SessionKind::Local;
+    auto session = std::make_unique<ClassicSession>(std::move(rules), std::move(s), player, kind);
+    // A network host's save or a PBEM game file (they carry a game id) is played
+    // on here as a local game; its passwords are the verifiers the host checks.
+    session->multiplayerGameId_ = loaded->second.gameId;
+    session->masterVerifier_ = loaded->second.masterPasswordVerifier;
+    // A scenario's Starting Game is no game the player chose to convert: what
+    // its import approximated goes to the log file only.
+    if (!scenario) session->importNotes_ = std::move(importNotes);
+    session->scenarioStart_ = scenario != nullptr;
+    // What the game asks before it is played (spec 06 §1.1, §1.2.1, spec 08
+    // §5, confirmed: binary): who signs in to a simultaneous game; the player
+    // whose turn it is, for a turn-based game's autosave.
+    if (!session->turnBased()) session->signIn_ = SignIn::Login;
+    else if (loaded->second.autosave) session->signIn_ = SignIn::NextPlayer;
+    session->loadedInfo_ = std::move(loaded->second);
+    session->fromSave_ = true;
+    return session;
+}
+
+std::filesystem::path userDataDir() { return userDataDirectory(); }
+
+std::filesystem::path historyDir() { return userDataDir() / "History"; }
+
+std::string historyFileName(game::EmpireId empire, std::string_view kind) { return std::format("plr_{}_{}", empire.value + 1, kind); }
+
+void copyHistoryNextTo(const std::filesystem::path& saveFile, const std::filesystem::path& history) {
+    std::error_code ec;
+    const std::string prefix = saveFile.stem().string() + "_";
+    for (const auto& e : std::filesystem::directory_iterator(history, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        std::filesystem::copy_file(e.path(), saveFile.parent_path() / (prefix + e.path().filename().string()),
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) log::warn("Cannot copy {} next to {}: {}", e.path().string(), saveFile.string(), ec.message());
+    }
+}
+
+void restoreHistoryFrom(const std::filesystem::path& saveFile, const std::filesystem::path& history) {
+    std::error_code ec;
+    const std::filesystem::path& dir = history;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec))
+        if (e.is_regular_file(ec)) std::filesystem::remove(e.path(), ec);
+    std::filesystem::create_directories(dir, ec);
+    const std::string prefix = saveFile.stem().string() + "_plr_";
+    for (const auto& e : std::filesystem::directory_iterator(saveFile.parent_path(), ec)) {
+        const std::string name = e.path().filename().string();
+        if (!e.is_regular_file(ec) || !name.starts_with(prefix) || !name.ends_with(".txt")) continue;
+        std::filesystem::copy_file(e.path(), dir / name.substr(saveFile.stem().string().size() + 1), std::filesystem::copy_options::overwrite_existing,
+                                   ec);
+    }
+}
+
+std::filesystem::path savesDir() {
+    // "saves" in the user folder, or the folder Settings → Files chose.
+    const std::filesystem::path dir = savesFolderPath(userDataDir(), appSettings().files.savesFolder);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+} // namespace opense4::client::classic

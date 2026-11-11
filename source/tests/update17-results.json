@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "runtime": "actual C++ native and WASM, exact parity",
+  "evidence": [
+    "separate planet/yard queues, second facility accepted, parallel ships, combined rates, exact native/WASM",
+    "space-yard component on a base builds a ship in its own independent queue",
+    "native planned-route points and turn labels, movement preview and snapshots do not alter game state",
+    "native movement range, multi-turn ETA, closest reachable yard and depot",
+    "unused research, exact unlocks and ETAs, independent queues persist in format 13",
+    "actual upstream tutorial setup, text, native step navigation, training and manual catalog"
+  ]
+}

@@ -1,0 +1,138 @@
+#pragma once
+
+// Screens shown before a game is running: intro, quick start, game and
+// empire setup, loading, and the multiplayer lobby (docs/spec/06 §1.1, §1.7).
+
+#include "client/classic/art.hpp"
+#include "client/classic/session.hpp"
+#include "client/classic/ui.hpp"
+#include "client/fonts.hpp"
+#include "game/setup.hpp"
+
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace opense4::client::classic {
+
+// Learn opens on the Tutorials tab, LearnTraining on Training; Manual is the manual alone.
+enum class FrontId { Intro, QuickStart, GameSetup, LoadGame, Multiplayer, Pbem, Settings, Learn, LearnTraining, Manual, Credits, Mods };
+
+struct LearnContent;
+class FrontScreen;
+
+struct MenuContext {
+    std::shared_ptr<const game::Rules> rules;
+    Art& art;
+    const Fonts& fonts;
+    FrameMapping map;
+    float fbScale = 1.0f;
+    double time = 0.0;
+    uint64_t seed = 1;
+    bool seedGiven = false;  // the player gave `seed` (--seed, or a script run); else it is the clock's
+    AppControl* app = nullptr;
+
+    // Starts a game (the mode switches to the main window).
+    std::function<void(std::unique_ptr<ClassicSession>)> startGame;
+    std::function<void(FrontId)> go;
+    std::function<void()> quit;
+    // A game was loaded from the intro (Resume Game, Load Game): the music
+    // changes to the background list (docs/spec/06 §5.5).
+    std::function<void()> loadedFromIntro;
+    std::string error;  // shown by the intro screen
+    // The learning content, and starting a lesson's game (docs/LEARNING.md).
+    const LearnContent* learn = nullptr;
+    std::function<void(learn::LessonKind, const std::string&)> startLesson;
+    // ... or resume a tutorial at the place the player left it.
+    std::function<void(learn::LessonKind, const std::string&)> resumeLesson;
+    // Another front-end screen, once this one has drawn.
+    std::function<void(std::unique_ptr<FrontScreen>)> goTo;
+    // Mods (docs/sdk/packages-and-data.md "Choosing mods in the game"): the
+    // data set is read again with these mods, in this order, once this frame
+    // has drawn, and the settings keep them. Then `next` is shown (the intro
+    // when null), or the saved game `load` is loaded. When they cannot be
+    // read, the screen stays and `failed` gets why.
+    struct ModsChange {
+        std::vector<std::string> mods;
+        std::function<std::unique_ptr<FrontScreen>()> next;
+        std::filesystem::path load;
+        std::function<void(const std::string&)> failed;
+    };
+    std::function<void(ModsChange)> changeMods;
+
+    float k() const { return map.scale / fbScale; }
+    ImVec2 at(Vec2 framePos) const {
+        const Vec2 p = map.toFb(framePos) / fbScale;
+        return {p.x, p.y};
+    }
+    ImVec2 size(Vec2 frameSize) const { return {frameSize.x * k(), frameSize.y * k()}; }
+    float px(float v) const { return v * k(); }
+    Painter painter() const;
+};
+
+class FrontScreen {
+public:
+    virtual ~FrontScreen() = default;
+    virtual void draw(MenuContext& ctx) = 0;
+};
+
+std::unique_ptr<FrontScreen> makeFrontScreen(FrontId id);
+// The intro picture over the whole window, behind the front end's windows.
+void introBackground(MenuContext& ctx);
+// Automation (--open=NAME): a front-end screen by name: intro, quickstart,
+// setup[:page] (Game Setup page, e.g. setup:players), empiresetup[:page]
+// (Empire Setup for a new empire, e.g. empiresetup:traits), multiplayer,
+// multiplayer:host, multiplayer:browse, multiplayer:join=ADDR[:PORT],
+// pbem[:GAME.gam] (Play by E-mail, with that game file opened),
+// learn[:tab] (the Learn window: tutorials, training, manual). The manual
+// alone is --manual; --open=manual opens it in a quick game.
+// Returns nullptr if NAME is not a front-end screen.
+std::unique_ptr<FrontScreen> frontScreenByName(std::string_view name);
+
+// Creates a local game from a setup; on failure returns the reason.
+std::expected<std::unique_ptr<ClassicSession>, std::string> startLocalGame(std::shared_ptr<const game::Rules> rules, const game::GameSetup& setup,
+                                                                          const game::StartExtras& extras = {});
+
+// Quick Start: the player's race in a new game's settings, so random computer
+// and neutral players (Medium) rolled from the seed (spec 01 §2.1, §2.2).
+// With `opponents` (a lesson's, or --empires on the command line): that many
+// computer players of other races picked from the seed, and no neutral one.
+game::GameSetup quickStartSetup(const game::Rules& rules, std::string_view playerPreset, uint64_t seed,
+                                std::optional<int> opponents = std::nullopt);
+// What a quick start gives beyond its setup (spec 01 §2.1, confirmed:
+// binary): the player gets one Design minister run at creation, and no ships.
+game::StartExtras quickStartExtras();
+
+// Game Setup / Empire Setup windows (setup.cpp in screens/), Multiplayer lobby (multiplayer.cpp).
+// `startPage`: a Game Setup page name, or "empire[:page]" to open Empire Setup at once.
+std::unique_ptr<FrontScreen> makeGameSetupScreen(std::string_view startPage = {});
+// `automation`: "host" opens a lobby at once (no UPnP), "join=ADDR[:PORT]"
+// connects at once (",ready" appended: and says it is ready); the player is
+// named "Player" (for screenshots/tests).
+std::unique_ptr<FrontScreen> makeMultiplayerScreen(std::string_view automation);
+// Play by E-mail (screens/pbem.cpp): `file` non-empty opens that game file at once.
+std::unique_ptr<FrontScreen> makePbemScreen(std::string_view file = {});
+// Learn (screens/learn_screens.cpp): `start` is the tab ("tutorials",
+// "training", "manual"), or "manual:<slug#anchor>" for the manual alone.
+std::unique_ptr<FrontScreen> makeLearnFrontScreen(std::string_view start = {});
+// Mods (screens/mods.cpp): the mods there are, which are on and in what
+// order, and what each holds; `back` makes the screen to return to (the
+// intro when null), afresh when the mods changed.
+using FrontFactory = std::function<std::unique_ptr<FrontScreen>()>;
+std::unique_ptr<FrontScreen> makeModsScreen(FrontFactory back = {});
+// A saved game that was played with other mods: what differs, and loading it
+// with its own mods when the mods folder has them.
+std::unique_ptr<FrontScreen> makeSavedGameModsScreen(std::filesystem::path file, FrontFactory back);
+// Loads a saved game from the front end: at once, or through the screen
+// above when its mods differ from the ones in use; on failure returns why.
+std::optional<std::string> loadFromFrontEnd(MenuContext& ctx, const std::filesystem::path& file, FrontFactory back);
+// The setup screens' line about the mods the new game will use, and the
+// button for the Mods window (true when pressed): OpenSE4's own, in the
+// area's bottom left corner, under the page buttons. Places in ImGui units.
+bool modsLine(MenuContext& ctx, ImVec2 textAt, ImVec2 buttonAt, ImVec2 buttonSize, float width);
+
+} // namespace opense4::client::classic

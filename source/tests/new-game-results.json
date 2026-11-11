@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "evidence": [
+    "original setup options, map generation/import, custom race roundtrip, three homeworlds, no ships/designs, two-human hotseat isolation, save handoff",
+    "original binary empire/map conversion and native hotseat password checks",
+    "simultaneous human entry, command persistence, all-player readiness, one processing pass and mid-turn save/load",
+    "custom team partnership, friendly-war rejection, team persistence, multiplayer automatic combat, required colony fitting and Master Computer replacement"
+  ]
+}

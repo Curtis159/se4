@@ -1,0 +1,19 @@
+{
+  "passed": true,
+  "runtime": "real in-app Chromium browser; hosted update 25",
+  "physicalDeviceQA": false,
+  "widths": [
+    320,
+    390
+  ],
+  "evidence": [
+    "Construction next level shows Fighters, Troops and Mines under New research",
+    "Research log action opens the Research screen",
+    "Native log rows fit at 320px with 320px document scroll width",
+    "390px research shows two columns and 375px document width"
+  ],
+  "screenshots": [
+    "SE4_Research_Branches_25_Phone.png",
+    "SE4_Log_Actions_25_Phone.png"
+  ]
+}

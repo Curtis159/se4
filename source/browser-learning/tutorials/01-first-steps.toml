@@ -1,0 +1,33 @@
+# Browser adaptation of OpenSE4 learning topics; original sources retained upstream.
+title = "First steps"
+summary = "Learn the map, resources, research and turn guide."
+minutes = 15
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+starting_ships = ["Attack Ship", "Attack Ship", "Colony"]
+[[step]]
+title = "Welcome"
+text = "This practice game includes ships to learn with. Normal games start without ships or designs. Use Next to begin."
+[[step]]
+title = "Your empire"
+text = "Open Status. The resource figures show reserves and net income; research and intelligence show their income per turn."
+done = { window = "empire-status" }
+[[step]]
+title = "Your homeworld"
+text = "Open Maps and tap the colony banner. Its planetary and shipyard queues appear below the map on a phone."
+done = { selected = "colony" }
+[[step]]
+title = "Research"
+text = "Open Research. Unallocated points expire when the turn ends. Project rows show progress, funding and estimated turns."
+done = { window = "research" }
+[[step]]
+title = "Your next action"
+text = "The blue button opens a task. Skip deliberately leaves it idle for this turn. The button turns gold when no tasks remain. Complete or skip the tasks and end one turn."
+done = { turns_passed = 1 }
+[[step]]
+title = "Turn news"
+text = "Open Log to read the results. Use the menu to save a file or return to the main menu."
+done = { window = "log" }

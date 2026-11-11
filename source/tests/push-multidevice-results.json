@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "runtime": "actual Edge Function handler in Node VM with mocked Supabase and Web Push; no live device delivery",
+  "evidence": [
+    "One turn notice is sent to both subscriptions belonging to the player",
+    "Notification links retain a GitHub Pages repository path",
+    "Expired endpoint is removed without preventing delivery to the other device",
+    "Temporary failure leaves notification pending for retry",
+    "Worker rejects an incorrect caller secret"
+  ]
+}

@@ -1,0 +1,211 @@
+# OpenSE4's own lesson (docs/LEARNING.md). Written from docs/spec and the client.
+title = "Research and construction"
+summary = "Choose research projects, build facilities and ships in a construction queue, and read your budget."
+minutes = 15
+learned = [
+    "Queuing research projects, and Divide Pts Evenly",
+    "Planning ahead with the Tech Tree",
+    "Adding ships and facilities to a construction queue, and how a queue builds",
+    "Reading your budget in Empire Status",
+]
+
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+complete_tech_tree = true
+
+[[step]]
+title = "Research and building"
+text = """
+**Two things decide how fast your empire grows:** what you **research** and what you **build**.
+This lesson shows you both. Press **Next**.
+"""
+highlight = ["lesson:panel"]
+manual = "research"
+
+[[step]]
+title = "The Research window"
+text = """
+**Open the Research window** with its command button (the flask) or `F8`. It is where your
+empire chooses what to learn next.
+"""
+highlight = ["command:research"]
+done = { window = "research" }
+manual = "research#the-research-window"
+
+[[step]]
+title = "Research points"
+text = """
+**The top line shows this turn's research points.** Your colonies made them last turn, and they
+are all spent at the end of this one: points no project can use are lost, so keep the queue full.
+
+You also start with a large stock of points. Press **Next**.
+"""
+highlight = ["research:points"]
+manual = "research#research-points"
+
+[[step]]
+title = "Choose projects"
+text = """
+**Click three areas** in the list to queue them as projects; they show in the boxes below it.
+
+Point at an area to see what its next level unlocks, and check the **Cost** column: some levels
+take a few turns, others a hundred. Start with one or two cheap ones, then add a long-term goal.
+"""
+highlight = ["research:areas"]
+show = ["research:headings", "research:queue"]
+done = { research_queued = 3 }
+manual = "research#technology-areas-and-levels"
+
+[[step]]
+title = "Your projects"
+text = """
+**Switch Divide Pts Evenly off** (outlined).
+
+Then your points go to the first project until it is paid for, then to the next, so the project
+you need most finishes first. Your projects are listed below, four to a page, each with an
+estimate of when it finishes.
+"""
+highlight = ["research:divide-evenly"]
+show = ["research:queue"]
+done = { not = { option = "research-evenly" } }
+manual = "research#the-research-queue"
+
+[[step]]
+title = "The Tech Tree"
+text = """
+**Press Tech Tree.** It shows every technology area of the game, what each one needs and what it
+leads to, so you can plan several steps ahead.
+"""
+highlight = ["research:tech-tree"]
+done = { window = "tech-tree" }
+manual = "research#the-tech-tree-window"
+
+[[step]]
+title = "Close the windows"
+text = """
+**Close the Tech Tree and the Research window** with their **Close** buttons, or `Esc` twice.
+"""
+highlight = ["tech-tree:close", "research:close"]
+keys = ["Escape"]
+done = { all = [{ not = { window = "tech-tree" } }, { not = { window = "research" } }] }
+manual = "research#the-tech-tree-window"
+
+[[step]]
+title = "Your construction queues"
+text = """
+**Open Construction Queues** with its command button (the wrench) or `F7`.
+
+Every colony with people has a **construction queue**. This window lists them all, what each is
+building and when it will be done.
+"""
+highlight = ["command:queues"]
+done = { window = "queues" }
+manual = "construction#who-can-build"
+
+[[step]]
+title = "Open a queue"
+text = """
+**Click your homeworld's row** to open its construction queue.
+"""
+highlight = ["queues:list"]
+done = { window = "set-queue" }
+manual = "construction#the-set-construction-queue-window"
+
+[[step]]
+title = "Build something"
+text = """
+**Click {design:Colony}**, your colony ship design, on the **Ships** tab to add it to the queue.
+Each row shows its design's type at the right; scroll the list if the design is out of sight.
+
+More colonies mean more of everything. A game starts without ships, so your colony ships and
+explorers all come from queues like this one.
+"""
+highlight = ["set-queue:available", "set-queue:available:named"]
+allow = ["set-queue:ships"]
+done = { command = "QueueAdd", design_type = "Colony" }
+manual = "construction#the-set-construction-queue-window"
+
+[[step]]
+title = "How a queue builds"
+text = """
+**Only the top item of a queue makes progress.** Each turn the queue spends up to its build rate,
+only when your treasury can pay all three resources at once, and it finishes at most one item.
+
+So keep every queue busy, and give long jobs to your best yards. Press **Next**.
+"""
+highlight = ["set-queue:queue"]
+show = ["set-queue:rate"]
+manual = "construction#how-a-queue-builds"
+
+[[step]]
+title = "Your colonies"
+text = """
+**Close both queue windows** (`Esc`, twice), **then open Colonies** with its command button or
+`F5`.
+"""
+highlight = ["command:colonies"]
+done = { window = "colonies" }
+manual = "planets-and-colonies#the-colonies-window"
+
+[[step]]
+title = "The Colonies window"
+text = """
+**It lists your colonies** with their people, production and facilities.
+
+Its tabs on the right choose the columns: try them. Later, a click on a column's heading sorts
+the list by that column, and a click on a colony shows it in the main window. Press **Next**.
+"""
+highlight = ["colonies:list"]
+allow = ["colonies:general", "colonies:value", "colonies:production", "colonies:facilities", "colonies:cargo",
+         "colonies:construction", "colonies:status", "colonies:races", "colonies:orders"]
+manual = "planets-and-colonies#the-colonies-window"
+
+[[step]]
+title = "Empire Status"
+text = """
+**Close Colonies (`Esc`), then open Empire Status** with the crown button or `F11`.
+"""
+highlight = ["command:empire-status"]
+done = { window = "empire-status" }
+manual = "economy#the-empire-status-window"
+
+[[step]]
+title = "Your budget"
+text = """
+**Empire Status shows what you produce and spend each turn.** **Net Resources Per Turn** is what
+your treasury gains or loses; ships cost upkeep, so watch it. Press **Next**.
+"""
+highlight = ["empire-status:net"]
+show = ["empire-status:budget"]
+manual = "economy#the-empire-status-window"
+
+[[step]]
+title = "End the turn"
+text = """
+**Close the window (`Esc`), then press End Turn** and **Yes**.
+
+Then your colonies produce, your queues build and your projects are paid. A project that reaches
+its cost gives your empire a new level: end turns until the first one is done (after five turns
+the lesson goes on anyway), closing the Log (`Esc`) before each End Turn.
+"""
+highlight = ["button:end-turn"]
+allow = ["log:close"]
+done = { any = [{ techs_researched = 1 }, { turns_passed = 5 }] }
+manual = "turns#what-happens-at-the-end-of-a-turn"
+
+[[step]]
+title = "New technology"
+text = """
+**The Log opened by itself at the new turn.** Click its **Research** category: a finished
+project's entry says what its new level unlocks, the components and facilities you can now use.
+(`F10` opens the Log again.)
+
+The next lesson designs a warship. Press **Finish**.
+"""
+highlight = ["log:research"]
+allow = ["log:research", "log:messages", "log:close"]
+show = ["log:details"]
+manual = "research#the-research-queue"

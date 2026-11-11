@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "runtime": "actual C++ native/WASM exact parity",
+  "evidence": [
+    "old local campaign retains turn, worlds, designs and reserves",
+    "AI empire becomes an invited human slot",
+    "human turns resume from saved campaign",
+    "vacant human empire can return to AI",
+    "failed conversion leaves campaign intact",
+    "original local save and restored multiplayer save both reload"
+  ]
+}

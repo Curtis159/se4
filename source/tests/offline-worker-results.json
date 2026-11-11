@@ -1,0 +1,187 @@
+{
+  "passed": true,
+  "hegemon": {
+    "checksum": "4673572163728317546",
+    "diagnostics": {
+      "mode": "hegemon",
+      "requests": 8,
+      "fallbacks": 0,
+      "errors": [],
+      "agents": [
+        {
+          "id": 1,
+          "team": 0,
+          "memory": {
+            "seen": {},
+            "strategy": {
+              "phase": "expand",
+              "since": 0,
+              "target": null
+            },
+            "rivals": {
+              "0": {
+                "colonies": 0,
+                "pop": 0,
+                "force": [
+                  0,
+                  0
+                ],
+                "dist": 99,
+                "battles": 0,
+                "seen": -1
+              },
+              "2": {
+                "colonies": 0,
+                "pop": 0,
+                "force": [
+                  0,
+                  0
+                ],
+                "dist": 99,
+                "battles": 0,
+                "seen": -1
+              }
+            },
+            "diplo": {
+              "offered": {}
+            },
+            "unsafe": {},
+            "colonist_pos": {},
+            "colonize_blocked": {},
+            "supply_per_move": {},
+            "explore": {
+              "pos": {},
+              "blocked": {}
+            },
+            "fleets": {},
+            "roles": {
+              "scout": "Scout B-1",
+              "warship": "Warship B-2",
+              "yard": "Yard B-3",
+              "platform": "Guard B-4",
+              "satellite": "Sentinel B-5",
+              "trooper": "Trooper B-6",
+              "colony:Rock": "Colonist B-7"
+            },
+            "role_values": {
+              "scout": 15584,
+              "warship": 448504625,
+              "yard": 175438,
+              "platform": 10924060660,
+              "satellite": 3714880332,
+              "trooper": 507692,
+              "colony:Rock": 250000
+            },
+            "invasion": {},
+            "repairing": {},
+            "pending_roles": {
+              "scout": true,
+              "warship": true,
+              "yard": true,
+              "platform": true,
+              "satellite": true,
+              "trooper": true,
+              "colony:Rock": true
+            },
+            "design_tech": 16,
+            "design_seq": 7,
+            "rp_spent": {
+              "civ": 0,
+              "mil": 0
+            },
+            "rp_head": "mil",
+            "unmet_ships": 0
+          }
+        },
+        {
+          "id": 2,
+          "team": 0,
+          "memory": {
+            "seen": {},
+            "strategy": {
+              "phase": "expand",
+              "since": 0,
+              "target": null
+            },
+            "rivals": {
+              "0": {
+                "colonies": 0,
+                "pop": 0,
+                "force": [
+                  0,
+                  0
+                ],
+                "dist": 99,
+                "battles": 0,
+                "seen": -1
+              },
+              "1": {
+                "colonies": 0,
+                "pop": 0,
+                "force": [
+                  0,
+                  0
+                ],
+                "dist": 99,
+                "battles": 0,
+                "seen": -1
+              }
+            },
+            "diplo": {
+              "offered": {}
+            },
+            "unsafe": {},
+            "colonist_pos": {},
+            "colonize_blocked": {},
+            "supply_per_move": {},
+            "explore": {
+              "pos": {},
+              "blocked": {}
+            },
+            "fleets": {},
+            "roles": {
+              "scout": "Scout C-1",
+              "warship": "Warship C-2",
+              "yard": "Yard C-3",
+              "platform": "Guard C-4",
+              "satellite": "Sentinel C-5",
+              "trooper": "Trooper C-6",
+              "colony:Gas Giant": "Colonist C-7"
+            },
+            "role_values": {
+              "scout": 15584,
+              "warship": 448504625,
+              "yard": 175438,
+              "platform": 10924060660,
+              "satellite": 3714880332,
+              "trooper": 507692,
+              "colony:Gas Giant": 250000
+            },
+            "invasion": {},
+            "repairing": {},
+            "pending_roles": {
+              "scout": true,
+              "warship": true,
+              "yard": true,
+              "platform": true,
+              "satellite": true,
+              "trooper": true,
+              "colony:Gas Giant": true
+            },
+            "design_tech": 16,
+            "design_seq": 7,
+            "rp_spent": {
+              "civ": 0,
+              "mil": 0
+            },
+            "rp_head": "mil",
+            "unmet_ships": 0
+          }
+        }
+      ]
+    }
+  },
+  "runtime": "Node worker_threads, browser-worker branch with opaque Blob URL (not real browser)",
+  "initialChecksum": "1419700027060767564",
+  "turn1Checksum": "3732358737799985728"
+}

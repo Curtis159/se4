@@ -1,0 +1,135 @@
+#pragma once
+
+// Rules: the loaded data set plus derived, read-only caches the engine needs
+// every turn (pre-parsed abilities, family tables, settings with defaults).
+// Build once per game; never mutated during play.
+
+#include "game/abilities.hpp"
+#include "game/state.hpp"
+#include "ruleset/races.hpp"
+#include "ruleset/ruleset.hpp"
+
+#include <filesystem>
+#include <optional>
+#include <span>
+#include <string_view>
+#include <vector>
+
+namespace opense4::game {
+
+// The cap on the cost of one tech level (spec 05 §1.3, confirmed: binary).
+inline constexpr int64_t kMaxTechLevelCost = 2'000'000'000;
+
+class Rules {
+public:
+    Rules() = default;
+    // gameRoot: directory holding Data/, Pictures/, Ai/ (empty for test data
+    // sets). A data set loaded with its files (ruleset::Ruleset::files: the
+    // install, perhaps with mods) reads its AI tables and races from them;
+    // otherwise from gameRoot as the install has them.
+    Rules(ruleset::Ruleset data, std::filesystem::path gameRoot = {});
+
+    const ruleset::Ruleset& data() const { return data_; }
+    const std::filesystem::path& gameRoot() const { return gameRoot_; }
+    // The game folder's files (AI tables, race files, design names); null
+    // without a game folder.
+    const ruleset::GameFiles* files() const { return data_.files.get(); }
+    const std::vector<ruleset::RacePreset>& racePresets() const { return races_; }
+    // The mods the data set was built with, in load order.
+    std::span<const ruleset::ModRecord> mods() const { return data_.mods; }
+
+    // A mod's declared ability (docs/sdk/packages-and-data.md): its value over
+    // a list of abilities, combined as the declaration says (sum, largest or
+    // smallest Val 1; 0 when none carries it), or nullopt when no mod declared
+    // that name. On a design, the hull's and every component's abilities; on a
+    // colony, its facilities'; on a system, its own and its objects'.
+    std::optional<int64_t> declaredAbility(std::span<const ParsedAbility> list, std::string_view name) const;
+    std::optional<int64_t> declaredAbilityOfComponent(uint32_t component, std::string_view name) const;
+    std::optional<int64_t> declaredAbilityOfFacility(uint32_t facility, std::string_view name) const;
+    std::optional<int64_t> declaredAbilityOfHull(uint32_t hull, std::string_view name) const;
+    std::optional<int64_t> declaredAbilityOfDesign(const Design& design, std::string_view name) const;
+    std::optional<int64_t> declaredAbilityOfColony(const Colony& colony, std::string_view name) const;
+    std::optional<int64_t> declaredAbilityOfSystem(const Galaxy& galaxy, SystemId system, std::string_view name) const;
+
+    // Pre-parsed abilities.
+    std::span<const ParsedAbility> componentAbilities(uint32_t component) const { return components_[component]; }
+    std::span<const ParsedAbility> facilityAbilities(uint32_t facility) const { return facilities_[facility]; }
+    std::span<const ParsedAbility> hullAbilities(uint32_t hull) const { return hulls_[hull]; }
+    std::span<const ParsedAbility> systemAbilities(uint32_t systemType) const { return systemTypes_[systemType]; }
+
+    const ruleset::Component& component(uint32_t i) const { return data_.components[i]; }
+    const ruleset::Facility& facility(uint32_t i) const { return data_.facilities[i]; }
+    const ruleset::VehicleSize& hull(uint32_t i) const { return data_.vehicleSizes[i]; }
+    const ruleset::TechArea& tech(ruleset::TechAreaId a) const { return data_.techAreas[a.index()]; }
+
+    // Settings.txt with the documented stock defaults when a key is missing.
+    int64_t setting(std::string_view key, int64_t fallback) const { return data_.settings.integer(key, fallback); }
+    bool settingFlag(std::string_view key, bool fallback) const { return data_.settings.boolean(key, fallback); }
+
+    // The Settings population rows (spec 02 §5.2) in file order, read once:
+    // `Pop Modifier N Population Amount`, production and SY rate percent.
+    struct PopulationRow {
+        int64_t amount = 0;
+        int production = 100;
+        int shipyard = 100;
+    };
+    std::span<const PopulationRow> populationRows() const { return populationRows_; }
+
+    // Technology gates.
+    bool meets(const Empire& e, std::span<const ruleset::TechRequirement> reqs) const;
+    bool componentAvailable(const Empire& e, uint32_t c) const { return meets(e, data_.components[c].requirements); }
+    bool facilityAvailable(const Empire& e, uint32_t f) const { return meets(e, data_.facilities[f].requirements); }
+    bool hullAvailable(const Empire& e, uint32_t h) const { return meets(e, data_.vehicleSizes[h].requirements); }
+    bool mountAvailable(const Empire& e, uint32_t m) const;
+    // The empire has the technology for the design's hull, every part and
+    // every mount: what "its owner can still build it" means for design
+    // knowledge (spec 05 §2.3, §8 "Design knowledge").
+    bool designTechnology(const Empire& e, const Design& d) const;
+    // A tech area this empire may research at all (allowed, racial/unique checks, requirements).
+    bool techVisible(const GameState& s, const Empire& e, ruleset::TechAreaId a) const;
+    // The same without the requirements: allowed in this game and passing the
+    // racial and unique checks (spec 05 §1.2).
+    bool techAreaOpen(const GameState& s, const Empire& e, ruleset::TechAreaId a) const;
+    // Research points to go from `level - 1` to `level` under the Technology
+    // Cost option (GameOptions::techCost: 0 low, 1 medium, 2 high), capped at
+    // kMaxTechLevelCost (spec 05 §1.3).
+    int64_t techLevelCost(ruleset::TechAreaId a, int level, int techCost) const;
+
+    // The target of a facility upgrade (spec 02 §6.6, confirmed: binary): the
+    // available facility of the family with the highest Roman Numeral, the
+    // first in data-file order on a tie.
+    std::optional<uint32_t> latestFacilityOfFamily(const Empire& e, int family) const;
+    // What a design's Upgrade puts in place of a component of this family
+    // (spec 03 §4.1, confirmed: binary): the last component in data-file
+    // order with that Family whose tech requirements the empire meets. Any
+    // family, 0 included; numerals and names play no part.
+    std::optional<uint32_t> componentUpgradeTarget(const Empire& e, int family) const;
+    // Only Latest (spec 02 §6.4, confirmed: binary): `items` are data-file
+    // indices in data-file order that passed a window's other filters; every
+    // item whose next one in that list has the same family (`Facility
+    // Family`, `Family`) is dropped, so of each run of neighbouring items of
+    // one family only the last stays, in its place. Numerals and names play
+    // no part, family 0 is an ordinary family, and a family split into
+    // separate runs keeps one item per run.
+    std::vector<uint32_t> onlyLatestFacilities(std::span<const uint32_t> items) const;
+    std::vector<uint32_t> onlyLatestComponents(std::span<const uint32_t> items) const;
+    // The empire's best available facility with ability `k`, as the starting
+    // planets choose it (spec 02 §9, confirmed: binary): the highest Val1 of
+    // the ability, or for `Spaceport` and `Space Yard` the highest sum of the
+    // facility's tech-level requirements; on a tie, the later facility.
+    std::optional<uint32_t> bestFacilityWith(const Empire& e, AbilityKind k) const;
+
+    // Racial trait values: sum of Value 1 over the race's traits of this Trait Type.
+    int64_t traitValue(const Race& race, std::string_view traitType) const;
+    bool hasTrait(const Race& race, std::string_view traitType) const;
+    const ruleset::Culture* culture(const Race& race) const;
+
+private:
+    ruleset::Ruleset data_;
+    std::filesystem::path gameRoot_;
+    std::vector<ruleset::RacePreset> races_;
+    std::vector<std::vector<ParsedAbility>> components_, facilities_, hulls_, systemTypes_;
+    std::vector<PopulationRow> populationRows_;
+};
+
+} // namespace opense4::game

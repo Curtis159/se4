@@ -1,0 +1,4 @@
+import create from '../web/engine-hegemon/opense4.mjs';import {readFile,writeFile} from 'node:fs/promises';import {fileURLToPath} from 'node:url';
+const engine=await create({locateFile:n=>fileURLToPath(new URL('../web/engine-hegemon/'+n,import.meta.url)),printErr:console.warn});
+const call=async(method,args={})=>{const x=JSON.parse(await engine.ccall('se4_call','string',['string','string'],[method,JSON.stringify(args)],{async:true}));if(x.error&&!('accepted'in x))throw Error(x.error);return x;};
+const save=JSON.parse(await readFile(process.argv[2],'utf8'));console.log('AI mode:',save.aiMode);let s=await call('load',{payload:save,aiMode:save.aiMode||'classic'});console.log('Loaded',s.turn,'ships',s.ships.length,'colonies',s.colonies.length,'systems',s.systemCount);for(let i=0;i<3;i++){try{s=await call('endTurn');console.log('Advanced',s.turn,s.checksum);}catch(error){console.log(error.stack);await writeFile('tests/local-save-error.txt',error.stack);break;}}

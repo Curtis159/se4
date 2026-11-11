@@ -1,0 +1,1 @@
+{"name":"opense4-browser-engine","private":true,"type":"module","version":"0.2.0","scripts":{"test":"node --test web/tests/*.test.mjs","test:engine":"node tests/engine-parity.mjs private/se4 && node tests/gameplay-loop.mjs","test:ui":"node tests/ui-with-wasm.mjs"},"devDependencies":{"@electric-sql/pglite":"0.5.16","jsdom":"26.1.0"}}

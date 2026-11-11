@@ -1,0 +1,1 @@
+{"wasm": {"parts": ["engine-hegemon/wasm.gzip.part0.bin"], "bytes": 10451395, "sha256": "64a62cdc10eb4c0bb83c75c01685b5b657255fd84fb74b33db4de255d64dd4e4"}, "data": {"parts": ["engine-hegemon/data.gzip.part0.bin"], "bytes": 5437651, "sha256": "ac6a71002c305bce7315954ee61ed6515574c85a4680289be7e619c116980071"}}

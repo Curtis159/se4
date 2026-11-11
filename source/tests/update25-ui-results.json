@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "evidence": [
+    "Construction lists newly available research using native prerequisite checks",
+    "Previewing unlocks does not mutate campaign state; completing Construction makes listed research available",
+    "Research log button opens Research",
+    "Actual completed-ship log button opens the construction sector and its ship cards without stale route lines",
+    "Actual colonization log button opens the new colony sector"
+  ]
+}

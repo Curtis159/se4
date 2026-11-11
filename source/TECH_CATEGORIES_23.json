@@ -1,0 +1,852 @@
+[
+  {
+    "order": 1,
+    "technology": "Rock Planet Colonization",
+    "proposedCategory": "Expansion & Colonies",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 1,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Creation of colonies which can survive on rock based planets."
+  },
+  {
+    "order": 2,
+    "technology": "Ice Planet Colonization",
+    "proposedCategory": "Expansion & Colonies",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 1,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Creation of colonies which can survive on ice based planets."
+  },
+  {
+    "order": 3,
+    "technology": "Gas Giant Colonization",
+    "proposedCategory": "Expansion & Colonies",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 1,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Creation of colonies which can survive within gas giant planets."
+  },
+  {
+    "order": 4,
+    "technology": "Ship Construction",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 9,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The construction of starships and their support components."
+  },
+  {
+    "order": 5,
+    "technology": "Base Construction",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The construction of bases which exist completely in space."
+  },
+  {
+    "order": 6,
+    "technology": "Fighters",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Construction 1",
+    "description": "The construction of fighter vehicles and their support components."
+  },
+  {
+    "order": 7,
+    "technology": "Troops",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Construction 1",
+    "description": "The construction of ground troops used to capture planets."
+  },
+  {
+    "order": 8,
+    "technology": "Mines",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Construction 1",
+    "description": "The construction of small space mines."
+  },
+  {
+    "order": 9,
+    "technology": "Weapon Platforms",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The construction of planet-based weapons platforms."
+  },
+  {
+    "order": 10,
+    "technology": "Satellites",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The construction of satellites to be dropped in space."
+  },
+  {
+    "order": 11,
+    "technology": "Space Yards",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Technology to construct Space Yards, which in turn construct all the structures and vehicles for an empire."
+  },
+  {
+    "order": 12,
+    "technology": "Cargo",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The ability to store and transport cargo through space."
+  },
+  {
+    "order": 13,
+    "technology": "Repair",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The ability to repair damage to ships and bases in space."
+  },
+  {
+    "order": 14,
+    "technology": "Resupply",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Equipment necessary to resupply ship in space."
+  },
+  {
+    "order": 15,
+    "technology": "Propulsion",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 12,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The use of ions to propel a starship through space."
+  },
+  {
+    "order": 16,
+    "technology": "Armor",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Standard",
+    "prerequisites": "Chemistry 1",
+    "description": "Standard alloy based armor used on the exterior of a starship."
+  },
+  {
+    "order": 17,
+    "technology": "Shields",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 10,
+    "access": "Standard",
+    "prerequisites": "Physics 1",
+    "description": "Protective energy barrier which surrounds a starship or base."
+  },
+  {
+    "order": 18,
+    "technology": "Cloaking",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Physics 3",
+    "description": "Stealth technology which defeats EM Passive sensors."
+  },
+  {
+    "order": 19,
+    "technology": "Sensors",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Standard",
+    "prerequisites": "Physics 1",
+    "description": "Sensors which detect objects in space by analyzing incoming electro-magnetic waves."
+  },
+  {
+    "order": 20,
+    "technology": "Scanners",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Physics 2",
+    "description": "Scanners which can analyze details of other starships."
+  },
+  {
+    "order": 21,
+    "technology": "Combat Support",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 4,
+    "access": "Standard",
+    "prerequisites": "Military Science 1",
+    "description": "Technology used to aid ships during combat."
+  },
+  {
+    "order": 22,
+    "technology": "Computers",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Standard",
+    "prerequisites": "Industry 1",
+    "description": "Advanced computer technology used for storage and processing."
+  },
+  {
+    "order": 23,
+    "technology": "Resource Manipulation",
+    "proposedCategory": "Economy & Industry",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Chemistry 2",
+    "description": "Technology to convert resources from one type to another."
+  },
+  {
+    "order": 24,
+    "technology": "Minerals Extraction",
+    "proposedCategory": "Economy & Industry",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 9,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The ability to extract minerals from a planet."
+  },
+  {
+    "order": 25,
+    "technology": "Organics Extraction",
+    "proposedCategory": "Economy & Industry",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 9,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The ability to grow and cultivate organic materials on a planet."
+  },
+  {
+    "order": 26,
+    "technology": "Radioactives Extraction",
+    "proposedCategory": "Economy & Industry",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 9,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The ability to locate and refine radioactive materials within a planet."
+  },
+  {
+    "order": 27,
+    "technology": "Stellar Manipulation",
+    "proposedCategory": "Stellar Engineering",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 8,
+    "access": "Standard",
+    "prerequisites": "Astrophysics 1",
+    "description": "Technology to manipulate spatial bodies."
+  },
+  {
+    "order": 28,
+    "technology": "Applied Research",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The capability of an empire to research new technologies."
+  },
+  {
+    "order": 29,
+    "technology": "Applied Intelligence",
+    "proposedCategory": "Intelligence & Diplomacy",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 4,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The capability of an empire to gather and perform intelligence actions."
+  },
+  {
+    "order": 30,
+    "technology": "Medical Technology",
+    "proposedCategory": "Expansion & Colonies",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Biology 1",
+    "description": "Medical science to manipulate organic materials."
+  },
+  {
+    "order": 31,
+    "technology": "Organic Technology",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Racial: Organic",
+    "prerequisites": "Organic Engineering 1",
+    "description": "Advanced utilization of organic forms to create structures."
+  },
+  {
+    "order": 32,
+    "technology": "Psychic Technology",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Racial: Psychic",
+    "prerequisites": "Psychic Studies 1",
+    "description": "Psychic ability to detect other beings and read their thoughts."
+  },
+  {
+    "order": 33,
+    "technology": "Religious Technology",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 4,
+    "access": "Racial: Religious",
+    "prerequisites": "Religious Studies 1",
+    "description": "The specific utilization of religion to achieve goals."
+  },
+  {
+    "order": 34,
+    "technology": "Temporal Technology",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Racial: Temporal",
+    "prerequisites": "Temporal Studies 1",
+    "description": "Science of altering time streams to produce specific results."
+  },
+  {
+    "order": 35,
+    "technology": "Crystalline Technology",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Racial: Crystalline",
+    "prerequisites": "Crystallurgy 1",
+    "description": "Science of using crystalline materials for construction of devices."
+  },
+  {
+    "order": 36,
+    "technology": "Planet Utilization",
+    "proposedCategory": "Expansion & Colonies",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 9,
+    "access": "Standard",
+    "prerequisites": "Planetary Engineering 1",
+    "description": "Science governing understanding and utilization of a planets resources."
+  },
+  {
+    "order": 37,
+    "technology": "Advanced Military Science",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Standard",
+    "prerequisites": "Military Science 2",
+    "description": "The training, study, and improvement of martial practices."
+  },
+  {
+    "order": 38,
+    "technology": "Applied Political Science",
+    "proposedCategory": "Intelligence & Diplomacy",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Psychology 1",
+    "description": "The process of government and its execution."
+  },
+  {
+    "order": 39,
+    "technology": "Astrophysics",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 2,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The science of astronomy dealing with the physical properties of the universe."
+  },
+  {
+    "order": 40,
+    "technology": "Biology",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 1,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Science which deals with the processes and physical characteristics of all life forms."
+  },
+  {
+    "order": 41,
+    "technology": "Chemistry",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 2,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The science dealing with the composition and properties of substances."
+  },
+  {
+    "order": 42,
+    "technology": "Construction",
+    "proposedCategory": "Economy & Industry",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 1,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The science of constructing vehicles and buildings."
+  },
+  {
+    "order": 43,
+    "technology": "Crystallurgy",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 1,
+    "access": "Racial: Crystalline",
+    "prerequisites": "None",
+    "description": "The science of manipulating crystals and their resonance waves."
+  },
+  {
+    "order": 44,
+    "technology": "Industry",
+    "proposedCategory": "Economy & Industry",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 1,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The science of creating and utilizing large scale manufacturing machinery."
+  },
+  {
+    "order": 45,
+    "technology": "Military Science",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 2,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The science of military practices and the strategic, tactical, and logistic theories that determine them."
+  },
+  {
+    "order": 46,
+    "technology": "Organic Engineering",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 1,
+    "access": "Racial: Organic",
+    "prerequisites": "None",
+    "description": "The technology of designing and creating organic forms to serve specific needs."
+  },
+  {
+    "order": 47,
+    "technology": "Physics",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 4,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The science dealing with the properties and interactions of matter and energy."
+  },
+  {
+    "order": 48,
+    "technology": "Planetary Engineering",
+    "proposedCategory": "Expansion & Colonies",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 1,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The science of designing and manipulating a planetary habitat."
+  },
+  {
+    "order": 49,
+    "technology": "Psychic Studies",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 2,
+    "access": "Racial: Psychic",
+    "prerequisites": "None",
+    "description": "The science of mental abilities and interaction."
+  },
+  {
+    "order": 50,
+    "technology": "Psychology",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 1,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The science dealing with the mind and with mental and emotional processes."
+  },
+  {
+    "order": 51,
+    "technology": "Religious Studies",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 1,
+    "access": "Racial: Religious",
+    "prerequisites": "None",
+    "description": "The study of religions and belief systems."
+  },
+  {
+    "order": 52,
+    "technology": "Temporal Studies",
+    "proposedCategory": "Science & Special Research",
+    "originalGroup": "Theoretical Science",
+    "maximumLevel": 2,
+    "access": "Racial: Temporal",
+    "prerequisites": "None",
+    "description": "The study of temporal phenomenon and manipulation."
+  },
+  {
+    "order": 53,
+    "technology": "Energy Stream Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 12,
+    "access": "Standard",
+    "prerequisites": "Physics 1",
+    "description": "Weapons employing a continuous stream of energy."
+  },
+  {
+    "order": 54,
+    "technology": "Energy Pulse Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 6,
+    "access": "Standard",
+    "prerequisites": "Physics 1",
+    "description": "Weapons which fire bursts of intense energy at enemy ships."
+  },
+  {
+    "order": 55,
+    "technology": "Missile Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 7,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Guided missile weapons which seek after and hit enemy ships."
+  },
+  {
+    "order": 56,
+    "technology": "Projectile Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Weapons which fire projectiles at other ships."
+  },
+  {
+    "order": 57,
+    "technology": "Torpedo Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 10,
+    "access": "Standard",
+    "prerequisites": "Military Science 1",
+    "description": "Seeking torpedo which homes in and detonates against enemy vessels."
+  },
+  {
+    "order": 58,
+    "technology": "High-Energy Discharge Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 10,
+    "access": "Standard",
+    "prerequisites": "Propulsion 7",
+    "description": "Weapons which employ massive energy releases to damage enemy ships."
+  },
+  {
+    "order": 59,
+    "technology": "Phased-Energy Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Physics 2",
+    "description": "Weapons using phased-energy to bypass normal shields."
+  },
+  {
+    "order": 60,
+    "technology": "Point-Defense Weapons",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Military Science 1",
+    "description": "Weapons which specifically target and destroy incoming seekers."
+  },
+  {
+    "order": 61,
+    "technology": "Shield Damaging Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 10,
+    "access": "Standard",
+    "prerequisites": "Shields 4",
+    "description": "Weapons designed to damage shields and their generators."
+  },
+  {
+    "order": 62,
+    "technology": "Tractor\\Repulser Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 9,
+    "access": "Standard",
+    "prerequisites": "Astrophysics 1",
+    "description": "Weapons which move enemy vessels through space."
+  },
+  {
+    "order": 63,
+    "technology": "Weapon Overloading Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Military Science 2",
+    "description": "Weapons designed to damage weapons on enemy ships."
+  },
+  {
+    "order": 64,
+    "technology": "Engine Overloading Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 10,
+    "access": "Standard",
+    "prerequisites": "Propulsion 4",
+    "description": "Weapons which overload and destroy the engines on enemy ships."
+  },
+  {
+    "order": 65,
+    "technology": "Gravitational Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Astrophysics 2",
+    "description": "Weapons which use gravitational forces to rip enemy ships apart."
+  },
+  {
+    "order": 66,
+    "technology": "Warp Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Physics 4",
+    "description": "Weapons which create small warp points at the location of their targets."
+  },
+  {
+    "order": 67,
+    "technology": "Biological Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Biology 1",
+    "description": "Biological weapons which attack by means of viruses and plagues."
+  },
+  {
+    "order": 68,
+    "technology": "Planetary Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 10,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Weapons designed to damage planets and their inhabitants."
+  },
+  {
+    "order": 69,
+    "technology": "Ship Capture",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 5,
+    "access": "Standard",
+    "prerequisites": "Military Science 2",
+    "description": "Technology used to board and conquer other ships."
+  },
+  {
+    "order": 70,
+    "technology": "Temporal Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 7,
+    "access": "Racial: Temporal",
+    "prerequisites": "Temporal Studies 2",
+    "description": "Weapons which use temporal manipulation to cause ill effects."
+  },
+  {
+    "order": 71,
+    "technology": "Psychic Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 6,
+    "access": "Racial: Psychic",
+    "prerequisites": "Psychic Studies 2",
+    "description": "Weapons which use psychic energy to manipulate people and ships."
+  },
+  {
+    "order": 72,
+    "technology": "Computer Combat",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Computers 4",
+    "description": "The ability to attack the computer components of another ship."
+  },
+  {
+    "order": 73,
+    "technology": "Null-Space Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Astrophysics 2",
+    "description": "Weapons which cause rifts of null-space where they hit."
+  },
+  {
+    "order": 74,
+    "technology": "Organic Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 10,
+    "access": "Racial: Organic",
+    "prerequisites": "Organic Engineering 1",
+    "description": "Weapons using organic materials and delivery methods."
+  },
+  {
+    "order": 75,
+    "technology": "Crystalline Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 10,
+    "access": "Racial: Crystalline",
+    "prerequisites": "Crystallurgy 1",
+    "description": "Weapons using the directed resonance waves of crystals."
+  },
+  {
+    "order": 76,
+    "technology": "Troop Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Troops 1",
+    "description": "Weapons employed by troops on a planet's surface."
+  },
+  {
+    "order": 77,
+    "technology": "Explosive Warheads",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Warheads which cause damage to enemy ships upon exploding."
+  },
+  {
+    "order": 78,
+    "technology": "Smaller Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "Normal ship based weapons miniaturized to fit on smaller vehicles."
+  },
+  {
+    "order": 79,
+    "technology": "Massive Shield Depleting Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 1,
+    "access": "Special unlock: 1",
+    "prerequisites": "None",
+    "description": "Weapons designed to deplete all of a target's shields."
+  },
+  {
+    "order": 80,
+    "technology": "Massive Engine Destroying Weapons",
+    "proposedCategory": "Weapons & Ship Capture",
+    "originalGroup": "Weapon Technology",
+    "maximumLevel": 1,
+    "access": "Special unlock: 2",
+    "prerequisites": "None",
+    "description": "Weapons which destroy all of the engines on enemy ships."
+  },
+  {
+    "order": 81,
+    "technology": "Neural Computer Interface",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 1,
+    "access": "Special unlock: 3",
+    "prerequisites": "None",
+    "description": "Advanced computer interface which connects ships during combat."
+  },
+  {
+    "order": 82,
+    "technology": "Massive Planetary Shielding",
+    "proposedCategory": "Defense, Detection & Combat Systems",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 1,
+    "access": "Special unlock: 4",
+    "prerequisites": "None",
+    "description": "Massive shield generators which can protect an entire planet."
+  },
+  {
+    "order": 83,
+    "technology": "Gravitational Technology",
+    "proposedCategory": "Stellar Engineering",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "Astrophysics 2",
+    "description": "Science of manipulating gravity fields."
+  },
+  {
+    "order": 84,
+    "technology": "Stellar Harnessing",
+    "proposedCategory": "Economy & Industry",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 6,
+    "access": "Standard",
+    "prerequisites": "Astrophysics 1",
+    "description": "Science of utilizing the energy of stars."
+  },
+  {
+    "order": 85,
+    "technology": "Drones",
+    "proposedCategory": "Ships, Units & Logistics",
+    "originalGroup": "Applied Science",
+    "maximumLevel": 3,
+    "access": "Standard",
+    "prerequisites": "None",
+    "description": "The construction of small self-directed space vehicles."
+  }
+]

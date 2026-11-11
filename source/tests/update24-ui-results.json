@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "evidence": [
+    "Two ships in one sector show distinct routes only after choosing the specific card; sector click hides routes",
+    "Uncolonized planet and asteroid survey values render with distinct applicable capacities",
+    "Do Nothing UI sends real native lane assignment",
+    "Research cards preserve search focus, paginate, and add native projects",
+    "Known Designs tab handles no encounters without leaking foreign designs",
+    "Native colonization opens a type choice; adding a custom type persists and appears in colony summary"
+  ]
+}

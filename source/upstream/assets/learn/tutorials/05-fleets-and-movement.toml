@@ -1,0 +1,238 @@
+# OpenSE4's own lesson (docs/LEARNING.md). Written from docs/spec and the client.
+title = "Fleets, movement and supply"
+summary = "Form a fleet, move it, use waypoints and the order list, and keep your ships supplied."
+minutes = 15
+learned = [
+    "Forming a fleet in Fleet Transfer",
+    "Moving with Move To, movement points and route lines (Ctrl+L)",
+    "Setting a waypoint (Alt+1) and going there (Ctrl+1)",
+    "Reading and editing an order list, and keeping ships supplied",
+]
+
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+# OpenSE4 lesson extension (docs/LEARNING.md): ships to learn with. A normal game starts with none.
+starting_ships = ["Attack Ship", "Attack Ship", "Colony"]
+
+[[step]]
+title = "Ships on the move"
+text = """
+**Ships do their work far from home.** In this lesson you group your two attack ships into a
+**fleet**, move it, and keep it supplied. Press **Next**.
+"""
+highlight = ["lesson:panel"]
+manual = "ships-and-fleets"
+
+[[step]]
+title = "Select an attack ship"
+text = """
+**Select one of your attack ships** with the ship arrows at the top right, or `Space`.
+
+Check its report: the **Class** must say **{design:Attack Ship}**, not {design:Colony}.
+"""
+highlight = ["cycle:ship"]
+show = ["panel:report"]
+done = { selected = "ship", design_type = "Attack Ship" }
+manual = "main-window#selecting-things"
+
+[[step]]
+title = "Fleet Transfer"
+text = """
+**Press the Fleet Transfer order** (or `F`).
+
+The window lists the ships in this sector that are not in a fleet, and the fleets already here.
+"""
+highlight = ["order:fleet-transfer"]
+done = { window = "fleet-transfer" }
+manual = "ships-and-fleets#fleets"
+
+[[step]]
+title = "Create a fleet"
+text = """
+**Press Create Fleet**, keep the name offered (or type your own) and press **OK**.
+
+The new fleet starts empty: you put ships in it next.
+"""
+highlight = ["fleet-transfer:create-fleet"]
+show = ["fleet-transfer:ships", "fleet-transfer:fleets"]
+done = { any = [{ command = "CreateFleet" }, { fleet_ships = 1, design_type = "Attack Ship" }] }
+manual = "ships-and-fleets#fleets"
+
+[[step]]
+title = "Add the attack ships"
+text = """
+**Click both attack ships** in the list of ships outside fleets: their names begin with
+**{design:Attack Ship}**. Each joins the selected fleet.
+
+Leave the colony ship out: a fleet moves at the speed of its slowest ship. A click on a ship in
+the fleet's list on the right takes it out again. A fleet still empty when the window closes is
+deleted.
+"""
+highlight = ["fleet-transfer:ships", "fleet-transfer:ships:named"]
+allow = ["fleet-transfer:create-fleet"]
+show = ["fleet-transfer:fleets"]
+done = { fleet_ships = 2, design_type = "Attack Ship" }
+manual = "ships-and-fleets#fleets"
+
+[[step]]
+title = "Your fleet"
+text = """
+**Close Fleet Transfer (`Esc`), then select an attack ship again** with the ship arrows.
+
+The new fleet's ships are selected as one from now on.
+"""
+highlight = ["fleet-transfer:close", "cycle:ship"]
+done = { all = [{ not = { window = "fleet-transfer" } }, { selected = "fleet", design_type = "Attack Ship" }] }
+manual = "ships-and-fleets#fleets"
+
+[[step]]
+title = "Move the fleet"
+text = """
+**Press the Move To order** (or `M`). The fleet then waits for you to pick where it goes.
+
+The report now shows the **fleet**: its speed, supplies, formation, strategy and members.
+Orders you give now go to the whole fleet.
+"""
+highlight = ["order:move-to"]
+show = ["panel:report"]
+done = { picking = "move-to" }
+manual = "ships-and-fleets#moving-around"
+
+[[step]]
+title = "Where to"
+text = """
+**Click a sector far from the fleet**, at the other end of the system view.
+
+The fleet moves at once, one sector per movement point, and goes on next turn. If it is there
+already, press **Move To** again and pick a sector farther off.
+"""
+highlight = ["panel:system"]
+allow = ["order:move-to"]
+show = ["panel:report"]
+done = { all = [{ order = "move-to", design_type = "Attack Ship" }, { route = true }] }
+manual = "ships-and-fleets#moving-around"
+
+[[step]]
+title = "Movement lines"
+text = """
+**Press `Ctrl+L`** to show the ships' movement lines, unless they show already.
+"""
+highlight = ["lesson:panel"]
+show = ["panel:system"]
+keys = ["Ctrl+L"]
+done = { movement_lines = true }
+manual = "ships-and-fleets#moving-around"
+
+[[step]]
+title = "The route"
+text = """
+**A blue line shows the fleet's route** while it has further to go: the numbers on it say in which
+turn it reaches each sector. `Ctrl+L` hides and shows these lines. Press **Next**.
+"""
+highlight = ["panel:system"]
+keys = ["Ctrl+L"]
+manual = "ships-and-fleets#moving-around"
+
+[[step]]
+title = "Set a waypoint"
+text = """
+**Press `Alt+1`, then click a sector in the system view**: that sector becomes waypoint 1, and a
+cyan frame with the number marks it.
+
+**Waypoints** are ten places you can send ships to quickly. The sector with a warp point is a
+good choice.
+"""
+highlight = ["panel:system"]
+keys = ["Alt+1"]
+done = { command = "SetWaypoint" }
+manual = "ships-and-fleets#waypoints"
+
+[[step]]
+title = "Your fleet again"
+text = """
+**Click your fleet in the system view** to select it again. The report shows the fleet; where its
+sector holds more, click the fleet's row in the list.
+
+The ship and fleet arrows pass it by now: they offer only ships and fleets that can still move
+this turn.
+"""
+highlight = ["panel:system"]
+allow = ["panel:report"]
+done = { selected = "fleet", design_type = "Attack Ship" }
+manual = "ships-and-fleets#fleets"
+
+[[step]]
+title = "Go to the waypoint"
+text = """
+**Press `Ctrl+1`**, or the **Move To Waypoint** order and waypoint 1.
+
+The fleet adds the trip to its orders.
+"""
+highlight = ["order:move-to-waypoint"]
+show = ["panel:report"]
+keys = ["Ctrl+1"]
+done = { order = "move-to-waypoint", design_type = "Attack Ship" }
+manual = "ships-and-fleets#waypoints"
+
+[[step]]
+title = "The order list"
+text = """
+**Press View Orders** (or `V`) to see the fleet's whole order list. New orders are **added to the
+end** of it.
+"""
+highlight = ["order:view-orders"]
+done = { window = "view-orders" }
+manual = "ships-and-fleets#orders"
+
+[[step]]
+title = "Editing orders"
+text = """
+**Close the window** (**Close** or `Esc`) once you have looked.
+
+Here you can move orders up and down, delete one or clear them all, and **Repeat Orders** makes
+the fleet repeat its list forever. An order that fails clears the whole list.
+"""
+highlight = ["view-orders:close"]
+show = ["view-orders:list"]
+keys = ["Escape"]
+done = { not = { window = "view-orders" } }
+manual = "ships-and-fleets#orders"
+
+[[step]]
+title = "Supplies"
+text = """
+**Press the Resupply At Nearest order** (or `S`): the fleet adds a trip to the nearest resupply
+depot.
+
+Ships use **supplies** to move, fire and cloak. One that runs out crawls a sector a turn and
+cannot fire. Depots, such as your homeworld's, refill them for free.
+"""
+highlight = ["order:resupply"]
+show = ["panel:report"]
+done = { order = "resupply", design_type = "Attack Ship" }
+manual = "logistics#supply"
+
+[[step]]
+title = "End the turn"
+text = """
+**Press End Turn**, then **Yes**.
+
+Your fleet carries on with its orders at the start of your next turn, before you get control.
+"""
+highlight = ["button:end-turn"]
+done = { turns_passed = 1 }
+manual = "turns#turn-based-play"
+
+[[step]]
+title = "Well done"
+text = """
+**You can now form fleets, move them and edit their orders.** Two orders for guards: **Sentry**
+(`Y`) waits until an enemy appears in the system, and **Set Patrol** (`P`) moves between sectors
+forever. Press **Finish**.
+"""
+highlight = ["order:sentry", "order:patrol"]
+allow = ["log:close"]
+manual = "ships-and-fleets#orders"

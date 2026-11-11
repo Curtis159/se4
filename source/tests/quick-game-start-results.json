@@ -1,0 +1,22 @@
+{
+  "passed": true,
+  "evidence": [
+    "Quick Game uses the original native facility allocation exactly",
+    "One starting shipyard and restored mineral facility match original engine at two seeds",
+    "No premade player ships"
+  ],
+  "checks": [
+    {
+      "seed": 12345,
+      "yards": 1,
+      "mineralFacilities": 5,
+      "nativeChecksum": "10055110004485607195"
+    },
+    {
+      "seed": 43210,
+      "yards": 1,
+      "mineralFacilities": 5,
+      "nativeChecksum": "6838832608471365934"
+    }
+  ]
+}

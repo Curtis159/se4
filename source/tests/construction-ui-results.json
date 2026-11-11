@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "evidence": [
+    "Quick Game exposes Combined and Separate modes for two yards",
+    "Three simultaneous hull/type/exact-component filters match only the intended ship and persist after queueing",
+    "Planet choices exclude ships; yard choices exclude facilities and units",
+    "Planet card owns construction tabs and expandable facts; orderable vehicles are below it",
+    "Native default design types are offered and custom type edits persist",
+    "Upgrade facilities button queues a real researched family upgrade"
+  ]
+}

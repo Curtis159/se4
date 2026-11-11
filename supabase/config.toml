@@ -1,0 +1,2 @@
+[functions.send-turn-push]
+verify_jwt = false

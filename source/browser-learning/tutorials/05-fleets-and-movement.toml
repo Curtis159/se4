@@ -1,0 +1,29 @@
+# Browser adaptation of OpenSE4 learning topics; original sources retained upstream.
+title = "Fleets, movement and supply"
+summary = "Group ships and give orders without covering the map."
+minutes = 15
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+starting_ships = ["Attack Ship", "Attack Ship", "Colony"]
+[[step]]
+title = "Select a ship"
+text = "Tap the sector containing your attack ships and select one."
+done = { selected = "ship" }
+[[step]]
+title = "Form a fleet"
+text = "Choose Fleet. Select ships sharing this sector and choose Create fleet."
+done = { command = "CreateFleet" }
+[[step]]
+title = "Move"
+text = "Choose Move. White bubbles show destinations reachable this turn; numbers show estimated turns for farther sectors. Tap a destination. Orders to a fleet member normally move its fleet."
+done = { order = "move-to" }
+[[step]]
+title = "Supply and repair"
+text = "Resupply routes to the closest reachable depot by travel distance. Repair routes to the closest reachable shipyard. They report when no destination is reachable."
+[[step]]
+title = "Process movement"
+text = "Finish one turn, then inspect the ships and orders. You can Stop an order list, or leave a fleet from a member\u2019s action bar."
+done = { turns_passed = 1 }

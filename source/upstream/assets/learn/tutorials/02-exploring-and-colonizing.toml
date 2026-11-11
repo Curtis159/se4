@@ -1,0 +1,199 @@
+# OpenSE4's own lesson (docs/LEARNING.md). Written from docs/spec and the client.
+title = "Exploring and colonizing"
+summary = "Choose a planet to settle, send your colony ship there, explore the quadrant with your attack ships and found your first new colony."
+minutes = 15
+learned = [
+    "Finding planets to settle in the Planets window",
+    "Sending a colony ship with Send Colony Ship",
+    "Exploring with attack ships, and checking a ship's Class before giving an order",
+    "Choosing a new colony's type, and why colonies need spaceports",
+]
+
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+# OpenSE4 lesson extension (docs/LEARNING.md): ships to learn with. A normal game starts with none.
+starting_ships = ["Attack Ship", "Attack Ship", "Colony"]
+
+[[step]]
+title = "Explore and expand"
+text = """
+**In this lesson you found a colony and explore.** This game gives you two **attack ships** and a
+**colony ship**.
+
+First the colony ship goes to a good planet; then the attack ships set out. The game is
+turn-based: orders are carried out at once, as far as each ship can move. Press **Next**.
+"""
+highlight = ["lesson:panel"]
+manual = "galaxy#exploring"
+
+[[step]]
+title = "The Planets window"
+text = """
+**Open the Planets window** with its command button (the globe) or `F4`.
+
+It lists every planet you have seen, with its type, its atmosphere and its value for each
+resource.
+"""
+highlight = ["command:planets"]
+done = { window = "planets" }
+manual = "planets-and-colonies#the-planets-window"
+
+[[step]]
+title = "Find a good planet"
+text = """
+**Click Coloniz\\Breathe** on the right. It lists the planets you can settle whose air your people
+can breathe.
+
+Those make the best colonies: a domed colony holds far fewer people and facilities.
+**Colonizable** lists every planet you can settle, domed ones included.
+"""
+highlight = ["planets:colonizable-breathable"]
+show = ["planets:colonizable", "planets:list"]
+done = { tab = "planets:colonizable-breathable" }
+manual = "planets-and-colonies#what-a-planet-is-like"
+
+[[step]]
+title = "Send the colony ship"
+text = """
+**Press Send Colony Ship**, pick a planet in the list that opens, and press **Colonize**.
+
+Your colony ship gets its orders and the window closes. Another time you can also select the
+colony ship, press `C` and click a planet marked with a green star.
+"""
+highlight = ["planets:send-colony-ship"]
+show = ["planets:list"]
+done = { order = "colonize" }
+manual = "planets-and-colonies#colonizing"
+
+[[step]]
+title = "Select an attack ship"
+text = """
+**Click the right arrow of the top row of selectors** (or press `Space`) until the report shows
+an attack ship: its **Class** must say **{design:Attack Ship}**, not {design:Colony}.
+
+The colony ship already has its orders; give it no others.
+"""
+highlight = ["cycle:ship"]
+show = ["panel:report"]
+done = { selected = "ship", design_type = "Attack Ship" }
+manual = "main-window#selecting-things"
+
+[[step]]
+title = "Explore"
+text = """
+**Press the Explore order** (point at the order buttons to find it), or `E`. The report's
+**Class** says **{design:Attack Ship}**: the order goes to this ship.
+
+The ship flies at once to the nearest warp point that leads somewhere unexplored, and jumps
+through. Any ship that can move can explore; there is no special scout.
+"""
+highlight = ["order:explore"]
+show = ["panel:report", "panel:orders"]
+done = { order = "explore", design_type = "Attack Ship" }
+manual = "ships-and-fleets#orders"
+
+[[step]]
+title = "The second attack ship"
+text = """
+**Click the right arrow once more** to select your other attack ship: its **Class** must say
+**{design:Attack Ship}** too.
+
+The colony ship already has its orders; give it no others.
+"""
+highlight = ["cycle:ship"]
+show = ["panel:report"]
+done = { selected = "ship", design_type = "Attack Ship" }
+manual = "main-window#selecting-things"
+
+[[step]]
+title = "A second explorer"
+text = """
+**Press Explore** (`E`) for this ship too.
+
+Two ships with Explore orders never pick the same warp point, so together they find new systems
+twice as fast.
+"""
+highlight = ["order:explore"]
+show = ["panel:report"]
+done = { order = "explore", design_type = "Attack Ship" }
+manual = "galaxy#exploring"
+
+[[step]]
+title = "New systems"
+text = """
+**Watch the galaxy panel.** Each system your ships reach becomes **explored**: from then on you
+know its planets and warp points, even with no ship of yours there.
+
+An Explore order ends when the ship arrives. Then select the ship and press `E` again. Press
+**Next**.
+"""
+highlight = ["panel:galaxy"]
+manual = "galaxy#exploring"
+
+[[step]]
+title = "Founding the colony"
+text = """
+**Press End Turn**, then **Yes**.
+
+The colony ship takes people aboard at your homeworld, flies to its planet and settles it. If it
+arrived with movement to spare, the colony is founded already and the lesson moves on by itself.
+"""
+highlight = ["button:end-turn"]
+done = { colonies = 2 }
+manual = "planets-and-colonies#colonizing"
+
+[[step]]
+title = "Your new colony"
+text = """
+**Close the Log (`Esc`), then open Colonies** with `F5` or its command button.
+
+If the game asks for the new colony's type as the colony is founded, before the Log opens by
+itself at the new turn, pick the suggested type: it only guides your ministers.
+"""
+highlight = ["command:colonies"]
+allow = ["log:close", "colony-type:suggested"]
+done = { window = "colonies" }
+manual = "planets-and-colonies#the-colonies-window"
+
+[[step]]
+title = "A small start"
+text = """
+**A new colony starts small**: few people and no facilities. It grows every turn, and builds its
+own facilities once it has people.
+
+One rule matters a lot: a system delivers its output to your empire only through a
+**spaceport**. Your home system has one; colonies in other systems need their own. Press
+**Next**.
+"""
+highlight = ["colonies:list"]
+manual = "economy#spaceports"
+
+[[step]]
+title = "Keep exploring"
+text = """
+**Close the window (`Esc`), then press End Turn** and **Yes**, until your ships have explored five
+systems, your home system included.
+
+Each time a ship has arrived, select it with the ship arrows and press **Explore** (`E`) again.
+Close the Log (`Esc`) before you end a turn.
+"""
+highlight = ["button:end-turn", "order:explore"]
+allow = ["cycle:ship", "panel:report", "log:close"]
+done = { systems_explored = 5 }
+progress = ["turns_passed"]
+manual = "galaxy#warp-points"
+
+[[step]]
+title = "Well done"
+text = """
+**You explored new systems and founded a colony.** From here on the game is about doing this
+again and again: build colony ships, settle the best planets you find, and keep your explorers
+moving.
+
+The next lesson chooses research and uses construction queues. Press **Finish**.
+"""
+highlight = ["command:planets"]
+manual = "planets-and-colonies"

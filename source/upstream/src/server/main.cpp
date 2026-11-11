@@ -1,0 +1,1121 @@
+// opense4-server: the dedicated host for network games, the host side of
+// play-by-e-mail games, and a small test client. See docs/MULTIPLAYER.md.
+
+#include "core/environment.hpp"
+#include "game/diplomacy.hpp"
+#include "game/rules.hpp"
+#include "game/serialize.hpp"
+#include "game/setup.hpp"
+#include "game/turn.hpp"
+#include "net/auth.hpp"
+#include "net/client.hpp"
+#include "net/host.hpp"
+#include "net/pbem.hpp"
+#include "net/secure.hpp"
+#include "ruleset/ruleset.hpp"
+#include "mods/data_set.hpp"
+#include "game/players.hpp"
+#include "sdk/bots.hpp"
+#include "sdk/players.hpp"
+#include "sdk/process.hpp"
+#include "server/setup_file.hpp"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <charconv>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <format>
+#include <limits>
+#include <map>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <vector>
+
+using namespace opense4;
+
+namespace {
+
+constexpr std::string_view kUsage = R"(opense4-server: host OpenSE4 network and play-by-e-mail games.
+
+Usage:
+  opense4-server [options]                      host a network game (lobby, turns, autosave)
+  opense4-server pbem new --setup=FILE.toml --out=GAME.gam [--turn-files=DIR] [--bot-...]
+  opense4-server pbem process --game=GAME.gam --orders=DIR [--password=PW] [--keep-orders] [--bot-...]
+                              [--reset-passwords=N,M]  (new passwords, shown here only)
+                              [--turn-files=DIR] [--no-password-migration] [--allow-data-mismatch]
+  opense4-server pbem turn-files --game=GAME.gam [--out=DIR]
+  opense4-server pbem orders --turn=FILE.turn [--password=PW] [--out=DIR] [--trust-new-host-key]
+                             [--new-password=PW --confirm-old-password]  (a game of OpenSE4 0.6)
+  opense4-server pbem info --game=GAME.gam|FILE.turn
+  opense4-server bot --name=NAME [--connect=HOST[:PORT]] [--port=N] [--turns=N]
+  opense4-server password-verifier --game-id=N PASSWORD
+
+Network game options:
+  --data=DIR             The classic game's Data directory (default: auto-detect)
+  --mod=MOD              Play with this mod: a folder or .zip, or the id of one in the
+                         mods folder; repeat for several, in load order (default: the
+                         setup file's mods; a loaded game's own, from the mods folder).
+                         Every command that reads the data set takes --mod, --mods-dir
+                         and --no-bundled-mods
+  --mods-dir=DIR         Where mods are looked up by id (default: Mods in OpenSE4's
+                         user folder); then among the mods that come with OpenSE4
+                         (mods/ beside the program)
+  --no-bundled-mods      Leave out the mods that come with OpenSE4
+  --port=N               TCP port (default 6720; 0 = any free port)
+  --bind=ADDRESS         Listen on one address only (default: all IPv4 interfaces)
+  --upnp / --no-upnp     Forward the port on the router with UPnP (default: on)
+  --no-lan-discovery     Do not answer LAN game searches (UDP port 6716)
+  --explain-failed-orders  Orders that fail without a word in the original (no route,
+                         an unset waypoint, a battle on entering a sector...) get an
+                         "Unable to ..." log entry or a message, as the client's
+                         Options "Explain failed orders" (default: off)
+  --players=N            Human player slots (default 2)
+  --ai=N                 Computer empires (default 0)
+  --random-ai=LEVEL      Random computer players join as the game starts: low (1-3),
+                         medium (3-7) or high (6-10), as a game hosted over TCP/IP
+                         rolls them in the original (spec 05 §9.4)
+  --random-neutrals=LEVEL
+                         Random neutral players too, the same way, at most 5; with
+                         --random-ai, the same level (one serves both)
+  --ai=MOD:PLAYER        Every computer empire is played by this script player of
+                         a mod the game uses ([[ai.players]], docs/sdk/ai-protocol.md);
+                         "builtin" for the built-in AI; "external:N" for the external
+                         bot of slot N; "external" for a bot of its own each (slots
+                         0, 1, ... in order). Give --ai twice for a number and a player
+  --bot-port=N           Where external bots connect (default 6722 when an empire has
+                         an external player; 0 = any free port). Bots present a token
+                         (--bot-token, else OPENSE4_BOT_TOKEN, else a random one, shown
+                         here); the game starts once each external slot has its bot
+                         (docs/sdk/bots-and-arena.md)
+  --bot-bind=ADDRESS     Where bots may connect from (default 127.0.0.1: this computer
+                         only; others connect without encryption, with the token)
+  --bot-token=TOKEN      The token bots present
+  --bot-timeout=SEC      A bot's time for one request (default: --turn-timeout, else 60);
+                         a bot that takes longer fails it and the classic AI decides
+  --seed=N               Galaxy seed (default: random)
+  --systems=N            Exactly N star systems (default 0: rolled from the quadrant size)
+  --quadrant-size=N      Quadrant size 0 small, 1 medium (default), 2 large
+  --quadrant=NAME        Quadrant type from the data set (default: the first)
+  --setup=FILE.toml      Game name, seed, options and computer empires from a setup file
+  --turn-based           Players take their turns one after another, and their
+                         commands are carried out at once (default: simultaneous)
+  --name=NAME            Game name (default "OpenSE4 game")
+  --password=PW          Master password: players who give it may administer the game
+                         (start, kick, add computer empires, force a turn, hand
+                         empires to the computer, reset passwords)
+  --join-password=PW     Password every player needs to join
+  --host-key=FILE        The host's long-term key, which players' games remember
+                         (default: host_key.txt in OpenSE4's user folder; made on
+                         first use)
+  --turn-timeout=SEC     Process the turn after SEC seconds even if orders are missing
+                         (turn-based: end a player's turn after SEC seconds)
+  --load=GAME.gam        Continue a saved game (players reconnect with name and password)
+  --no-password-migration  A game of OpenSE4 0.6: refuse to move a player's password
+                         from that version's form (the player shows its hash once);
+                         such players get a password by Reset Passwords only.
+                         Each move is logged ("Password migration: ...")
+  --save-dir=DIR         Where autosaves go (default: the current directory, or the
+                         loaded game's file)
+  --autosave=N           Save every N turns (default 1; 0 = only when stopping)
+  --max-turns=N          Stop once the game reaches turn N (for testing)
+  --verbose              Also log lobby changes after the game started
+  --version              Print the version, network protocol and save format, and exit
+  -h, --help             Show this help
+
+The game starts when every player slot is taken and every player is ready.
+Players whose orders are missing when the turn is processed are played by the
+computer for that turn. In a turn-based game the server waits for the player
+whose turn it is; when the time limit runs out the computer plays the rest of
+that turn. Stop the server with Ctrl+C; it saves first.
+
+pbem new and process take --bot-port, --bot-bind, --bot-token, --bot-timeout and
+--bot-wait=SEC (default 30): the game's external bots connect (python -m opense4.bot
+... --reconnect stays for the next run) before the turn is played.
+
+pbem: the host keeps GAME.gam, the whole game, and never sends it. "new" and
+"process" write a turn file per player who plays next (<game>_<NN>.turn, next
+to GAME.gam or in --turn-files): the game as that player's empire knows it,
+encrypted to that empire's password and signed with the host's key. Send each
+player their own. Players' games trust the host key of a game from its first
+turn file on and refuse a turn file signed by another, so keep the key file
+(--host-key, the same as for network games; the commands print its
+play-by-e-mail fingerprint for players to compare). Players send back one
+.plr file per turn, signed with their password and encrypted to the host's
+key (lose the key, and the .plr files can no longer be read). "process" reads every .plr in DIR, checks game, turn,
+empire, the turn file it was made from and the password, processes the turn,
+rewrites GAME.gam (the previous turn is kept as GAME.gam.bak), writes the new
+turn files and deletes the .plr files it used (--keep-orders keeps them). It
+refuses a game made with another data set or other game-changing mods unless
+given --allow-data-mismatch (the game must still fit this data set). In a
+turn-based game (setup file: simultaneous = false) "process" plays one
+player's turn from that player's .plr and names the player whose turn file to
+send next. A game of OpenSE4 0.6 moves each empire's password to the current
+form with that player's first .plr, which shows the old form's hash once
+("password migration" in the report); --no-password-migration refuses that
+(reset those passwords instead). "turn-files" writes the current turn files
+again (a game of OpenSE4 0.6, or a lost file). "orders" writes an empty .plr from a turn file, as a
+player's game would: it trusts the turn file's host key on first use per game
+(known_hosts.txt in OpenSE4's user folder; --trust-new-host-key accepts a
+changed one), and for an empire of OpenSE4 0.6 shows the old password's form
+to that host once only with --confirm-old-password.
+
+password-verifier: what a setup file may hold instead of a password
+(password_verifier, master_password_verifier, with game_id = N): the
+password's verifier in the game N. It holds nothing anyone can log in with.
+
+bot: a scripted player for tests. It joins, readies up, submits orders for
+--turns turns (default 2) and exits 0 once the turn has advanced that often.
+In a turn-based game it plays one command in each of its turns and ends them.
+Options: --port=N (the host's, when --connect names none; default 6720),
+--password, --join-password, --master-password (then also --start to
+start the game), --race=PRESET, --data=DIR, --timeout=SEC (default 120),
+--host-key=HEX (the host's public key: refuse any other host), --old-password
+(a game of OpenSE4 0.6: show the host the old form of the password once, to
+move it to the new one; only with --host-key).
+)";
+
+std::atomic<bool> gStop{false};
+
+extern "C" void onSignal(int) { gStop = true; }
+
+void say(std::string_view line) {
+    const auto now = std::chrono::floor<std::chrono::seconds>(std::chrono::system_clock::now());
+    std::printf("%s %.*s\n", std::format("{:%Y-%m-%d %H:%M:%S}Z", now).c_str(), static_cast<int>(line.size()), line.data());
+    std::fflush(stdout);
+}
+
+int usage() {
+    std::printf("%.*s", static_cast<int>(kUsage.size()), kUsage.data());
+    return 0;
+}
+
+const char* kindName(game::PlayerKind k) {
+    switch (k) {
+        case game::PlayerKind::Human: return "human";
+        case game::PlayerKind::Computer: return "computer";
+        case game::PlayerKind::Neutral: return "neutral";
+    }
+    return "computer";
+}
+
+int fail(std::string_view message, int code = 1) {
+    std::fprintf(stderr, "opense4-server: %.*s\n", static_cast<int>(message.size()), message.data());
+    return code;
+}
+
+// ---- Command line ------------------------------------------------------------------------------
+
+struct Options {
+    std::map<std::string, std::string, std::less<>> values;              // the last value of each option
+    std::map<std::string, std::vector<std::string>, std::less<>> all;    // every value, for repeatable options (--mod)
+    std::vector<std::string> positional;
+
+    bool has(std::string_view key) const { return values.contains(key); }
+    std::vector<std::string> getAll(std::string_view key) const {
+        auto it = all.find(key);
+        return it == all.end() ? std::vector<std::string>{} : it->second;
+    }
+    std::string get(std::string_view key, std::string fallback = {}) const {
+        auto it = values.find(key);
+        return it == values.end() ? fallback : it->second;
+    }
+    // An integer option within [min, max]; the fallback when absent.
+    std::expected<int64_t, std::string> integer(std::string_view key, int64_t fallback, int64_t min, int64_t max) const {
+        auto it = values.find(key);
+        if (it == values.end()) return fallback;
+        int64_t v = 0;
+        const std::string& s = it->second;
+        auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+        if (ec != std::errc{} || end != s.data() + s.size() || v < min || v > max)
+            return std::unexpected(std::format("--{} must be a number from {} to {}", key, min, max));
+        return v;
+    }
+};
+
+std::expected<Options, std::string> parseArgs(std::span<char*> args, std::initializer_list<std::string_view> valued,
+                                              std::initializer_list<std::string_view> flags) {
+    Options o;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string_view arg = args[i];
+        if (!arg.starts_with("--")) {
+            o.positional.emplace_back(arg);
+            continue;
+        }
+        const size_t eq = arg.find('=');
+        const std::string key(arg.substr(2, eq == std::string_view::npos ? std::string_view::npos : eq - 2));
+        const bool isValued = std::find(valued.begin(), valued.end(), key) != valued.end();
+        const bool isFlag = std::find(flags.begin(), flags.end(), key) != flags.end();
+        if (!isValued && !isFlag) return std::unexpected(std::format("unknown option --{} (see --help)", key));
+        if (isFlag) {
+            if (eq != std::string_view::npos) return std::unexpected(std::format("--{} takes no value", key));
+            o.values[key] = "1";
+        } else if (eq != std::string_view::npos) {
+            o.values[key] = std::string(arg.substr(eq + 1));
+        } else if (i + 1 < args.size()) {
+            o.values[key] = args[++i];
+        } else {
+            return std::unexpected(std::format("--{} needs a value", key));
+        }
+        if (!isFlag) o.all[key].push_back(o.values[key]);
+    }
+    return o;
+}
+
+// ---- Shared helpers -----------------------------------------------------------------------------
+
+// The data set with its mods (docs/sdk/packages-and-data.md): --mod (paths,
+// or ids in --mods-dir and then among the mods that come with OpenSE4), else
+// `fallbackMods` (a setup file's), else the game-affecting mods a saved game
+// recorded, found the same way.
+std::expected<std::unique_ptr<game::Rules>, std::string> loadRules(const Options& o, std::vector<std::string> fallbackMods = {},
+                                                                   std::span<const ruleset::ModRecord> recorded = {}) {
+    const std::string dataArg = o.get("data");
+    const auto dir = ruleset::findInstalledDataDir(dataArg);
+    if (!dir)
+        return std::unexpected(dataArg.empty() ? std::string("No installed data set found; pass --data=<the game's Data directory>.")
+                                               : std::format("No data set at {}.", dataArg));
+    const std::filesystem::path userDir = net::secure::userDataDir();
+    mods::ModChoice choice;
+    choice.mods = o.has("mod") ? o.getAll("mod") : std::move(fallbackMods);
+    choice.folders.user = o.has("mods-dir") ? std::filesystem::path(o.get("mods-dir")) : mods::modsFolderIn(userDir);
+    if (!o.has("no-bundled-mods")) choice.folders.bundled = mods::bundledModsFolder(sdk::executableDir());
+    choice.open.cacheDir = mods::modCacheIn(userDir);
+    auto modSet = choice.mods.empty() && !recorded.empty() ? mods::modsForGame(recorded, choice.folders, choice.open) : mods::selectMods(choice);
+    if (!modSet) {
+        std::string why = "The mods could not be loaded:";
+        for (const auto& e : modSet.error()) why += "\n  " + e;
+        return std::unexpected(why);
+    }
+    for (const mods::Package& p : modSet->packages) say(std::format("Mod {} ({}) from {}", p.label(), mods::ModManager::summary(p), p.source.string()));
+    auto loaded = mods::loadDataSet(dir->parent_path(), *dir, *modSet);
+    // Without mods, as before: only a data set that cannot be read at all is
+    // refused. A mod's problems are always errors.
+    if (!loaded.ruleset || (!modSet->empty() && !loaded.diagnostics.errors.empty())) {
+        std::string why = std::format("Could not load the data set at {}", dir->string());
+        for (const auto& e : loaded.diagnostics.errors) why += "\n  " + e;
+        return std::unexpected(why);
+    }
+    return std::make_unique<game::Rules>(std::move(*loaded.ruleset), dir->parent_path());
+}
+
+// The host's long-term keys: --host-key=FILE, else host_key.txt in OpenSE4's
+// user folder (made on first use). Network players pin the network key; PBEM
+// players' orders files are encrypted to the PBEM box key, and they pin the
+// PBEM signing key that signs their turn files.
+enum class KeyUse { Network, Pbem };
+std::expected<net::secure::HostIdentity, std::string> loadHostKey(const Options& o, KeyUse use) {
+    const std::filesystem::path keyFile = o.has("host-key") ? std::filesystem::path(o.get("host-key"))
+                                                            : net::secure::userDataDir() / net::secure::kHostKeyFileName;
+    auto file = net::secure::loadOrCreateHostKey(keyFile);
+    if (!file) return std::unexpected(file.error());
+    if (!file->warning.empty()) say(file->warning);
+    if (use == KeyUse::Network)
+        say(std::format("Host key {} ({}); public key {}", net::crypto::fingerprint(file->keys.network.publicKey), keyFile.string(),
+                        net::crypto::hex(file->keys.network.publicKey)));
+    else
+        say(std::format("Play-by-e-mail host key {} ({}): players see it when they open their turn files", net::crypto::fingerprint(file->keys.pbem.signing.publicKey),
+                        keyFile.string()));
+    return std::move(file->keys);
+}
+
+std::string fileSafe(std::string_view name) {
+    std::string out;
+    for (char c : name) {
+        const auto u = static_cast<unsigned char>(c);
+        out.push_back(std::isalnum(u) || c == '-' || c == '_' ? c : '_');
+    }
+    return out.empty() ? std::string("game") : out;
+}
+
+std::string lobbySummary(const net::LobbyInfo& l) {
+    std::string s = std::format("Lobby '{}':", l.gameName);
+    for (const net::LobbySlot& slot : l.slots) {
+        if (slot.kind == net::SlotKind::Computer) s += std::format(" [computer{}{}]", slot.setup.preset.empty() ? "" : " ", slot.setup.preset);
+        else if (slot.open()) s += " [open]";
+        else s += std::format(" [{}{}{}]", slot.player, slot.ready ? ", ready" : "", slot.connected ? "" : ", away");
+    }
+    return s;
+}
+
+std::string turnSummary(const net::TurnStatus& t) {
+    if (t.turnBased) {
+        const net::EmpireTurnStatus* a = t.activeStatus();
+        std::string s = !a ? std::format("Turn {}: waiting (every player is played by the computer)", t.turn)
+                           : std::format("Turn {}: {}'s turn{}", t.turn, a->player.empty() ? a->empireName : a->player, a->connected ? "" : " (away)");
+        if (t.secondsLeft >= 0) s += std::format("; {} s left", t.secondsLeft);
+        return s;
+    }
+    std::string waiting;
+    int in = 0;
+    int humans = 0;
+    for (const auto& e : t.empires) {
+        if (!e.human || !e.alive || e.aiControl) continue;
+        ++humans;
+        if (e.submitted) ++in;
+        else waiting += std::format("{}{}{}", waiting.empty() ? "" : ", ", e.player.empty() ? e.empireName : e.player, e.connected ? "" : " (away)");
+    }
+    std::string s = std::format("Turn {}: orders from {} of {} players", t.turn, in, humans);
+    if (!waiting.empty()) s += "; waiting for " + waiting;
+    if (t.secondsLeft >= 0) s += std::format("; {} s left", t.secondsLeft);
+    return s;
+}
+
+// The script players the empires name must be players the game's mods declare
+// (docs/sdk/ai-protocol.md §1); what is wrong, one problem a line.
+std::string checkPlayers(const game::Rules& rules, std::span<const game::EmpireSetup> empires) {
+    std::string out;
+    for (const std::string& p : sdk::checkControllers(empires, sdk::gamePackages(rules))) out += (out.empty() ? "" : "\n") + p;
+    return out;
+}
+
+// ---- External bots (docs/sdk/bots-and-arena.md) ----------------------------------------------------
+
+// The external slots the empires' controllers name.
+std::vector<uint32_t> externalSlotsOf(const game::GameState& s) {
+    std::vector<game::EmpireSetup> setups(s.empires.size());
+    for (size_t i = 0; i < s.empires.size(); ++i) setups[i].controller = s.empires[i].controller;
+    return sdk::externalSlots(setups);
+}
+
+std::string slotList(std::span<const uint32_t> slots) {
+    std::string out;
+    for (uint32_t slot : slots) out += (out.empty() ? "" : ", ") + std::to_string(slot);
+    return out;
+}
+
+// The bots' host, when the game has external empires or --bot-port asks for
+// one, with the sessions asking it; null without.
+std::expected<std::unique_ptr<sdk::BotHost>, std::string> openBots(const Options& o, std::vector<uint32_t> slots, int64_t turnTimeout,
+                                                                  const std::string& gameName) {
+    if (slots.empty() && !o.has("bot-port")) return std::unique_ptr<sdk::BotHost>();
+    auto port = o.integer("bot-port", sdk::kDefaultBotPort, 0, 65535);
+    auto timeout = o.integer("bot-timeout", turnTimeout > 0 ? turnTimeout : 60, 1, 7 * 24 * 3600);
+    for (const auto* v : {&port, &timeout})
+        if (!*v) return std::unexpected(v->error());
+    sdk::BotHostOptions bo;
+    bo.bind = o.get("bot-bind", "127.0.0.1");
+    bo.port = static_cast<uint16_t>(*port);
+    bo.token = o.has("bot-token") ? o.get("bot-token") : core::environment("OPENSE4_BOT_TOKEN").value_or("");
+    bo.gameName = gameName;
+    bo.slots = slots;
+    bo.requestTimeout = std::chrono::seconds(*timeout);
+    bo.report = [](const std::string& line) { say(line); };
+    auto host = sdk::BotHost::open(std::move(bo));
+    if (!host) return std::unexpected(host.error());
+    say(std::format("Bots: external slots {} connect to {} with the token {} (python -m opense4.bot MODULE:CLASS --port {} --slot N, "
+                    "the token in OPENSE4_BOT_TOKEN); {} s per request",
+                    slots.empty() ? std::string("(none yet)") : slotList(slots), (*host)->address(), (*host)->token(), (*host)->port(), *timeout));
+    const std::string where = o.get("bot-bind", "127.0.0.1");
+    if (where != "127.0.0.1" && where != "localhost" && where != "::1")
+        say("Bots: they may connect from other computers; the connection is not encrypted, so only the token keeps others out");
+    sdk::installPlayers((*host)->playerSetup());
+    return std::move(*host);
+}
+
+// Waits for the bots of `slots` (play by e-mail), saying who is missing.
+void waitForBots(sdk::BotHost& bots, std::span<const uint32_t> slots, int64_t seconds) {
+    if (slots.empty()) return;
+    say(std::format("Bots: waiting up to {} s for external slots {}", seconds, slotList(slots)));
+    if (bots.waitFor(slots, std::chrono::seconds(seconds))) return;
+    std::vector<uint32_t> missing;
+    for (uint32_t slot : slots)
+        if (!bots.connected(slot)) missing.push_back(slot);
+    say(std::format("Bots: no bot for external slots {}; the classic AI plays their empires this time", slotList(missing)));
+}
+
+// Back to the sessions without bots before the host goes (they point into it).
+struct BotsGone {
+    ~BotsGone() { sdk::installPlayers(); }
+};
+
+// ---- The network server ----------------------------------------------------------------------------
+
+int runServer(std::span<char*> args) {
+    auto parsed = parseArgs(args,
+                            {"data", "port", "bind", "players", "ai", "seed", "systems", "quadrant-size", "quadrant", "setup", "name", "password",
+                             "join-password", "turn-timeout", "load", "save-dir", "autosave", "max-turns", "host-key", "mod", "mods-dir", "bot-port",
+                             "bot-bind", "bot-token", "bot-timeout", "random-ai", "random-neutrals"},
+                            {"upnp", "no-upnp", "no-lan-discovery", "turn-based", "no-password-migration", "verbose", "help", "version", "no-bundled-mods",
+                             "explain-failed-orders"});
+    if (!parsed) return fail(parsed.error(), 2);
+    const Options& o = *parsed;
+    if (o.has("help")) return usage();
+    if (o.has("version")) {
+        std::printf("%.*s (network protocol %u, save format %u)\n", static_cast<int>(net::appVersion().size()), net::appVersion().data(),
+                    net::kProtocolVersion, game::kSaveVersion);
+        return 0;
+    }
+    if (!o.positional.empty()) return fail(std::format("unexpected argument '{}' (see --help)", o.positional.front()), 2);
+
+    auto port = o.integer("port", net::kDefaultPort, 0, 65535);
+    auto players = o.integer("players", 2, 1, 32);
+    // --ai: how many computer empires, and who plays them.
+    std::expected<int64_t, std::string> ai = int64_t{0};
+    std::optional<game::Controller> aiPlayer;
+    bool botEach = false;   // --ai=external: a bot of its own for each computer empire
+    for (const std::string& v : o.getAll("ai")) {
+        int64_t n = 0;
+        const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
+        if (ec == std::errc{} && end == v.data() + v.size()) ai = n >= 0 && n <= 31 ? std::expected<int64_t, std::string>(n)
+                                                                                     : std::unexpected(std::string("--ai must be a number from 0 to 31"));
+        else if (v == "external") botEach = true;
+        else if (auto c = game::parseController(v)) aiPlayer = *c;
+        else ai = std::unexpected(std::format("--ai must be a number of computer empires or a player \"<mod id>:<player>\", not '{}'", v));
+    }
+    auto systems = o.integer("systems", 0, 0, 500);
+    auto quadrantSize = o.integer("quadrant-size", 1, 0, 2);
+    auto timeout = o.integer("turn-timeout", 0, 0, 7 * 24 * 3600);
+    auto autosave = o.integer("autosave", 1, 0, 100000);
+    auto maxTurns = o.integer("max-turns", 0, 0, 1000000);
+    auto seed = o.integer("seed", 0, 0, std::numeric_limits<int64_t>::max());
+    for (const auto* v : {&port, &players, &ai, &systems, &quadrantSize, &timeout, &autosave, &maxTurns, &seed})
+        if (!*v) return fail(v->error(), 2);
+
+    // The mods: --mod, else the setup file's, else those a saved game recorded.
+    std::vector<std::string> setupMods;
+    if (o.has("setup")) {
+        auto m = server::setupFileMods(o.get("setup"));
+        if (!m) return fail(m.error(), 2);
+        setupMods = std::move(*m);
+    }
+    std::vector<ruleset::ModRecord> recorded;
+    if (o.has("load"))
+        if (auto info = game::readSaveInfo(o.get("load"))) recorded = info->mods;
+    auto rules = loadRules(o, std::move(setupMods), recorded);
+    if (!rules) return fail(rules.error(), 2);
+    say(std::format("{}; data set {}", net::appVersion(), game::dataSetIdentity(**rules)));
+
+    net::HostConfig cfg;
+    cfg.gameName = o.get("name", "OpenSE4 game");
+    cfg.bindAddress = o.get("bind");
+    cfg.port = static_cast<uint16_t>(*port);
+    cfg.humanSlots = static_cast<int>(*players);
+    cfg.autoStart = true;
+    cfg.turnTimeoutSeconds = static_cast<int>(*timeout);
+    cfg.masterPassword = o.get("password");
+    cfg.joinPassword = o.get("join-password");
+    cfg.upnp.enabled = !o.has("no-upnp");
+    cfg.lanDiscovery = !o.has("no-lan-discovery");
+    cfg.passwordMigration = !o.has("no-password-migration");
+    cfg.explainFailedOrders = o.has("explain-failed-orders");
+    // The host's identity: players' games remember its key and refuse a host
+    // that shows another (docs/MULTIPLAYER.md, "Security").
+    auto hostKey = loadHostKey(o, KeyUse::Network);
+    if (!hostKey) return fail(hostKey.error(), 2);
+    cfg.hostKey = hostKey->network;
+    cfg.setup.seed = o.has("seed") ? static_cast<uint64_t>(*seed) : net::randomId();
+    cfg.setup.options.systemCount = static_cast<int>(*systems);
+    cfg.setup.options.quadrantSize = static_cast<int>(*quadrantSize);
+    cfg.setup.options.quadrantType = o.get("quadrant");
+    cfg.setup.options.simultaneous = true;  // a network host runs simultaneous turns unless --turn-based (docs/MULTIPLAYER.md)
+    // Random players (spec 05 §9.4): one level serves both kinds.
+    for (const char* key : {"random-ai", "random-neutrals"}) {
+        if (!o.has(key)) continue;
+        static constexpr std::array<std::string_view, 3> kLevels{"low", "medium", "high"};
+        const std::string v = o.get(key);
+        const auto at = std::find(kLevels.begin(), kLevels.end(), v);
+        if (at == kLevels.end()) return fail(std::format("--{} must be low, medium or high, not '{}'", key, v), 2);
+        const int level = static_cast<int>(at - kLevels.begin());
+        if ((cfg.randomComputers || cfg.randomNeutrals) && level != cfg.randomPlayersLevel)
+            return fail("--random-ai and --random-neutrals take the same level: one serves both", 2);
+        cfg.randomPlayersLevel = level;
+        (std::string_view(key) == "random-ai" ? cfg.randomComputers : cfg.randomNeutrals) = true;
+    }
+    std::vector<game::EmpireSetup> computers(static_cast<size_t>(*ai));
+
+    if (o.has("setup")) {
+        auto setup = server::loadSetupFile(o.get("setup"), **rules);
+        if (!setup) return fail(setup.error(), 2);
+        if (!o.has("name")) cfg.gameName = setup->gameName;
+        if (setup->seed && !o.has("seed")) cfg.setup.seed = *setup->seed;
+        const int count = o.has("systems") ? cfg.setup.options.systemCount : setup->options.systemCount;
+        const int size = o.has("quadrant-size") ? cfg.setup.options.quadrantSize : setup->options.quadrantSize;
+        const std::string quadrant = o.has("quadrant") ? cfg.setup.options.quadrantType : setup->options.quadrantType;
+        cfg.setup.options = setup->options;
+        cfg.setup.options.systemCount = count;
+        cfg.setup.options.quadrantSize = size;
+        cfg.setup.options.quadrantType = quadrant;
+        if (!o.has("password")) {
+            cfg.masterPassword = setup->masterPassword;
+            cfg.masterPasswordVerifier = setup->masterPasswordVerifier;
+        }
+        if (setup->gameId) cfg.gameId = *setup->gameId;
+        cfg.setup.scenario = setup->scenario;   // a mod's scenario (docs/sdk/rules.md "Scenarios")
+        for (const auto& e : setup->empires) {
+            if (e.setup.kind == game::PlayerKind::Human) say("Note: human empires in the setup file are ignored; players join the lobby.");
+            else computers.push_back(e.setup);
+        }
+    }
+
+    if (o.has("turn-based")) cfg.setup.options.simultaneous = false;
+    // --ai=MOD:PLAYER plays every computer empire (the setup file's included; not neutral ones).
+    if (aiPlayer)
+        for (auto& c : computers)
+            if (c.kind != game::PlayerKind::Neutral) c.controller = *aiPlayer;
+    if (botEach) {
+        uint32_t slot = 0;
+        for (auto& c : computers)
+            if (c.kind != game::PlayerKind::Neutral) {
+                c.controller.kind = game::Controller::Kind::External;
+                c.controller.slot = slot++;
+            }
+    }
+    if (auto problems = checkPlayers(**rules, computers); !problems.empty()) return fail(problems, 2);
+    // A new game with external empires waits for their bots before it starts.
+    const std::vector<uint32_t> newGameSlots = o.has("load") ? std::vector<uint32_t>{} : sdk::externalSlots(computers);
+    if (!newGameSlots.empty()) cfg.autoStart = false;
+
+    if (const std::string& q = cfg.setup.options.quadrantType; !q.empty()) {
+        const auto& types = (*rules)->data().quadrantTypes;
+        const bool known = std::any_of(types.begin(), types.end(), [&](const auto& t) {
+            return std::equal(t.name.begin(), t.name.end(), q.begin(), q.end(),
+                              [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); });
+        });
+        if (!known) {
+            std::string names;
+            for (const auto& t : types) names += (names.empty() ? "" : ", ") + t.name;
+            return fail(std::format("the data set has no quadrant type '{}' (it has: {})", q, names), 2);
+        }
+    }
+
+    std::filesystem::path saveFile = std::filesystem::path(o.get("save-dir", ".")) / (fileSafe(cfg.gameName) + ".gam");
+    std::unique_ptr<sdk::BotHost> bots;
+    const BotsGone botsGone;
+    net::HostSession host(**rules, cfg);
+    if (o.has("load")) {
+        auto game = game::loadGame(o.get("load"));
+        if (!game) return fail(game.error(), 2);
+        game::upgradeLoadedGame(**rules, game->first, game->second.formatVersion);
+        auto opened = openBots(o, externalSlotsOf(game->first), *timeout, cfg.gameName);
+        if (!opened) return fail(opened.error(), 2);
+        bots = std::move(*opened);
+        // Reading a game file recalculates every colony's cloak and sensor
+        // levels, a colony that can no longer cloak decloaking as by Decloak
+        // (spec 01 §6.9, §14 Q44).
+        game::diplomacy::recalculateColonies(**rules, game->first);
+        if (!o.has("save-dir")) saveFile = o.get("load");
+        else if (!game->second.gameName.empty()) saveFile = std::filesystem::path(o.get("save-dir")) / (fileSafe(game->second.gameName) + ".gam");
+        if (auto r = host.resume(std::move(game->first), game->second); !r) return fail(r.error(), 2);
+    } else {
+        auto opened = openBots(o, newGameSlots, *timeout, cfg.gameName);
+        if (!opened) return fail(opened.error(), 2);
+        bots = std::move(*opened);
+        if (auto r = host.start(); !r) return fail(r.error(), 2);
+        for (auto& c : computers)
+            if (auto r = host.addComputerEmpire(c); !r) return fail(r.error(), 2);
+    }
+    bool toldWaiting = false;
+
+    std::signal(SIGINT, onSignal);
+    std::signal(SIGTERM, onSignal);
+
+    // What was saved last (turn-based: the game turn and whose turn it was).
+    std::optional<std::pair<uint32_t, uint32_t>> lastSaved;
+    auto saveNow = [&](std::string_view why) {
+        if (!host.state()) return;
+        lastSaved = std::pair{host.state()->turn, host.activeEmpire().value};
+        if (auto r = host.save(saveFile); r) say(std::format("Saved turn {} to {} ({})", host.state()->turn, saveFile.string(), why));
+        else say("Could not save: " + r.error());
+    };
+
+    const bool verbose = o.has("verbose");
+    std::string lastLobby, lastTurn;
+    int exitCode = 0;
+    while (!gStop) {
+        for (const net::Event& e : host.poll(200)) {
+            switch (e.type) {
+                case net::EventType::LobbyChanged: {
+                    std::string s = lobbySummary(host.lobby());
+                    if ((host.phase() == net::HostPhase::Lobby || verbose) && s != lastLobby) say(s);
+                    lastLobby = std::move(s);
+                    break;
+                }
+                case net::EventType::StateUpdated:
+                case net::EventType::TurnProcessing:
+                case net::EventType::OrdersReceived:
+                    // Turn-based games: every command and every player turn (the turn summary says whose turn it is).
+                    // Simultaneous games: each player's orders and each turn processed.
+                    if (verbose || !host.turnBased()) say(net::describe(e));
+                    break;
+                case net::EventType::TurnStatusChanged: {
+                    // Only the open turn's status (events from a turn processed since are stale).
+                    if (e.turn != host.turnStatus().turn || host.turnStatus().processing) break;
+                    std::string s = turnSummary(host.turnStatus());
+                    if (s != lastTurn) say(s);
+                    lastTurn = std::move(s);
+                    break;
+                }
+                default: say(net::describe(e)); break;
+            }
+            if (e.type == net::EventType::GameStarted) saveNow("game start");
+            // Turn-based games also save as each player's turn begins.
+            const bool autosaveTurn = *autosave > 0 && host.state() && host.state()->turn % *autosave == 0;
+            if (e.type == net::EventType::NewTurn && autosaveTurn && !host.turnBased()) saveNow("autosave");
+            if (e.type == net::EventType::PlayerTurn && autosaveTurn && lastSaved != std::pair{host.state()->turn, host.activeEmpire().value})
+                saveNow("autosave");
+        }
+        // The start held for the bots: as the host starts by itself, once each external slot has its bot.
+        if (!newGameSlots.empty() && host.phase() == net::HostPhase::Lobby) {
+            const auto& slots = host.lobby().slots;
+            const bool full = std::none_of(slots.begin(), slots.end(), [](const net::LobbySlot& sl) { return sl.open(); });
+            if (full && host.startProblem(false).empty()) {
+                const bool botsIn = bots && std::all_of(newGameSlots.begin(), newGameSlots.end(), [&](uint32_t sl) { return bots->connected(sl); });
+                if (botsIn) {
+                    if (auto r = host.startGame(false); !r) return fail("the game could not start: " + r.error(), 1);
+                } else if (!toldWaiting) {
+                    say(std::format("Every player is ready; waiting for the bots of external slots {}", slotList(newGameSlots)));
+                    toldWaiting = true;
+                }
+            }
+        }
+        if (*maxTurns > 0 && host.state() && host.state()->turn >= static_cast<uint32_t>(*maxTurns)) {
+            say(std::format("Reached turn {}; stopping.", host.state()->turn));
+            break;
+        }
+        if (host.phase() == net::HostPhase::Stopped) {
+            exitCode = 1;
+            break;
+        }
+    }
+    if (gStop) say("Stopping (signal).");
+    saveNow("shutdown");
+    if (bots) {
+        script::ValueMap bye;
+        bye.emplace_back("reason", script::Value("the server is shutting down"));
+        bots->sayGoodbye(script::Value(std::move(bye)));
+    }
+    host.stop("The server is shutting down.");
+    for (const net::Event& e : host.poll(0)) say(net::describe(e));
+    return exitCode;
+}
+
+// ---- Play by e-mail ---------------------------------------------------------------------------------
+
+// Prints the turn files to send, each to its empire's player.
+void listTurnFiles(const std::vector<std::pair<game::EmpireId, std::filesystem::path>>& files, const game::SaveInfo& info) {
+    for (const auto& [empire, file] : files) {
+        const std::string player = empire.index() < info.players.size() ? info.players[empire.index()] : std::string{};
+        std::printf("Send %s to empire %u%s%s.\n", file.string().c_str(), empire.value + 1, player.empty() ? "" : ", player ", player.c_str());
+    }
+}
+
+int pbemNew(std::span<char*> args) {
+    auto o = parseArgs(args, {"setup", "out", "data", "turn-files", "host-key", "mod", "mods-dir", "bot-port", "bot-bind", "bot-token", "bot-timeout", "bot-wait"},
+                       {"help", "no-bundled-mods"});
+    if (!o) return fail(o.error(), 2);
+    if (o->has("help")) return usage();
+    if (!o->has("setup") || !o->has("out")) return fail("pbem new needs --setup=FILE.toml and --out=GAME.gam", 2);
+    auto setupMods = server::setupFileMods(o->get("setup"));
+    if (!setupMods) return fail(setupMods.error(), 2);
+    auto rules = loadRules(*o, std::move(*setupMods));
+    if (!rules) return fail(rules.error(), 2);
+    auto setup = server::loadSetupFile(o->get("setup"), **rules);
+    if (!setup) return fail(setup.error(), 2);
+    if (setup->empires.empty()) return fail("the setup file has no [[empire]] entries", 2);
+
+    game::GameSetup gs;
+    gs.seed = setup->seed.value_or(net::randomId());
+    gs.options = setup->options;
+    gs.scenario = setup->scenario;
+    game::SaveInfo info;
+    info.gameName = setup->gameName;
+    info.dataSet = game::dataSetIdentity(**rules);
+    info.gameId = setup->gameId.value_or(net::randomId());
+    // The game keeps only verifiers, made for this game (Argon2id: a moment per password).
+    info.masterPasswordVerifier = !setup->masterPasswordVerifier.empty() ? setup->masterPasswordVerifier
+                                                                         : net::passwordVerifier(setup->masterPassword, info.gameId);
+    for (const auto& e : setup->empires) {
+        game::EmpireSetup es = e.setup;
+        es.passwordHash = !e.passwordVerifier.empty() ? e.passwordVerifier : net::passwordVerifier(e.password, info.gameId);
+        gs.empires.push_back(std::move(es));
+        info.players.push_back(e.player);
+    }
+    if (auto problems = checkPlayers(**rules, gs.empires); !problems.empty()) return fail(problems, 2);
+    auto hostKey = loadHostKey(*o, KeyUse::Pbem);
+    if (!hostKey) return fail(hostKey.error(), 2);
+    auto state = game::createGame(**rules, gs);
+    if (!state) return fail("could not create the game: " + state.error(), 1);
+    // Turn-based: computer players before the first human play now, and that human's turn starts.
+    if (game::turnBased(*state)) {
+        auto bots = openBots(*o, externalSlotsOf(*state), 0, info.gameName);
+        if (!bots) return fail(bots.error(), 2);
+        const BotsGone botsGone;
+        auto wait = o->integer("bot-wait", 30, 0, 24 * 3600);
+        if (!wait) return fail(wait.error(), 2);
+        if (*bots) waitForBots(**bots, externalSlotsOf(*state), *wait);
+        game::resumeTurnBased(**rules, *state);
+        if (*bots) (*bots)->sayGoodbye(script::Value(script::ValueMap{{"reason", script::Value("the game file is written")}}));
+    }
+    const std::filesystem::path out = o->get("out");
+    if (auto r = game::saveGame(out, *state, info); !r) return fail(r.error(), 1);
+    std::printf("Created '%s' (turn %u) in %s:\n", info.gameName.c_str(), state->turn, out.string().c_str());
+    for (const game::Empire& e : state->empires)
+        std::printf("  empire %u: %s (%s)%s\n", e.id.value + 1, e.name.c_str(), kindName(e.kind),
+                    e.passwordHash.empty() ? "" : ", password set");
+    const std::filesystem::path dir = o->has("turn-files") ? std::filesystem::path(o->get("turn-files"))
+                                      : out.has_parent_path() ? out.parent_path()
+                                                              : std::filesystem::path(".");
+    auto files = net::pbem::writeTurnFiles(**rules, out, dir, hostKey->pbem);
+    if (!files) return fail(files.error(), 1);
+    std::printf("Keep %s to yourself: it holds the whole game.\n", out.string().c_str());
+    listTurnFiles(*files, info);
+    return 0;
+}
+
+int pbemTurnFiles(std::span<char*> args) {
+    auto o = parseArgs(args, {"game", "out", "data", "host-key", "mod", "mods-dir"}, {"help", "no-bundled-mods"});
+    if (!o) return fail(o.error(), 2);
+    if (o->has("help")) return usage();
+    if (!o->has("game")) return fail("pbem turn-files needs --game=GAME.gam", 2);
+    std::vector<ruleset::ModRecord> recorded;
+    if (auto saved = game::readSaveInfo(o->get("game"))) recorded = saved->mods;
+    auto rules = loadRules(*o, {}, recorded);
+    if (!rules) return fail(rules.error(), 2);
+    const std::filesystem::path game = o->get("game");
+    auto info = game::readSaveInfo(game);
+    if (!info) return fail(info.error(), 1);
+    const std::filesystem::path dir = o->has("out") ? std::filesystem::path(o->get("out"))
+                                      : game.has_parent_path() ? game.parent_path()
+                                                               : std::filesystem::path(".");
+    auto hostKey = loadHostKey(*o, KeyUse::Pbem);
+    if (!hostKey) return fail(hostKey.error(), 2);
+    auto files = net::pbem::writeTurnFiles(**rules, game, dir, hostKey->pbem);
+    if (!files) return fail(files.error(), 1);
+    if (files->empty()) std::printf("Nobody plays this turn (the game is over, or no human is left).\n");
+    listTurnFiles(*files, *info);
+    return 0;
+}
+
+int pbemProcess(std::span<char*> args) {
+    auto o = parseArgs(args,
+                       {"game", "orders", "password", "data", "reset-passwords", "turn-files", "host-key", "mod", "mods-dir", "bot-port", "bot-bind",
+                        "bot-token", "bot-timeout", "bot-wait"},
+                       {"keep-orders", "allow-data-mismatch", "no-password-migration", "help", "no-bundled-mods"});
+    if (!o) return fail(o.error(), 2);
+    if (o->has("help")) return usage();
+    if (!o->has("game") || !o->has("orders")) return fail("pbem process needs --game=GAME.gam and --orders=DIR", 2);
+    std::vector<ruleset::ModRecord> recorded;
+    if (auto saved = game::readSaveInfo(o->get("game"))) recorded = saved->mods;
+    auto rules = loadRules(*o, {}, recorded);
+    if (!rules) return fail(rules.error(), 2);
+    net::pbem::ProcessOptions options;
+    options.masterPassword = o->get("password");
+    auto hostKey = loadHostKey(*o, KeyUse::Pbem);
+    if (!hostKey) return fail(hostKey.error(), 2);
+    options.host = hostKey->pbem;
+    options.deleteProcessed = !o->has("keep-orders");
+    options.allowDataSetMismatch = o->has("allow-data-mismatch");
+    options.passwordMigration = !o->has("no-password-migration");
+    if (o->has("turn-files")) options.turnFilesDir = o->get("turn-files");
+    // --reset-passwords=2,5: Reset Passwords for those empires (numbers from 1).
+    const std::string resets = o->get("reset-passwords");
+    for (std::string_view rest = resets; !rest.empty();) {
+        const size_t comma = rest.find(',');
+        const std::string item(rest.substr(0, comma));
+        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+        uint32_t n = 0;
+        const auto [end, ec] = std::from_chars(item.data(), item.data() + item.size(), n);
+        if (ec != std::errc{} || end != item.data() + item.size() || n == 0) return fail(std::format("--reset-passwords: '{}' is not an empire number", item), 2);
+        options.resetPasswords.push_back(game::EmpireId{n - 1});
+    }
+    // The game's external bots, connected before the turn is played.
+    std::unique_ptr<sdk::BotHost> bots;
+    const BotsGone botsGone;
+    if (auto game = game::loadGame(o->get("game"))) {
+        const std::vector<uint32_t> slots = externalSlotsOf(game->first);
+        auto opened = openBots(*o, slots, 0, game->second.gameName);
+        if (!opened) return fail(opened.error(), 2);
+        bots = std::move(*opened);
+        auto wait = o->integer("bot-wait", 30, 0, 24 * 3600);
+        if (!wait) return fail(wait.error(), 2);
+        if (bots) waitForBots(*bots, slots, *wait);
+    }
+    auto rep = net::pbem::processGameFile(**rules, o->get("game"), o->get("orders"), options);
+    if (bots) bots->sayGoodbye(script::Value(script::ValueMap{{"reason", script::Value("the turn is processed")}}));
+    if (!rep) return fail(rep.error(), 1);
+    const game::SaveInfo info = game::readSaveInfo(o->get("game")).value_or(game::SaveInfo{});
+    for (const std::string& line : net::pbem::reportLines(*rep, options.deleteProcessed, info)) std::printf("%s\n", line.c_str());
+    return 0;
+}
+
+int pbemOrders(std::span<char*> args) {
+    auto o = parseArgs(args, {"turn", "game", "password", "new-password", "out"}, {"trust-new-host-key", "confirm-old-password", "help"});
+    if (!o) return fail(o.error(), 2);
+    if (o->has("help")) return usage();
+    if (!o->has("turn") && !o->has("game")) return fail("pbem orders needs --turn=FILE.turn (the player's turn file)", 2);
+    const std::filesystem::path path = o->has("turn") ? o->get("turn") : o->get("game");
+    auto turnFile = net::pbem::readTurnFile(path);
+    if (!turnFile) return fail(turnFile.error() + " (pbem orders needs the player's turn file)", 1);
+    const game::EmpireId empire = turnFile->empire;
+    // The host's signature and key (trusted per game in known_hosts.txt from
+    // the first turn file on), the password (an OpenSE4 0.6 empire shows the
+    // old hash once, with --confirm-old-password, and signs with a
+    // --new-password), then the view.
+    net::secure::KnownHosts known(net::secure::userDataDir() / net::secure::kKnownHostsFileName);
+    const net::pbem::HostKeyCheck host = net::pbem::checkHostKey(*turnFile, known);
+    net::pbem::PlayerTrust trust;
+    trust.trustChangedHostKey = o->has("trust-new-host-key");
+    trust.showOldPassword = o->has("confirm-old-password");
+    if (net::isLegacyVerifier(turnFile->verifier) && !o->has("new-password"))
+        return fail("this game was made by OpenSE4 0.6: give a --new-password for this empire", 2);
+    auto opened = net::pbem::openTurnForPlayer(*turnFile, known, o->get("password"), o->get("new-password"), trust);
+    if (!opened) return fail(opened.error(), 1);
+    switch (host.status) {
+        case net::pbem::HostKeyStatus::First:
+            say(std::format("First turn file of this game: the host key {} is trusted from now on. Check it against the one the host sees.",
+                            host.fingerprint));
+            break;
+        case net::pbem::HostKeyStatus::Known: say(std::format("The host key {} is the one trusted for this game.", host.fingerprint)); break;
+        case net::pbem::HostKeyStatus::Changed: say(std::format("The new host key {} is trusted for this game from now on.", host.fingerprint)); break;
+    }
+    auto state = game::deserializeState(opened->view.view);
+    if (!state) return fail(state.error(), 1);
+    if (game::turnBased(*state) && (!state->playerTurn.started || game::activePlayer(*state) != empire))
+        return fail("it is not this empire's turn in this turn file", 1);
+    // An order list without commands: "end turn" (the empire keeps its standing orders).
+    const game::EmpireOrders orders{empire, state->turn, {}};
+    auto file = net::pbem::writePlayerOrders(o->get("out", "."), turnFile->info, orders, opened->view.viewChecksum, opened->keys, turnFile->hostKey,
+                                             opened->legacyPasswordHash);
+    if (!file) return fail(file.error(), 1);
+    std::printf("Wrote %s (turn %u, empire %u).\n", file->string().c_str(), orders.turn, empire.value + 1);
+    return 0;
+}
+
+int pbemInfo(std::span<char*> args) {
+    auto o = parseArgs(args, {"game"}, {"help"});
+    if (!o) return fail(o.error(), 2);
+    if (o->has("help")) return usage();
+    if (!o->has("game")) return fail("pbem info needs --game=GAME.gam (or a player's FILE.turn)", 2);
+    auto game = game::loadGame(o->get("game"));
+    if (!game) {
+        // A player's turn file: only its header is readable without the password.
+        auto turnFile = net::pbem::readTurnFile(o->get("game"));
+        if (!turnFile) return fail(game.error(), 1);
+        const game::SaveInfo& info = turnFile->info;
+        std::printf("A player's turn file of '%s' (id %016llx), turn %u, for empire %u%s.\n", info.gameName.c_str(),
+                    static_cast<unsigned long long>(info.gameId), info.turn, turnFile->empire.value + 1,
+                    turnFile->encrypted ? " (its view opens with that empire's password)" : "");
+        std::printf("Signed by the host key %s%s.\n", net::crypto::fingerprint(turnFile->hostSigningKey).c_str(),
+                    net::pbem::turnFileSigned(*turnFile) ? "" : ", but changed since (the signature does not match)");
+        std::printf("Data set: %s\n%s\n", info.dataSet.c_str(), turnFile->turnBased ? "Turn-based: it is that empire's turn." : "Simultaneous turns.");
+        for (size_t i = 0; i < info.empires.size(); ++i) {
+            const std::string player = i < info.players.size() ? info.players[i] : std::string{};
+            std::printf("  empire %zu: %s%s%s\n", i + 1, info.empires[i].c_str(), player.empty() ? "" : ", player ", player.c_str());
+        }
+        return 0;
+    }
+    const auto& [state, info] = *game;
+    std::printf("Game '%s' (id %016llx), turn %u, year %d.%u\n", info.gameName.c_str(), static_cast<unsigned long long>(info.gameId), state.turn,
+                state.year(), state.turn % 10);
+    std::printf("Data set: %s\nMaster password: %s\n", info.dataSet.c_str(), info.masterPasswordVerifier.empty() ? "none" : "set");
+    for (const game::Empire& e : state.empires) {
+        const std::string player = e.id.index() < info.players.size() ? info.players[e.id.index()] : std::string{};
+        std::printf("  empire %u: %s, %s%s%s%s\n", e.id.value + 1, e.name.c_str(), kindName(e.kind),
+                    player.empty() ? "" : ", player ", player.c_str(), e.alive ? "" : ", destroyed");
+    }
+    if (game::turnBased(state)) {
+        const game::EmpireId active = game::activePlayer(state);
+        if (!state.gameOver && active.valid() && state.playerTurn.started)
+            std::printf("Turn-based: it is empire %u's turn (%s).\n", active.value + 1, state.empire(active).name.c_str());
+        else if (!state.gameOver)
+            std::printf("Turn-based: between player turns (\"pbem process\" plays on).\n");
+    }
+    if (state.gameOver) std::printf("The game is over.\n");
+    else if (!game::turnBased(state) && state.lastTurn)
+        std::printf("A victory condition is met: the game is complete. Turns may still be processed, but no empire produces or researches any more.\n");
+    return 0;
+}
+
+// ---- Test client ---------------------------------------------------------------------------------------
+
+int runBot(std::span<char*> args) {
+    auto parsed = parseArgs(args,
+                            {"connect", "port", "name", "password", "join-password", "master-password", "data", "race", "turns", "timeout", "host-key",
+                             "mod", "mods-dir"},
+                            {"start", "old-password", "help", "no-bundled-mods"});
+    if (!parsed) return fail(parsed.error(), 2);
+    const Options& o = *parsed;
+    if (o.has("help")) return usage();
+    if (!o.has("name")) return fail("bot needs --name=NAME", 2);
+    auto turns = o.integer("turns", 2, 1, 100000);
+    auto timeout = o.integer("timeout", 120, 1, 24 * 3600);
+    auto port = o.integer("port", net::kDefaultPort, 1, 65535);
+    for (const auto* v : {&turns, &timeout, &port})
+        if (!*v) return fail(v->error(), 2);
+    auto rules = loadRules(o);
+    if (!rules) return fail(rules.error(), 2);
+
+    net::ClientConfig cfg;
+    cfg.host = o.get("connect", "127.0.0.1");
+    cfg.port = static_cast<uint16_t>(*port);
+    if (const size_t colon = cfg.host.rfind(':'); colon != std::string::npos && cfg.host.find(':') == colon) {
+        int p = 0;
+        const std::string digits = cfg.host.substr(colon + 1);
+        auto [end, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), p);
+        if (ec != std::errc{} || end != digits.data() + digits.size() || p < 1 || p > 65535) return fail("bad --connect port", 2);
+        cfg.port = static_cast<uint16_t>(p);
+        cfg.host.resize(colon);
+    }
+    cfg.playerName = o.get("name");
+    cfg.password = o.get("password");
+    cfg.joinPassword = o.get("join-password");
+    cfg.masterPassword = o.get("master-password");
+    // An OpenSE4 0.6 game: show the host the old form of the password once (with --host-key only).
+    cfg.sendOldPassword = o.has("old-password");
+    cfg.dataSet = game::dataSetIdentity(**rules);
+    cfg.mods.assign((*rules)->mods().begin(), (*rules)->mods().end());
+    if (o.has("host-key")) {
+        cfg.hostKey = net::crypto::keyFromHex(o.get("host-key"));
+        if (!cfg.hostKey) return fail("--host-key must be the host's public key (64 hex digits)", 2);
+    }
+    net::ClientSession client(cfg);
+    if (auto r = client.connect(); !r) return fail(r.error(), 1);
+
+    game::EmpireSetup setup;
+    setup.preset = o.get("race");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(*timeout);
+    int64_t firstTurn = -1;
+    std::string expectedNote;
+    game::SystemId noteSystem;
+    uint32_t playRequest = 0;                                  // turn-based: our command in flight
+    int64_t playedTurn = -1;                                   // turn-based: the game turn we last played in
+    auto homeSystem = [](const game::GameState& s, game::EmpireId me) {
+        game::SystemId sys{0u};
+        for (const auto& c : s.colonies)
+            if (c && c->owner == me && c->homeworld) sys = s.galaxy.object(c->planet).system;
+        return sys;
+    };
+    auto noteApplied = [&](const game::GameState& s) {
+        const game::Empire& me = s.empire(client.empire());
+        return noteSystem.index() < me.knowledge.notes.size() && me.knowledge.notes[noteSystem.index()] == expectedNote;
+    };
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (const net::Event& e : client.poll(100)) {
+            say("bot " + cfg.playerName + ": " + net::describe(e));
+            switch (e.type) {
+                case net::EventType::Joined:
+                    if (client.seenHostKey()) say(std::format("bot {}: host key {}", cfg.playerName, net::crypto::fingerprint(*client.seenHostKey())));
+                    client.submitSetup(setup);
+                    client.setReady(true);
+                    if (o.has("start")) client.requestStart();
+                    break;
+                case net::EventType::StateUpdated:
+                case net::EventType::PlayerTurn:
+                    if (!client.turnBased()) break;
+                    [[fallthrough]];
+                case net::EventType::GameStarted:
+                case net::EventType::NewTurn: {
+                    if (!client.state()) break;
+                    const game::GameState& s = *client.state();
+                    if (firstTurn < 0) firstTurn = s.turn;
+                    if (client.turnBased()) {
+                        // Turn-based: one command in each of our turns, then End Turn.
+                        if (s.turn >= firstTurn + *turns && playRequest == 0) {
+                            say(std::format("bot {}: the game advanced from turn {} to {}; done", cfg.playerName, firstTurn, s.turn));
+                            client.disconnect("Test finished.");
+                            return 0;
+                        }
+                        if (!client.myTurn() || playedTurn == static_cast<int64_t>(s.turn) || client.pendingRequests() > 0) break;
+                        noteSystem = homeSystem(s, client.empire());
+                        expectedNote = std::format("bot note, turn {}", s.turn);
+                        auto r = client.play(game::cmd::SetSystemNote{noteSystem, expectedNote});
+                        if (!r) return fail(r.error(), 1);
+                        playRequest = *r;
+                        playedTurn = s.turn;
+                        break;
+                    }
+                    const game::Empire& me = s.empire(client.empire());
+                    if (!expectedNote.empty()) {
+                        const bool applied = noteApplied(s);
+                        say(std::format("bot {}: last turn's orders {}", cfg.playerName, applied ? "were applied" : "were NOT applied"));
+                        if (!applied) return fail("orders were not applied", 1);
+                    }
+                    if (s.turn >= firstTurn + *turns) {
+                        say(std::format("bot {}: the game advanced from turn {} to {}; done", cfg.playerName, firstTurn, s.turn));
+                        client.disconnect("Test finished.");
+                        return 0;
+                    }
+                    noteSystem = homeSystem(s, me.id);
+                    expectedNote = std::format("bot note, turn {}", s.turn);
+                    game::EmpireOrders orders{me.id, s.turn, {game::cmd::SetSystemNote{noteSystem, expectedNote}}};
+                    if (auto r = client.submitOrders(orders); !r) return fail(r.error(), 1);
+                    break;
+                }
+                case net::EventType::CommandsDone: {
+                    if (playRequest == 0 || e.request != playRequest) break;
+                    playRequest = 0;
+                    if (!e.text.empty()) return fail("command refused: " + e.text, 1);
+                    const bool applied = client.state() && noteApplied(*client.state());
+                    say(std::format("bot {}: the command {} at once", cfg.playerName, applied ? "was carried out" : "was NOT carried out"));
+                    if (!applied) return fail("the command was not carried out", 1);
+                    if (auto r = client.endTurn(); !r) return fail(r.error(), 1);
+                    break;
+                }
+                case net::EventType::OrdersRejected: return fail("orders rejected: " + e.text, 1);
+                case net::EventType::Rejected:
+                case net::EventType::Disconnected: return fail(e.text, 1);
+                default: break;
+            }
+        }
+    }
+    return fail("timed out", 1);
+}
+
+int run(std::span<char*> args);
+
+} // namespace
+
+int main(int argc, char** argv) {
+    // The arguments as UTF-8, as every narrow string in the program (on Windows the C
+    // library gives them in the ANSI code page: core/environment.hpp).
+    std::vector<std::string> utf8 = core::utf8Arguments(argc, argv);
+    std::vector<char*> pointers;
+    for (std::string& a : utf8) pointers.push_back(a.data());
+    const std::span<char*> args = std::span<char*>(pointers).subspan(std::min<size_t>(1, pointers.size()));
+    // Script computer players play wherever the host plays turns (docs/sdk/ai-protocol.md).
+    sdk::installPlayers();
+    // A password key that cannot be made (Argon2id's memory not to be had)
+    // ends the command with that said, wherever no step reported it itself.
+    try {
+        return run(args);
+    } catch (const net::PasswordWorkError& e) {
+        return fail(e.what(), 1);
+    }
+}
+
+namespace {
+
+int run(std::span<char*> args) {
+    const std::string_view mode = args.empty() ? std::string_view{} : std::string_view(args[0]);
+    if (mode == "-h") return usage();
+    if (mode == "pbem") {
+        const std::string_view sub = args.size() > 1 ? std::string_view(args[1]) : std::string_view{};
+        const auto rest = args.size() > 2 ? args.subspan(2) : std::span<char*>{};
+        if (sub == "new") return pbemNew(rest);
+        if (sub == "process") return pbemProcess(rest);
+        if (sub == "orders") return pbemOrders(rest);
+        if (sub == "info") return pbemInfo(rest);
+        if (sub == "turn-files") return pbemTurnFiles(rest);
+        if (sub == "--help" || sub == "-h") return usage();
+        return fail("pbem needs a command: new, process, turn-files, orders or info (see --help)", 2);
+    }
+    if (mode == "bot") return runBot(args.subspan(1));
+    if (mode == "password-verifier") {
+        auto o = parseArgs(args.subspan(1), {"game-id"}, {"help"});
+        if (o && o->has("help")) return usage();
+        if (!o || o->positional.size() != 1 || !o->has("game-id")) return fail("usage: opense4-server password-verifier --game-id=N PASSWORD", 2);
+        auto id = o->integer("game-id", 0, 1, std::numeric_limits<int64_t>::max());
+        if (!id) return fail(id.error(), 2);
+        std::printf("%s\n", net::passwordVerifier(o->positional.front(), static_cast<uint64_t>(*id)).c_str());
+        return 0;
+    }
+    return runServer(args);
+}
+
+} // namespace

@@ -1,0 +1,264 @@
+#pragma once
+
+// Binary save format for GameState and order lists (the `.gam` and `.plr`
+// equivalents, docs/spec/05 §9.5). Little-endian, versioned, checksummed.
+//
+// Every blob starts with a 32-byte envelope:
+//
+//     offset  size  field
+//          0     8  magic ("OSE4STAT" state, "OSE4ORDR" orders, "OSE4SAVE" save file)
+//          8     4  u32 format version (kSaveVersion)
+//         12     4  u32 flags (0)
+//         16     8  u64 payload size
+//         24     8  u64 FNV-1a 64 of the payload
+//         32     n  payload (serialize_io.hpp)
+//
+// Readers reject wrong magic, unsupported versions, truncation, checksum
+// mismatches and malformed payloads with a readable message, and never crash
+// on hostile input. See docs/MULTIPLAYER.md.
+
+#include "game/commands.hpp"
+#include "game/state.hpp"
+
+#include <cstdint>
+#include <expected>
+#include <filesystem>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace opense4::game {
+
+class Rules;
+
+// Current and oldest readable version of the binary format (save files,
+// order files and network messages share it). Bump kSaveVersion when a
+// change to the serialized structs makes older files unreadable.
+// Version 2: colony anger in whole percent (was tenths), no riot counter,
+// atmosphere counter counts up (spec 02 §2, §4); research and intelligence
+// pools, the trade counter, the Research - Steal target area, and the
+// Technology Cost and Score Display options (spec 05); vehicle and fleet
+// experience tenths, the sector a vehicle came from, colony militia and
+// obstacle combat pieces (spec 04); the computer players' memory, relation
+// counters and flags, difficulty, ministers, and the random-players option
+// (spec 05 §7); planet orders (Colony::orders, spec 03 §12); the Quadrant
+// Size and All Planets Same Size options (spec 01 §2); mood events waiting
+// for an empire's next happiness update (GameState::pendingMood, spec 05 §8).
+// Version 3: one object slot order for every object (SpaceObject::slot) and
+// fleets whose orders are their members' copies, with their own location
+// (spec 03 §19 Q62, Q65); the recorded home sector, design "ever built"
+// marks, dated messages and the computer players' demand counts (spec 05
+// Q42, Q41, Q37, Q49); per-empire interface options and facilities left on
+// abandoned planets (spec 06 §1.9, §7).
+// Version 4: colony cloaking (Colony::cloaked and its cloak and sensor
+// levels), colony order Repeat, Convert Resources amounts on orders, ground
+// combat counts per round in battle records, log entry targets and messages,
+// combat piece damage, and the windows' sort history (spec 01 §6.9, spec 02
+// §5.6, spec 06 §7 Q24, Q33, Q41-Q43).
+// Version 5: design Number Scrapped, the Scrap window's actions as orders,
+// vehicle headings, combat event flags, the Ships\Units window's tab and
+// switches, the minister flag on messages, empire-file strategies; the unused
+// vehicle target fields are gone (spec 03 §15, spec 06 §7 Q56, Q62, spec 05 Q52).
+// Version 6: ship arrival stamps per system (Vehicle::arrival,
+// GameState::arrivals), the computer players' Seek and Join Fleet orders;
+// happiness events waiting for the next update are no longer saved (spec 05
+// §7.5, spec 02 §4).
+// Version 7: each empire's e-mail address (Empire::email, EmpireSetup::email
+// and the Change Email command cmd::SetEmail, spec 06 §7 Q95); the neutral mark
+// of a neutral empire a human plays (Empire::neutral) and the fleets' flag in a
+// player's minister switches (cmd::SetMinisters::fleets) (spec 06 §7 Q84); the
+// "Players can see the complete tech tree" option (GameOptions::completeTechTree,
+// spec 06 §7 Q92); the designer's To Hit Modifiers and Condensed View options
+// (InterfaceOptions::designToHit, designCondensed, spec 06 §7 Q94).
+// Version 9: the game's mods (GameState::mods, SaveInfo::mods; the modding
+// SDK, docs/sdk/packages-and-data.md); script players (Empire::controller,
+// script); and mods' rules (docs/sdk/rules.md): their data on the game,
+// empires, colonies and vehicles (ModData), their options and budgets
+// (GameOptions::modOptions, rulesHookBudget, rulesTurnBudget, modDataLimit),
+// what the game keeps about each rules mod (GameState::modRules), the
+// scenario (GameState::scenario), the reason a game ended (endReason) and
+// the command cmd::ModCommand. Format 8 still reads, without them.
+// Version 8: what a log entry imported from the original's saved games held
+// besides OpenSE4's own fields (LogEntry::classic, docs/spec/08 §3.6.11), and
+// each colony's never-reset counts of destroyed facilities
+// (Colony::destroyedFacilities, spec 08 §11.2); a tagged group's Attack Sector
+// question and its answer (EntryQuestion::tagged, cmd::EnterSector::tagged),
+// and the commands cmd::OrderTagged and cmd::SetFleetLeader (spec 03 §8, §9,
+// spec 06 §2.5); the Designs window's Hide Obsolete and Stats\Strategy check
+// boxes (InterfaceOptions::designsHideObsolete, designsStatsView, spec 08
+// §3.6.7). Format 7 still reads, without them.
+// Version 10: what the REA parity audit of 2026-10-11 to 10-14 brought in
+// line with the original: the windows' remembered tabs, steps and switches,
+// cargo orders by kind and a repeating list's turn, the game flow's last turn
+// and endings, diplomacy's records, the battle records' hit details, empire
+// files' settings, and the commands CloakVehicles, LaunchUnitsNow,
+// RecoverUnitsNow and SetQueueTypes. Format 9 still reads, without it:
+// - The Construct size of a stellar manipulation order (Order::planetSize),
+//   cmd::SetOrders::ownList (an order for a fleet member's own list, the
+//   Stellar Manipulation window's), and the Galaxy Map's Show Names and
+//   destination-mode Show Distances (InterfaceOptions::galaxyMapNames,
+//   galaxyMapDistances) (spec 06 §1.3, §2.6, spec 08 §3.6.7).
+// - A turn-based game's last turn after its victory check was met
+//   (GameState::lastTurn, spec 05 §6); the Lose ending due at the start of a
+//   human's turn (PlayerTurn::loseEnding, spec 06 §7 Q99); an autosave's mark
+//   (SaveInfo::autosave, spec 06 §6.1).
+// - The scenario of the original a game was started from
+//   (GameState::classicScenario) and the page of its text each empire saw
+//   last (InterfaceOptions::scenarioPage; spec 06 §5.6, spec 08 §3.4).
+// - The Designs window's tab (InterfaceOptions::designsTab, spec 08 §3.6.7).
+// - Combat records: each Hit's damage to the shields and to the structure
+//   (CombatEvent::shieldDamage, structureDamage) for the Tactical Combat
+//   window's target panel (spec 06 §1.10.1).
+// - Diplomacy: a human player's statistics record (Empire::statistics,
+//   spec 05 §5), the trade and tariffs of the economy report empire by empire
+//   (EconomyReport::partners, spec 06 §1.5), the Empires window's tab
+//   (InterfaceOptions::empiresTab) and the minister mark on answers
+//   (cmd::AnswerMessage::minister, spec 05 §3.2).
+// - The victory conditions' three "years" values in turns, tenths of a year,
+//   as the original keeps them (VictoryConditions::yearsTurns, peaceTurns,
+//   delayTurns; docs/spec/01 §11): format 9 held whole years.
+// - A fleet's Toggle Minister Control (cmd::SetMinister::fleet, spec 03 §8);
+//   how far a repeating order list has turned since Repeat was switched on
+//   (Vehicle::repeatShift, Colony::repeatShift, spec 03 §8); Cloak and
+//   Decloak of vehicles at once (cmd::CloakVehicles, a new command).
+// - Cargo orders by kind (Order::cargo; spec 03 §8): a Load, Drop, Launch or
+//   Recover a player gives names a kind of cargo, not a design.
+// - The steps of Transfer Cargo and Launch \ Recover Units
+//   (InterfaceOptions::cargoStep, unitsStep; spec 08 §3.6.7).
+// - The window Launch \ Recover Units: the commands cmd::LaunchUnitsNow and
+//   cmd::RecoverUnitsNow, and a battle's CombatEvent::Kind::Recovered (spec 03
+//   §12, spec 04 §10.4).
+// - The scrap package: a colony's Abandon Planet order (OrderKind::Abandon,
+//   `amount` 1 to scrap the facilities first; spec 02 §5); the commands'
+//   cmd::AbandonPlanet::scrapFacilities and cmd::CreateFleet::location (an
+//   empty fleet, spec 03 §9). A format 9 AbandonPlanet reads as one that
+//   keeps the facilities, a CreateFleet as one with no place.
+// - The economy package: each empire's queue types (Empire::queueTypes,
+//   QueueType, cmd::SetQueueTypes, spec 02 §6.4), the tabs Set Construction
+//   Queue and Colonies open on (InterfaceOptions::setQueueTab, coloniesTab,
+//   spec 06 §1.8.3) and Scrap Facil Types' refund (cmd::Scrap::typeWide,
+//   spec 02 §6.6).
+// - Empire files: what one brings to a new game's empire besides its race,
+//   designs and strategies: its minister switches, Empire Options and
+//   movement options (EmpireSetup::settings, EmpireSettings) and its design
+//   types, colony types and repair priorities (spec 08 §13).
+// Version 11 (0.15.0): the accuracy pass of 2026-10-14/15 (the rules settled from the
+// complete listing). Format 10 still reads, without it:
+// - The fleets each empire ever created (Empire::fleetsCreated, spec 03 §9,
+//   spec 08 §3.6.12), which the next default fleet name counts from; a
+//   format 10 game reads each empire's fleet count.
+// - Orders to tagged vehicles switching the first one's Repeat over
+//   (cmd::OrderTagged::toggleRepeat, Repeat Orders), and orders given held,
+//   which a turn-based game runs only at the list's next run
+//   (cmd::SetOrders::hold, cmd::OrderTagged::hold, Set Patrol's points; spec
+//   03 §8). A format 10 command reads with neither.
+// - The Retrofit minister's yard (cmd::Retrofit::moveFirst, spec 05 §7.5
+//   *Retrofit*, spec 03 §19 Q78): retrofit there at once, or go there and
+//   retrofit on arrival. A format 10 command reads as the window's retrofit.
+// - A Construct order's world (Order::planetSize) is its position in
+//   PlanetSize.txt, as the original's order holds it (spec 01 §9); format
+//   10's held its Special Ability ID, converted with the data set once the
+//   game is loaded (upgradeLoadedGame).
+inline constexpr uint32_t kSaveVersion = 13;
+inline constexpr uint32_t kMinSaveVersion = 7;
+
+inline constexpr size_t kEnvelopeSize = 32;
+
+std::vector<uint8_t> serializeState(const GameState& s);
+std::expected<GameState, std::string> deserializeState(std::span<const uint8_t> bytes);
+
+std::vector<uint8_t> serializeOrders(const EmpireOrders& o);
+std::expected<EmpireOrders, std::string> deserializeOrders(std::span<const uint8_t> bytes);
+
+// Structural consistency of a state: every id a state refers to exists
+// (empires, systems, objects, designs, vehicles sorted by id, damage per
+// design entry, ...). With `rules`, also the data-set indices (hulls,
+// components, facilities, tech areas). Returns what is wrong, or empty.
+// deserializeState() runs the structural part, so a crafted file cannot make
+// the engine index out of bounds; callers that know the rules (hosts loading
+// a save) should run the full check.
+std::string validateState(const GameState& s, const Rules* rules = nullptr);
+
+// Stable hash of the whole state (desync detection): FNV-1a 64 of the
+// serialized payload, identical on every platform. Equals the checksum in
+// serializeState's envelope.
+uint64_t stateChecksum(const GameState& s);
+
+// The state in named parts (the date and options, the galaxy, the colonies,
+// the empires, ...), each hashed as stateChecksum() hashes the whole: when two
+// copies of a game differ, the parts whose hashes differ say where. Always
+// the same parts in the same order (statePartNames()).
+std::vector<uint64_t> statePartHashes(const GameState& s);
+std::span<const std::string_view> statePartNames();
+// The names of the parts whose hashes differ ("everything" when the lists
+// do not even have the same length).
+std::vector<std::string> differingStateParts(std::span<const uint64_t> a, std::span<const uint64_t> b);
+
+// Save files carry a small header (data set identity, turn, empire names).
+struct SaveInfo {
+    std::string gameName;
+    std::string dataSet;               // dataSetIdentity() of the rules the game was played with
+    uint32_t turn = 0;                 // filled from the state when saving
+    std::vector<std::string> empires;  // filled from the state when saving
+    uint64_t gameId = 0;               // random id chosen at creation (matches order files to games)
+    std::vector<std::string> players;  // per empire: the player's login name in network games (may be empty)
+    std::string masterPasswordVerifier;  // net::passwordVerifier() of the master password; empty = none
+    std::vector<ruleset::ModRecord> mods;  // the game's mods (format 9), as GameState::mods
+    // Format 10: an autosave, written at the start of a human's turn: loading
+    // it opens the Next Player window (spec 06 §1.2.1, §6.1, confirmed: binary).
+    bool autosave = false;
+    uint32_t formatVersion = kSaveVersion;  // the format the file was written in (not saved: readers fill it in)
+};
+
+std::vector<uint8_t> serializeSave(const GameState& s, const SaveInfo& info);
+std::expected<std::pair<GameState, SaveInfo>, std::string> deserializeSave(std::span<const uint8_t> bytes);
+
+// Writes atomically (temporary file, then rename).
+std::expected<void, std::string> saveGame(const std::filesystem::path& file, const GameState& s, const SaveInfo& info);
+std::expected<std::pair<GameState, SaveInfo>, std::string> loadGame(const std::filesystem::path& file);
+// What a game file of an older format needs once the data set it is played
+// with is known (loadGame has none): `formatVersion` is the file's
+// (SaveInfo::formatVersion). Format 10's Construct orders named their world
+// by its Special Ability ID; they get its position in PlanetSize.txt
+// (Order::planetSize, spec 01 §9). Every reader of a game file that goes on
+// to play it calls this.
+void upgradeLoadedGame(const Rules& r, GameState& s, uint32_t formatVersion);
+// Only the header, e.g. for a load dialog (still verifies the checksum).
+std::expected<SaveInfo, std::string> readSaveInfo(const std::filesystem::path& file);
+
+// Identity of a data set: "<label>#<16 hex digits>", where the digits hash the
+// data files, the loaded tables, the AI tables, race files and design-name
+// lists of the game folder, and the game-affecting mods (save format 9 on).
+// Two machines can play together only when the hashes match (sameDataSet);
+// the label is for messages.
+std::string dataSetIdentity(const Rules& r);
+// The identity as format 8 and older computed it (the data files and the
+// loaded tables only): what their saves hold.
+std::string legacyDataSetIdentity(const Rules& r);
+bool sameDataSet(std::string_view a, std::string_view b);
+// Whether a game file's data set is this one: its identity compared with the
+// one its format computed (legacyDataSetIdentity for format 8 and older), so
+// that older saves made with the same install are not taken for another data
+// set. A header without an identity matches.
+bool sameDataSet(const SaveInfo& info, const Rules& r);
+// What keeps this data set's mods from playing a game made with `game`'s
+// (ruleset::compareModSets); empty when they match. `theirs` names the game's
+// side in the messages ("the saved game", "the host").
+std::vector<std::string> modDifferences(std::span<const ruleset::ModRecord> game, const Rules& r, std::string_view theirs = "the saved game");
+
+// File helpers (shared with the PBEM and network code).
+std::expected<std::vector<uint8_t>, std::string> readFileBytes(const std::filesystem::path& file, size_t maxBytes = size_t{1} << 30);
+std::expected<void, std::string> writeFileAtomic(const std::filesystem::path& file, std::span<const uint8_t> bytes);
+
+// Envelope helpers for other blob kinds (e.g. PBEM order files). `magic` is
+// 8 characters; `what` names the blob in error messages ("saved game").
+struct Envelope {
+    std::span<const uint8_t> payload;
+    uint32_t version = kSaveVersion;
+};
+std::vector<uint8_t> wrapEnvelope(std::string_view magic, std::span<const uint8_t> payload);
+std::expected<Envelope, std::string> unwrapEnvelope(std::span<const uint8_t> bytes, std::string_view magic, std::string_view what);
+
+} // namespace opense4::game

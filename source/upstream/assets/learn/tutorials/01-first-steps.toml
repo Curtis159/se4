@@ -1,0 +1,215 @@
+# OpenSE4's own lesson (docs/LEARNING.md). Written from docs/spec and the client.
+title = "First steps"
+summary = "Find your way around the main window: your empire, your home system, the reports, the main windows and the End Turn button."
+minutes = 10
+learned = [
+    "The status bar: your empire, the game date and your treasury",
+    "Selecting your system, your homeworld and other planets, and reading their reports",
+    "The galaxy panel, the Galaxy Map and the Help window",
+    "Where the command buttons, a ship's orders and End Turn are",
+]
+
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+# OpenSE4 lesson extension (docs/LEARNING.md): ships to learn with. A normal game starts with none.
+starting_ships = ["Attack Ship", "Attack Ship", "Colony"]
+
+[[step]]
+title = "Welcome"
+text = """
+Welcome! This lesson shows you the main window, where you spend most of the game.
+
+Each step outlines what to use and moves on once you have done it; the rest of the screen waits,
+dimmed. Point at the panel's buttons to see what they do. Press **Next** to begin.
+"""
+highlight = ["lesson:panel", "lesson:next"]
+manual = "getting-started#your-first-turns"
+
+[[step]]
+title = "Your empire"
+text = """
+**The status bar** across the top shows your empire's flag and name, your leader, the game date
+and your treasury.
+
+The game starts in 2400.0, and each turn adds 0.1. The three numbers on the right are your stored
+**minerals**, **organics** and **radioactives**, which pay for everything you build. Press
+**Next**.
+"""
+highlight = ["status:empire", "status:leader", "status:date", "status:resources"]
+manual = "main-window#the-layout"
+
+[[step]]
+title = "Your home system"
+text = """
+**Click an empty part of the system view**, the large map on the left.
+
+It shows your home system: its star, its planets, and the warp points at its edges that lead to
+other systems. The report panel on the right then describes the whole system.
+"""
+highlight = ["panel:system"]
+show = ["panel:report"]
+done = { selected = "system" }
+manual = "main-window#selecting-things"
+
+[[step]]
+title = "Your homeworld"
+text = """
+**Click your homeworld**, the planet with the small box in your colour (outlined).
+
+Your ships share its sector, so the report first lists everything there: **click your homeworld
+in that list**. Later, the up arrow at the top right of a report brings such a list back.
+"""
+highlight = ["sector:home", "report:colony"]
+show = ["panel:report"]
+done = { selected = "colony" }
+manual = "main-window#selecting-things"
+
+[[step]]
+title = "The planet report"
+text = """
+**The report panel** now shows your homeworld: its type, atmosphere and value, and, as it is your
+colony, its people, mood and output.
+
+Try the tabs at its bottom: **Facil** lists its facilities, **Cargo** what it stores and
+**Ability** its special abilities. Press **Next** when you have looked.
+"""
+highlight = ["panel:report", "panel:report-tabs"]
+allow = ["panel:report-tabs"]
+manual = "main-window#the-report-panel"
+
+[[step]]
+title = "Other planets"
+text = """
+**Click another planet of your home system.**
+
+Some planets carry a small **green or red star**: you could settle those. Green means your people
+can breathe the air there; red means they would live under domes. The next lesson settles one.
+"""
+highlight = ["panel:system"]
+show = ["panel:report"]
+done = { all = [{ selected = "planet" }, { not = { selected = "colony" } }] }
+manual = "planets-and-colonies#colonizing"
+
+[[step]]
+title = "The whole quadrant"
+text = """
+**Right-click the galaxy panel** at the bottom right to open the larger **Galaxy Map**.
+
+The galaxy panel shows every star system of the quadrant, and the warp links you know as lines.
+A ring marks the system you are looking at.
+"""
+highlight = ["panel:galaxy"]
+right_click = ["panel:galaxy"]
+done = { window = "galaxy-map" }
+manual = "galaxy#the-galaxy-panel-and-the-galaxy-map"
+
+[[step]]
+title = "The Galaxy Map"
+text = """
+**Close the Galaxy Map** with its **Close** button or `Esc` once you have looked.
+
+It shows the same quadrant, larger. The buttons on the right switch its overlays: where empires
+are, the systems they claim, and your spaceports and supply depots. At the start you know only your
+home system.
+"""
+highlight = ["galaxy-map:close"]
+allow = ["galaxy-map:overlays"]
+show = ["galaxy-map:map"]
+keys = ["Escape"]
+done = { not = { window = "galaxy-map" } }
+manual = "galaxy#the-galaxy-panel-and-the-galaxy-map"
+
+[[step]]
+title = "The command buttons"
+text = """
+**The twelve square buttons** at the top left open the game's main windows: designs, planets,
+colonies, ships, construction, research, other empires, the log, your budget, the help, the Game
+Menu, and End Turn.
+
+Each also has a function key, `F1` to `F12`. Point at a button to see its name, then press
+**Next**.
+"""
+highlight = ["panel:commands"]
+manual = "main-window#command-buttons"
+
+[[step]]
+title = "The Help window"
+text = """
+**Open the Help window** with the question mark button or `F1`.
+
+It is the game's encyclopedia: every component, facility, hull and technology your empire knows,
+with its cost and abilities.
+"""
+highlight = ["command:help"]
+done = { window = "help" }
+manual = "main-window#the-help-window"
+
+[[step]]
+title = "Help topics"
+text = """
+**Click a few of the tabs on the right**, and an item in the list to read about it. The **Weapons
+Report** compares every weapon you know.
+
+Then close Help with **Close** or `Esc`.
+"""
+highlight = ["help:tabs", "help:close"]
+allow = ["window:help"]
+done = { not = { window = "help" } }
+manual = "main-window#the-help-window"
+
+[[step]]
+title = "Your ships"
+text = """
+**Click the right arrow of the top row** at the top right, or press `Space`, to select a ship. The
+report shows it, and the order buttons in the middle light up.
+
+A normal game starts with no ships, only designs. This lesson gives you two **attack ships** and
+a **colony ship** to learn with.
+"""
+highlight = ["cycle:ship"]
+show = ["panel:report", "panel:orders"]
+done = { selected = "ship" }
+manual = "main-window#order-buttons"
+
+[[step]]
+title = "The orders"
+text = """
+**The buttons in the middle are the selected ship's orders.** Dim ones do not apply to it.
+
+Point at the two outlined ones: **Move To** (`M`) and **Explore** (`E`) are the orders you will
+use most. Every order button shows its name and key this way. You give your first orders in the
+next lesson. Press **Next**.
+"""
+highlight = ["order:move-to", "order:explore"]
+show = ["panel:orders", "panel:report"]
+manual = "ships-and-fleets#orders"
+
+[[step]]
+title = "End the turn"
+text = """
+**Press End Turn** (the arrow at the end of the command buttons, or `F12`), then answer **Yes**
+(or `Y`).
+
+`Enter` and `Esc` mean No, so a stray key never ends your turn. Your empire then produces and
+builds, the computer players move, and a new turn begins.
+"""
+highlight = ["button:end-turn"]
+show = ["panel:commands"]
+done = { turns_passed = 1 }
+manual = "turns#turn-based-play"
+
+[[step]]
+title = "Well done"
+text = """
+**A new turn has begun.** The **Log** (`F10`) holds each turn's news: what was built, what was
+found and what happened to your ships. Read it at the start of every turn.
+
+The next lesson sends your ships exploring and founds a colony. Press **Finish**.
+"""
+highlight = ["command:log"]
+allow = ["command:log", "log:messages", "log:categories", "log:close"]
+show = ["log:details"]
+manual = "turns#the-log"

@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "stackSizeMb": 0.5,
+  "turns": [
+    {
+      "turn": 1,
+      "ms": 1989,
+      "checksum": "3981467102866419648"
+    },
+    {
+      "turn": 2,
+      "ms": 1147,
+      "checksum": "2311484546732040590"
+    },
+    {
+      "turn": 3,
+      "ms": 967,
+      "checksum": "12579301403589833586"
+    }
+  ],
+  "diagnostics": {
+    "requests": 36,
+    "fallbacks": 0,
+    "errors": []
+  }
+}

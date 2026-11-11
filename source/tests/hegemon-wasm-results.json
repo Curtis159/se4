@@ -1,0 +1,179 @@
+{
+  "passed": true,
+  "classicParityTurns": 3,
+  "simultaneousTurns": 10,
+  "replayVerifiedTurns": 8,
+  "runtime": "actual MicroPython Hegemon in WASM; Node, not browser/device QA",
+  "turns": [
+    {
+      "turn": 1,
+      "checksum": "17417766993879862131",
+      "ms": 989
+    },
+    {
+      "turn": 2,
+      "checksum": "431825912296607541",
+      "ms": 452
+    },
+    {
+      "turn": 3,
+      "checksum": "2519435367871815341",
+      "ms": 382
+    },
+    {
+      "turn": 4,
+      "checksum": "17295070061902619120",
+      "ms": 391
+    },
+    {
+      "turn": 5,
+      "checksum": "14903627643684370696",
+      "ms": 422
+    },
+    {
+      "turn": 6,
+      "checksum": "16316657214619058871",
+      "ms": 382
+    },
+    {
+      "turn": 7,
+      "checksum": "4648400588647813750",
+      "ms": 398
+    },
+    {
+      "turn": 8,
+      "checksum": "8524466047113393886",
+      "ms": 467
+    },
+    {
+      "turn": 9,
+      "checksum": "169492858003405476",
+      "ms": 509
+    },
+    {
+      "turn": 10,
+      "checksum": "4761216075386669350",
+      "ms": 441
+    },
+    {
+      "turn": 11,
+      "checksum": "10560968069622962273",
+      "ms": 470
+    },
+    {
+      "turn": 12,
+      "checksum": "3689154655780604323",
+      "ms": 390
+    },
+    {
+      "turn": 13,
+      "checksum": "5765234068250610985",
+      "ms": 414
+    },
+    {
+      "turn": 14,
+      "checksum": "9088103655765764048",
+      "ms": 539
+    },
+    {
+      "turn": 15,
+      "checksum": "10305255197357688527",
+      "ms": 418
+    }
+  ],
+  "diagnostics": {
+    "mode": "hegemon",
+    "requests": 32,
+    "fallbacks": 0,
+    "errors": [],
+    "agents": [
+      {
+        "id": 1,
+        "team": 0,
+        "memory": {
+          "seen": {},
+          "strategy": {
+            "phase": "expand",
+            "since": 0,
+            "target": null
+          },
+          "rivals": {
+            "0": {
+              "colonies": 0,
+              "pop": 0,
+              "force": [
+                0,
+                0
+              ],
+              "dist": 99,
+              "battles": 0,
+              "seen": -1
+            }
+          },
+          "diplo": {
+            "offered": {}
+          },
+          "unsafe": {},
+          "colonist_pos": {
+            "2": [
+              5,
+              5,
+              7,
+              7
+            ]
+          },
+          "colonize_blocked": {},
+          "supply_per_move": {
+            "0": 60,
+            "6": 50
+          },
+          "explore": {
+            "pos": {
+              "0": [
+                [
+                  1,
+                  7,
+                  11
+                ],
+                7
+              ]
+            },
+            "blocked": {},
+            "refuel": {}
+          },
+          "fleets": {},
+          "roles": {
+            "scout": "Scout B-1",
+            "warship": "Warship B-2",
+            "yard": "Yard B-3",
+            "platform": "Guard B-4",
+            "satellite": "Sentinel B-5",
+            "trooper": "Trooper B-6",
+            "colony:Rock": "Colonist B-7"
+          },
+          "role_values": {
+            "scout": 15584,
+            "warship": 448504625,
+            "yard": 175438,
+            "platform": 10924060660,
+            "satellite": 3714880332,
+            "trooper": 507692,
+            "colony:Rock": 250000
+          },
+          "invasion": {},
+          "repairing": {},
+          "pending_roles": {},
+          "design_tech": 21,
+          "design_seq": 28,
+          "rp_spent": {
+            "civ": 20000,
+            "mil": 3500
+          },
+          "rp_head": "civ",
+          "unmet_ships": 0
+        }
+      }
+    ]
+  },
+  "logs": []
+}

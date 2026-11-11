@@ -1,0 +1,8 @@
+{
+  "passed": true,
+  "runtime": "local PGlite PostgreSQL; Vault and cron test stubs; no cloud deployment",
+  "evidence": [
+    "Schedule SQL parses and refuses activation without its named Vault secret",
+    "Minute cron job uses a Vault lookup instead of embedding the private token"
+  ]
+}

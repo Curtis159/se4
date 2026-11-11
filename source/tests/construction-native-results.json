@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "evidence": [
+    "Quick Game starts with one yard; a second can be built through the planet queue",
+    "Combined construction rate equals the sum of two separate lanes",
+    "Native engine rejects unit designs in yard queues and accepts them in planet queues",
+    "Catalog exposes native design types, hulls, component families/levels and all researched facility versions",
+    "Upgrade Facilities moves queued builds to latest researched versions while preserving count and paid resources",
+    "Installed facilities upgrade through paid construction, with no facility-slot increase; save/load retains yards"
+  ]
+}

@@ -1,0 +1,1589 @@
+#pragma once
+
+// Complete state of one classic-rules game. Plain data: rules live in the
+// subsystem modules (economy, movement, combat, research, ...), all state
+// changes by players go through commands (commands.hpp), and all randomness
+// goes through GameState::rng. Everything here is serialized: when adding a
+// field, add it to its struct's io() list in serialize_io.hpp (a test fails
+// until you do, and the golden-checksum test prints the new value).
+
+#include "core/rng.hpp"
+#include "game/galaxy.hpp"
+#include "game/types.hpp"
+#include "ruleset/ruleset.hpp"
+
+#include <algorithm>
+#include <optional>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace opense4::game {
+
+// ---- Races and empires ------------------------------------------------------------
+
+struct Race {
+    std::string name;   // e.g. "Terran"
+    std::string style;  // art set: folder under Pictures/Races (or RaceGeneric)
+    std::string biology, society, history;
+    std::array<int, kCharacteristics> characteristics = [] {
+        std::array<int, kCharacteristics> a{};
+        a.fill(100);  // every characteristic defaults to 100 %
+        return a;
+    }();
+    std::vector<uint32_t> traits;    // RacialTraits.txt indices
+    uint32_t culture = 0;            // Cultures.txt index
+    uint32_t happinessModel = 0;     // Happiness.txt index
+    std::string nativeSurface = "Rock";   // "Rock", "Ice", "Gas Giant"
+    std::string atmosphere = "Oxygen";    // the gas this race breathes
+    std::string demeanor;
+    std::string designNameFile;
+
+    int characteristic(Characteristic c) const { return characteristics[static_cast<size_t>(c)]; }
+};
+
+struct Waypoint {
+    std::string name;
+    Location location;
+    bool set = false;
+};
+
+struct ResearchProject {
+    ruleset::TechAreaId area;
+    int64_t progress = 0;  // toward the next level of the area
+};
+
+struct IntelProjectOrder {
+    uint32_t project = 0;       // IntelProjects.txt index
+    EmpireId target;            // invalid for defense projects
+    ObjectId targetPlanet;      // optional specific target ("Any" when invalid)
+    VehicleId targetVehicle;
+    EmpireId thirdEmpire;       // political operations
+    ruleset::TechAreaId targetTech;  // Research - Steal: the area ("Any" when invalid)
+    int64_t progress = 0;
+};
+
+// One empire's standing with another (spec 05 §3).
+struct Relation {
+    bool contact = false;
+    Treaty treaty = Treaty::None;
+    bool dominant = false;      // Subjugation/Protectorate: true if *we* are the master
+    int tradeTurns = 0;         // trade counter (spec 05 §3.3); the trade % is min(this, the maximum)
+    uint32_t treatyTurn = 0;    // when the current treaty took effect
+    int32_t lastWarTurn = -1;
+    int anger = 50;             // computer players: anger toward that empire, 0..100 (spec 05 §7.3)
+    bool messageSentThisTurn = false;
+    // What a computer player (or a Politics minister) remembers about that
+    // empire between turns (spec 05 §7.3, §7.4). Kept by the AI memory steps
+    // (ai::recordAiDecisions, updateAiState, politicalStep, rememberAiEvents).
+    int turnsSinceWar = 999;    // 0 while at war, +1 each turn otherwise
+    int treatyAge = 0;          // turns since the treaty changed (moves between Trade Alliance and better do not count)
+    Treaty agedTreaty = Treaty::None;  // the treaty treatyAge was last updated for
+    // The Politics minister's demand lists (spec 05 §7.4 "Demand lists", §7.3
+    // term 8, confirmed: binary), as the number of entries naming that empire
+    // (the lists keep duplicates): each carried-out demand adds one, each
+    // check that gets far enough uses one up, and all are emptied on the
+    // dates that are multiples of 10.
+    int promises = 0;           // promises about them: "stop hostile actions against" them accepted (-20 anger each, one a turn)
+    int queuedWar = 0;          // the war list: "declare war on" or "support against" them accepted
+    int queuedBreak = 0;        // the break list: "break with" them accepted
+    int queuedPeace = 0;        // the peace list: "make peace with" them accepted
+    bool attackedUs = false;    // their ships attacked ours or our planets
+    bool spiedOnUs = false;     // one of their intelligence operations against us was traced to them
+    SystemId attackedIn;        // where they last attacked us
+    int combatsThisTurn = 0;    // combats with them in the last processed turn
+    int combatsLastTurn = 0;    // ... and in the turn before
+};
+
+// A foreign design an empire knows and the turn it last saw it. Knowledge of
+// a design not seen for more than kDesignMemoryTurns is forgotten in the
+// empire's end-of-turn processing (spec 05 §8 step 12).
+struct SeenDesign {
+    DesignId design;
+    uint32_t turn = 0;
+};
+inline constexpr uint32_t kDesignMemoryTurns = 50;
+
+// A computer player's plans between turns (spec 05 §7.2, §7.4).
+struct AiMemory {
+    std::vector<SystemId> targets;        // attack targets, at most 3
+    SystemId staging;                     // where the attack gathers
+    SystemId secured;                     // the system Secure Holdings watches
+    std::vector<SystemId> defend;         // systems to defend, most urgent first
+    int afterAttack = 0;                  // after-attack timer: 1 when an attack ends, +1 per turn
+    std::vector<SystemId> avoid;          // systems we agreed to leave (accepted demands)
+    std::vector<SystemId> attackSystems;  // systems an accepted request asked us to attack
+    bool metMinefield = false;            // our ships have run into a mine field
+    // Our own designs that fought in a battle, with the turn of the latest
+    // (spec 05 §8 "Design knowledge": every participant dates every piece;
+    // the layers' star-destroyer flag reads it, §7.5). Foreign designs are in
+    // Knowledge::seenDesigns.
+    std::vector<SeenDesign> designsFought;
+};
+
+// Turn-based games: how far an empire's last political step counted (spec 05
+// §7.3 "What it counts"): the game turn it ran in, how many battles
+// (GameState::combats) and log entries of each empire were dated that turn
+// then, and the next message id. The next step counts what came after.
+// Simultaneous games use only the message id (ai::simultaneousWindow).
+struct PoliticsMark {
+    bool set = false;
+    uint32_t turn = 0;
+    uint32_t battles = 0;
+    std::vector<uint32_t> logs;   // per EmpireId
+    uint32_t nextMessage = 0;
+};
+
+// ---- Script and external computer players (docs/sdk/ai-protocol.md) ------------------------
+
+// Who plays a computer empire (save format 9): the built-in AI (the classic
+// ministers, the default), a script player a mod declares in its
+// `[[ai.players]]`, or an external bot connected to the host. A controller
+// plays its empire while the empire is computer-controlled (PlayerKind
+// Computer or Neutral); a human empire's controller is not used.
+struct Controller {
+    enum class Kind : uint8_t { Builtin, Script, External, Count };
+    Kind kind = Kind::Builtin;
+    std::string mod;      // Script: the mod's id
+    std::string player;   // Script: the player's name in the mod's [[ai.players]]
+    uint32_t slot = 0;    // External: the host's slot for the bot
+
+    bool builtin() const { return kind == Kind::Builtin; }
+    bool operator==(const Controller&) const = default;
+};
+
+// What an empire's script or external player keeps in the game (save format
+// 9): its memory, and how often it failed this turn (docs/sdk/ai-protocol.md §7).
+struct ScriptPlayerState {
+    std::string memory;        // the player's `memory` as JSON text; empty: none yet (null)
+    uint32_t failureTurn = 0;  // the game turn `failures` counts
+    int failures = 0;          // its requests that failed in that turn
+    bool operator==(const ScriptPlayerState&) const = default;
+};
+
+// ---- Mods' rules (docs/sdk/rules.md) ------------------------------------------------------------
+
+// What one mod's rules scripts keep on a thing (the game, an empire, a
+// colony or a vehicle; save format 9): a script value as JSON text, saved,
+// sent and checksummed, at most GameOptions::modDataLimit bytes. Lists of
+// these hold one entry per mod, in the order the mods first wrote.
+struct ModData {
+    std::string mod;     // the mod's id
+    std::string value;   // JSON
+    bool operator==(const ModData&) const = default;
+};
+
+// A mod's game option (mod.toml [[rules.options]]): its value in this game.
+struct ModOption {
+    std::string mod;
+    std::string name;
+    int64_t value = 0;   // a whole number; a switch is 0 or 1
+    bool operator==(const ModOption&) const = default;
+};
+
+// A note a computer player attaches to something for the client's AI view
+// (a response's `notes`). Kept in memory for the turn it was given and the
+// next, unless the player replaces it: never saved, sent or hashed.
+struct PlayerNote {
+    uint32_t turn = 0;
+    std::string kind;      // what `object` is: "object", "vehicle", "fleet", "system", "empire" (docs/sdk/ai-protocol.md §4)
+    int64_t object = -1;   // its id; -1: a note about nothing in particular
+    std::string text;
+    bool operator==(const PlayerNote&) const = default;
+};
+
+// Where the Log's Goto takes an entry (spec 06 §4.1, §7 Q41, confirmed:
+// binary): fixed per kind of entry when it is made. Location closes the Log
+// and shows the entry's system with the sector selected (nothing happens when
+// the entry names none); the windows open over the Log. Nothing makes an
+// entry with the last three, which the original's handler also knows.
+enum class LogGoto : uint8_t { None, Location, Research, Intelligence, Empires, ConstructionQueues, EmpireOptions, Designs };
+
+// What an entry imported from one of the original's saved games held that
+// OpenSE4's own entries do not (docs/spec/08 §3.6.11), kept so that an export
+// writes it back: its kind, picture key, the other empire, the event fields and
+// a combat entry's battle details, which the original's Log pictures and its
+// computer players' anger read. Kind 0: an entry OpenSE4 made.
+struct ClassicBattleShip {
+    std::string name, hullCode;
+    uint16_t hull = 0;          // VehicleSize.txt position, 0 none
+};
+struct ClassicBattleSurvivor {
+    std::string name;
+    uint8_t damage = 0;         // percent
+};
+struct ClassicBattleSide {
+    uint8_t player = 0;
+    bool tookPart = false;
+    std::vector<ClassicBattleShip> forces;
+    std::vector<ClassicBattleSurvivor> survivors;
+};
+struct ClassicLogFields {
+    uint8_t kind = 0;
+    // The owner, system and sector bytes as the file had them (the owner is not
+    // always the log's empire, observed; a sector may lie outside the grid).
+    uint8_t owner = 0, system = 0, sector = 0;
+    // The date it was first read: the Log window's mark, which is also what a
+    // computer player's political step has counted (spec 05 §7.3); 0 unread.
+    int32_t dateRead = 0;
+    uint16_t pictureKey = 0;
+    EmpireId otherEmpire;
+    bool eventNotice = false;
+    uint8_t eventKind = 0;
+    uint16_t techArea = 0;
+    uint16_t battleNumber = 0;
+    std::vector<ClassicBattleSide> battle;   // one per player 1..20 when the entry had battle details
+};
+
+struct LogEntry {
+    uint32_t turn = 0;
+    LogCategory category = LogCategory::Misc;
+    std::string title;
+    std::string text;
+    std::optional<Location> location;
+    std::string picture;  // Events/ picture name, if any
+    // Goto's target; addLog gives Research entries the Research window and
+    // every other entry its location, and callers change it (logGoto).
+    LogGoto target = LogGoto::Location;
+    // A delivered diplomatic message's entry: the message (Send Reply, the details).
+    MessageId message;
+    // Imported from one of the original's saved games: what it held besides.
+    ClassicLogFields classic;
+};
+
+// One dated line of an empire's long record, the History window (spec 05
+// §3.4): the log keeps only the last turn, this record keeps every turn.
+// Entries are listed per empire they concern, plus a General list, and may
+// carry a map position. Which events are recorded is OpenSE4's choice
+// (addHistory's callers, spec 05 open question 30, inferred).
+struct HistoryEntry {
+    uint32_t turn = 0;
+    EmpireId empire;                    // the empire it concerns (us or another); invalid: General
+    std::string text;
+    std::optional<Location> location;   // where it happened, if anywhere
+};
+
+struct TurnStats {
+    uint32_t turn = 0;
+    int64_t score = 0;
+    Resources production;
+    int64_t research = 0;
+    int64_t intelligence = 0;
+    int techLevels = 0;
+    int systems = 0;
+    int planets = 0;
+    int64_t population = 0;
+    int units = 0;
+    int ships = 0;
+    int bases = 0;
+};
+
+// One row of a player's statistics record (Empire::statistics).
+struct StatisticsRow {
+    EmpireId empire;
+    TurnStats stats;
+};
+
+// What one other empire gives us by trade and tariffs in the coming turn, for
+// the Empires window's Trade and Tariff tabs (spec 06 §1.5).
+struct PartnerIncome {
+    EmpireId empire;
+    Resources trade;            // minerals, organics and radioactives by trade (Trade Alliance up)
+    int64_t research = 0;       // research by trade (Trade and Research Alliance up)
+    int64_t intelligence = 0;   // intelligence by trade (Partnership)
+    Resources tariffReceived;   // its tariff, when it is our subject or protectorate
+    Resources tariffGiven;      // our tariff, when it is our master
+};
+
+// Income/expense breakdown of the last processed turn (Empire Status window).
+struct EconomyReport {
+    Resources colonies, trade, tariffsIn, remoteMining, otherIncome;
+    Resources tariffsOut, maintenance, construction;
+    Resources lostToStorage, undelivered;
+    Resources storageCap;
+    int64_t research = 0;
+    int64_t intelligence = 0;
+    // The trade and tariffs above, empire by empire: one entry for each living
+    // empire with something to give or take, in empire order (save format 10).
+    std::vector<PartnerIncome> partners;
+};
+
+// What an empire knows about the galaxy (spec 01 §6).
+struct Knowledge {
+    std::vector<uint8_t> explored;        // per SystemId: stellar bodies known
+    std::vector<uint8_t> present;         // per SystemId: has presence this turn (recomputed)
+    std::vector<uint8_t> knownWarpLink;   // per ObjectId (warp points): destination known
+    std::vector<uint32_t> lastSeen;       // per SystemId: turn last seen with presence
+    std::vector<VehicleId> visibleVehicles;  // foreign vehicles visible this turn (sorted)
+    std::vector<SeenDesign> seenDesigns;     // foreign designs learned (sorted by design), with the turn last seen
+    std::vector<std::string> notes;          // per SystemId, player notes
+};
+
+struct QueueItem {
+    enum class Kind : uint8_t { Vehicle, Facility, Upgrade };
+    Kind kind = Kind::Vehicle;
+    DesignId design;          // Vehicle
+    uint32_t facility = 0;    // Facility: Facility.txt index; Upgrade: the target facility, fixed when queued
+    int count = 1;            // built as a batch; Upgrade: facilities to convert, fixed when queued (spec 02 §6.6)
+    Resources spent;          // progress on the current item
+};
+
+// A queue type (spec 02 §6.4, spec 08 §3.6.6, confirmed: binary): a named
+// copy of a construction queue's items with their counts, kept by the empire
+// and saved with the game (format 10). Set Construction Queue's Add Type stores
+// one, Fill Queue appends its items, each checked as it is added
+// (cmd::SetQueueTypes). The items carry no progress.
+struct QueueType {
+    std::string name;
+    std::vector<QueueItem> items;
+};
+inline constexpr size_t kMaxQueueTypes = 255;
+inline constexpr size_t kMaxQueueTypeItems = 255;
+
+// The Empire Options window's switches and what some windows remember
+// (spec 06 §1.9, §1.8, §1.10.3, §1.10.4, §4.1; confirmed: binary). They belong
+// to the empire and are saved with the game, so each hotseat player keeps
+// their own; a new empire starts with these defaults. The engine reads only
+// autoClaimColonized; the rest is for the client. Players change them with
+// cmd::SetInterfaceOptions.
+struct InterfaceOptions {
+    // General.
+    bool showLogAtTurnStart = true;
+    bool confirmEndTurn = true;
+    bool confirmScrap = true;
+    bool confirmStellarManipulation = true;
+    bool confirmDeleteResearch = true;
+    bool confirmDeleteIntel = true;
+    bool confirmDeleteFirstQueueItem = true;
+    bool noteSimilarAbilities = true;
+    // Next / Previous (the main window's selection cycles).
+    bool skipUnderConstruction = false;
+    bool skipDamaged = false;
+    bool stopOncePerLocation = false;
+    bool skipInFleets = false;
+    // System Display.
+    bool warpPointNames = true;
+    bool planetNames = false;
+    bool colonizableMarkers = true;
+    bool systemGrid = false;
+    bool coordinateLocation = true;
+    uint16_t facilityMarkers = 0;        // bit i: facility marker group i (12 groups)
+    // Galaxy Display.
+    bool galaxyGridLines = true;
+    bool galaxyWarpLines = true;
+    // Latest Items.
+    bool latestConstructionOnly = false;
+    bool latestComponentsOnly = false;
+    // Politics: a system we colonize joins Empire::claimedSystems.
+    bool autoClaimColonized = true;
+    // Remembered by the windows.
+    uint8_t logFilter = 0;               // 0 All, else LogCategory + 1
+    int32_t logPosition = 0;             // the selected entry's index in the empire's whole log (spec 06 §4.1)
+    int32_t logScroll = 0;               // the list's scroll position, in rows
+    uint8_t planetsTab = 0;              // the Planets window's tab (0 All)
+    bool planetsNoSysToAvoid = false;
+    uint8_t queuesTab = 0;               // the Construction Queues window's tab (0 Rate)
+    uint8_t queuesShown = 0x0f;          // its toggles: bit 0 Ships, 1 Planets, 2 Ship SY, 3 Planet SY
+    bool simulatorNoObsolete = false;    // the Combat Simulator's No Obsolete
+    // The Ships\Units window's tab (0 General) and its Show Ships (bit 0), Show
+    // Units (bit 1) and Show Fleets (bit 2) switches, kept with the empire: Fleet
+    // Transfer's Existing Fleets opens the window with them (spec 06 §7 Q79).
+    uint8_t shipsTab = 0;
+    uint8_t shipsShown = 0x07;
+    // The sort keys of the four list windows (spec 06 §7 Q24): five slots of
+    // column numbers each, newest click first; a slot holds column + 1, 0 is
+    // empty. All empty: the window's Name column alone (the default). The
+    // Colonies and Ships\Units keys are column identities, the same in every
+    // tab (spec 06 §1.8.3: client ColonyColumn and shipui::ShipColumn, Name 1).
+    std::array<uint8_t, 5> planetsSort{};
+    std::array<uint8_t, 5> coloniesSort{};
+    std::array<uint8_t, 5> shipsSort{};
+    std::array<uint8_t, 5> queuesSort{};
+    // Combat Replay Options.
+    bool replayAnimate = true;
+    bool replayFast = false;
+    bool replayViewRect = true;
+    bool replayGrid = false;
+    // The designer's To Hit Modifiers and Condensed View check boxes, options
+    // of the empire (spec 06 §7 Q94).
+    bool designToHit = false;
+    bool designCondensed = false;
+    // The Designs window's Hide Obsolete and Stats\Strategy check boxes: the
+    // original keeps both with the empire's options in the saved game (spec 08
+    // §3.6.7), so they come back on every opening (save format 8).
+    bool designsHideObsolete = false;
+    bool designsStatsView = false;
+    // The scenario window's page shown last in a game of one of the
+    // original's scenarios (GameState::classicScenario): its 1-based position
+    // in the scenario's text file, which Ctrl+H and the T buttons show again
+    // (docs/spec/06 §5.6; save format 10). The original keeps one for the
+    // game (spec 08 §3.4); ours keeps one per empire.
+    uint16_t scenarioPage = 1;
+    // The Designs window's tab (0 Ship Designs, 1 Unit Designs, 2 Enemy Ship
+    // Dsgn, 3 Enemy Unit Dsgn), kept with the empire's options like the two
+    // check boxes: the window opens on it (spec 08 §3.6.7; save format 10).
+    uint8_t designsTab = 0;
+    // The Empires window's tab, 0 Treaty, 1 Trade, 2 Tariff: the original keeps
+    // it with the empire's options (spec 06 §1.5, spec 08 §3.6.7; save format 10).
+    uint8_t empiresTab = 0;
+    // The Galaxy Map's Show Names, and Show Distances in its destination mode
+    // (Open Warp Point), kept with the empire's options in the saved game and
+    // not shown in Empire Options (spec 06 §2.6, spec 08 §3.6.7; save format 10).
+    bool galaxyMapNames = false;
+    bool galaxyMapDistances = false;
+    // How much a click moves in Transfer Cargo (0 Move One, 1 Five, 2 Ten, 3
+    // Hundred, 4 All) and in Launch \ Recover Units, on the map and in
+    // battle (0 Move One, 1 Five, 2 Ten, 3 All): kept with the empire's
+    // options, Ten at first (spec 08 §3.6.7, confirmed: binary; save format 10).
+    uint8_t cargoStep = 2;
+    uint8_t unitsStep = 2;
+    // The tab Set Construction Queue opens on (0 Ships, 1 Facilities, 2 Units,
+    // 3 Upgrades) and the Colonies window's (ColonyTab: 0 General ... 8
+    // Orders), stored when each window closes (spec 06 §1.8.3, spec 08
+    // §3.6.7, confirmed: binary; save format 10).
+    uint8_t setQueueTab = 0;
+    uint8_t coloniesTab = 0;
+
+    bool operator==(const InterfaceOptions&) const = default;
+};
+inline constexpr int kFacilityMarkerGroups = 12;
+
+struct Empire {
+    EmpireId id;
+    std::string name;          // e.g. "Terran"
+    std::string empireType;    // e.g. "Confederation"
+    std::string leaderTitle;
+    std::string leaderName;
+    Race race;
+    uint32_t color = 0xffffff;
+    PlayerKind kind = PlayerKind::Human;
+    // A neutral empire handed to a human player (kind Human): neutrality is a
+    // mark of its own that no window changes, so it stays neutral while a
+    // human plays it (spec 06 §7 Q84, confirmed: binary). Computer-controlled
+    // neutral empires have kind Neutral and this false. isNeutral() reads both.
+    bool neutral = false;
+    bool alive = true;
+    std::string passwordHash;
+    // The player's e-mail address (spec 06 §7 Q95, spec 05 §9.2, confirmed:
+    // binary): entered in Empire Setup's Email box, changed with Change Email
+    // (cmd::SetEmpireOptions), saved with the game. Only shown back to its
+    // player; the game never sends mail.
+    std::string email;
+    int racialPointsSpent = 0;
+
+    Resources stockpile;
+    EconomyReport economy;
+
+    // Research (spec 05 §1).
+    std::vector<int> techLevels;            // per TechAreaId
+    std::vector<ResearchProject> research;  // queue, max 12
+    bool researchEvenly = true;
+    bool repeatResearch = false;
+    std::vector<int> uniqueAreasUnlocked;   // Unique Area ids granted by ruins
+    // Points for this turn's research step: produced at the end of the
+    // previous turn, spent at the end of this one, then emptied (spec 05 §1.1).
+    int64_t researchPool = 0;
+
+    // Intelligence (spec 05 §2).
+    std::vector<IntelProjectOrder> intel;
+    bool intelEvenly = true;
+    bool repeatIntel = false;
+    int64_t intelPool = 0;                  // like researchPool (spec 05 §2.1)
+
+    std::vector<Relation> relations;        // per EmpireId
+    Knowledge knowledge;
+
+    // The empire's home system (spec 02 §2, §5.5): recorded when the game is
+    // created (a rebel empire: its capital's system when it is founded) and
+    // never moved, even after the homeworld is lost. Every starting planet is
+    // a capital (Colony::homeworld), so that flag alone does not tell which
+    // one is home.
+    SystemId homeSystem;
+    // The home planet's sector, recorded with the home system on the same
+    // occasions and never moved either, not even when the empire is
+    // destroyed: with it, the home planet location that High and Catastrophic
+    // events spare (spec 05 §4, open question 42, confirmed: binary).
+    Sector homeSector;
+    std::vector<SystemId> claimedSystems;
+    std::vector<SystemId> systemsToAvoid;
+    std::vector<Location> taggedMinefields;
+    std::array<Waypoint, 10> waypoints{};
+    std::vector<std::string> designTypes;
+    std::vector<std::string> colonyTypes;
+    std::vector<QueueType> queueTypes;      // Select Queue Type's own list (save format 10)
+    std::vector<ruleset::CombatStrategy> strategies;
+    std::vector<std::string> repairPriorities;
+    std::vector<DesignId> designs;          // own designs
+
+    std::vector<LogEntry> log;              // this turn's messages (pruned at the end of each turn, spec 05 §3.4)
+    std::vector<HistoryEntry> historyEvents;  // the History window's long record, oldest first
+    std::vector<TurnStats> history;         // statistics per turn (Scores, Comparisons)
+    // A human player's statistics record (spec 05 §5, confirmed: binary): at
+    // the start of each of its end-of-turn processings, one row for every
+    // living empire whose score the player may see then, its own included.
+    // The Comparisons window plots these rows only, so an empire has a gap
+    // for the turns it was not visible (save format 10).
+    std::vector<StatisticsRow> statistics;
+    int experience = 0;
+    // Fleets the empire has ever created (spec 03 §9, spec 08 §3.6.12,
+    // confirmed: binary): rises by one with every fleet made, never falls
+    // when one is disbanded; the next default fleet name starts from it plus
+    // one (defaultFleetName). Save format 11; an older game reads its fleet
+    // count.
+    uint32_t fleetsCreated = 0;
+
+    // Computer player state (spec 05 §7).
+    int aiState = 0;
+    int aiTurnsInState = 0;
+    bool aiMinimalChanges = false;
+    AiMemory aiMemory;
+    int aiDifficulty = -1;                  // kDifficulty*; -1 until the AI step assigns it (ai::difficultyOf)
+    PoliticsMark politicsMark;              // turn-based games: what its political steps have counted
+
+    // Full minister control: the Players window's computer control and a stand-in
+    // for a missing player set it (ai::setComputerControl, ai::standIn), and a
+    // rebel empire has it. The Ministers window's Complete AI does not (spec 02 §10).
+    bool ministerAll = false;
+    uint32_t ministers = kIndividualMinisters;  // human empires: minister areas switched on (bit = Minister)
+    std::string ministerStyle;              // "Aggressive", "Defensive", "Neutral"; empty: the race's own AI files
+    bool useRaceMinisterStyle = false;      // "Use Race Minister Style": the race's files even with a style (spec 05 §7.1)
+    bool ministersForNewVehicles = false;   // new vehicles and launched units start under minister control (spec 02 §10)
+
+    // Ship Orders option (spec 03 §6.4, confirmed: binary): a warp transit into
+    // a system holding such an empire's objects that the owner sees clears the
+    // group's orders (movement reads it). "Clear on meeting an enemy" is on for
+    // a new empire. Players set it with cmd::SetEncounterOptions; computer
+    // players copy it from their AI_Settings each turn (spec 05 §7.5).
+    EncounterClear clearOrdersOnEncounter = EncounterClear::Enemy;
+    // Ship Movement options (spec 03 §6.2): routes go around the tagged
+    // minefields, and never cross the systems to avoid, only while these are
+    // on. Both are on for a new empire (spec 03 §19 Q58, confirmed: binary). Players set
+    // them with cmd::SetEncounterOptions; computer players copy them from their
+    // AI_Settings each turn (spec 05 §7.5).
+    bool avoidTaggedMinefields = true;
+    bool avoidRestrictedSystems = true;
+    // "Choose the colony type on colonization" (spec 03 §8, on for a new
+    // empire): a human player's colony founded in a turn-based game waits in
+    // colonyTypeChoices for the player to pick its type in a dialog
+    // (cmd::SetColonyType); until then it has the type the computer would pick.
+    bool chooseColonyType = true;
+    std::vector<ObjectId> colonyTypeChoices;
+    // Empire Options and window memories (spec 06 §1.9).
+    InterfaceOptions interfaceOptions;
+    // Who plays the empire while it is computer-controlled, and its script
+    // player's memory (save format 9; docs/sdk/ai-protocol.md).
+    Controller controller;
+    ScriptPlayerState script;
+    // Its computer player's notes of this turn and the one before (never saved, sent or hashed).
+    std::vector<PlayerNote> aiNotes;
+    // What mods' rules scripts keep on it (save format 9).
+    std::vector<ModData> modData;
+
+    int techLevel(ruleset::TechAreaId a) const { return a.index() < techLevels.size() ? techLevels[a.index()] : 0; }
+    const Relation& relation(EmpireId e) const { return relations[e.index()]; }
+    Relation& relation(EmpireId e) { return relations[e.index()]; }
+    bool hasExplored(SystemId s) const { return s.index() < knowledge.explored.size() && knowledge.explored[s.index()]; }
+};
+
+// A neutral empire (spec 01 §8): computer-controlled ones have kind Neutral, a
+// neutral empire a human plays keeps the mark Empire::neutral (spec 06 §7 Q84).
+inline bool isNeutral(const Empire& e) { return e.kind == PlayerKind::Neutral || e.neutral; }
+
+// ---- Orders (spec 03 §8) -------------------------------------------------------------------------
+
+enum class OrderKind : uint8_t {
+    MoveTo,         // location
+    Warp,           // object = warp point
+    Attack,         // vehicle or object target
+    Resupply,
+    Repair,
+    Explore,
+    Colonize,       // object = planet
+    Sentry,
+    LoadCargo,      // design (unit) or population (design invalid); amount (-1 = all that fit)
+    DropCargo,      // same
+    LaunchUnits,    // design, amount
+    RecoverUnits,   // design = one of the unit kind (every design of each group of that kind is recovered);
+                    // vehicle = one named group, then only `design` from it, up to amount (the Launch/Recover window)
+    Cloak,
+    Decloak,
+    SweepMines,
+    UseComponent,   // amount = design entry position (spec 03 §8)
+    StellarManipulation,  // amount = StellarAction, object/location = target
+    MoveToWaypoint, // amount = waypoint slot
+    SelfDestruct,   // the whole object is destroyed (spec 03 §8, §15; movement::canSelfDestruct)
+    UseFacility,    // a colony's: amount = facility position; completes with no effect (spec 03 §8)
+    ConvertResources,  // a colony's: `amount` (at most 65,000) of resource `from` into `to` (spec 02 §5.6)
+    // The Scrap window's actions given in a simultaneous game, each as the
+    // vehicle's only order (spec 03 §15; scrap.hpp). They come only from the
+    // window's commands (cmd::Scrap, cmd::Analyze, cmd::Mothball,
+    // cmd::Retrofit, cmd::FireOn), never from cmd::SetOrders.
+    Scrap,          // "Scrap / Analyze / Mothball"
+    Analyze,        // "Deconstruct & Analyze"
+    Mothball,
+    Unmothball,
+    Retrofit,       // design = the design to retrofit to
+    FireOn,         // "Fire On And Destroy"
+    // The computer player's ministers' movement orders (spec 05 §7.5 "How
+    // long the ministers' movement orders last", AI_Fleets; confirmed:
+    // binary). Players never give them; a human's ministers do.
+    Seek,           // toward `location`, or after `vehicle` / the planet `object`; lasts one movement phase
+    JoinFleet,      // amount = the fleet's id: follows the fleet wherever it goes and joins it where it stands
+    // A colony's Abandon Planet (spec 02 §5, spec 08 §3.8.8 kind 64,
+    // confirmed: binary): amount 1 = scrap the facilities first. It comes only
+    // from cmd::AbandonPlanet, never from cmd::SetOrders.
+    Abandon,
+    Count
+};
+std::string_view displayName(OrderKind k);
+
+enum class StellarAction : uint8_t {
+    CreatePlanet, DestroyPlanet, CreateStar, DestroyStar, OpenWarpPoint, CloseWarpPoint,
+    CreateStorm, DestroyStorm, CreateNebulae, DestroyNebulae, CreateBlackHole, DestroyBlackHole,
+    CreateConstructedPlanet, Count
+};
+
+// What a Load Cargo, Drop Cargo, Launch Units or Recover Units order moves
+// when the player gives it: a kind of cargo, never one design (spec 03 §8,
+// confirmed: binary). The values are the original's cargo-kind numbers
+// (spec 08 §3.8.8). None: the order names one design instead (`Order::design`,
+// population when that is invalid), as OpenSE4's computer players and games
+// saved before format 10 give them.
+enum class CargoKind : uint8_t { None, Population, Troops, Fighters, Mines, Satellites, Drones, WeaponPlatforms, Count };
+// The unit type of a cargo kind (nullopt: None, Population).
+std::optional<ruleset::VehicleType> unitTypeOf(CargoKind k);
+// The cargo kind of a unit type (None for ships and bases).
+CargoKind cargoKindOf(ruleset::VehicleType t);
+std::string_view displayName(CargoKind k);   // "Population", "Fighters", ...
+
+struct Order {
+    OrderKind kind = OrderKind::MoveTo;
+    Location location;
+    ObjectId object;
+    VehicleId vehicle;
+    DesignId design;
+    int amount = 0;
+    // Convert Resources: the resource converted from and into, as Resource
+    // values; with any other value the order does nothing (spec 02 §5.6).
+    uint8_t from = 0;
+    uint8_t to = 0;
+    // Construct (StellarAction::CreateConstructedPlanet): the world the
+    // player chose in the Stellar Manipulation window, by its position in
+    // PlanetSize.txt, from 1, as the original's order stores it; the record's
+    // `Special Ability ID` must equal the device's value when it is carried
+    // out (spec 01 §9, spec 06 §1.3, spec 08 §3.8.8; confirmed: binary).
+    // Before 2026-10-14 it held the record's Special Ability ID instead.
+    uint8_t planetSize = 0;
+    // Load, Drop, Launch and Recover: the kind of cargo (save format 10).
+    CargoKind cargo = CargoKind::None;
+    bool operator==(const Order&) const = default;
+};
+
+// ---- Cargo, queues, colonies ------------------------------------------------------------
+
+struct PopulationGroup {
+    EmpireId race;          // the empire whose race this population is
+    int64_t millions = 0;
+    bool operator==(const PopulationGroup&) const = default;
+};
+
+struct UnitStack {
+    DesignId design;
+    int count = 0;
+    bool operator==(const UnitStack&) const = default;
+};
+
+struct Cargo {
+    std::vector<PopulationGroup> population;
+    std::vector<UnitStack> units;
+
+    int64_t totalPopulation() const {
+        int64_t n = 0;
+        for (const auto& p : population) n += p.millions;
+        return n;
+    }
+    int unitCount(DesignId d) const {
+        for (const auto& u : units)
+            if (u.design == d) return u.count;
+        return 0;
+    }
+    bool empty() const { return population.empty() && units.empty(); }
+};
+
+struct ConstructionQueue {
+    std::vector<QueueItem> items;
+    bool onHold = false;
+    bool repeat = false;
+    bool emergency = false;
+    int emergencyTurns = 0;   // consecutive emergency turns used
+    int slowTurns = 0;        // remaining slow-mode turns after an emergency
+    int autoWaypoint = -1;    // new vehicles get Move To this waypoint slot
+};
+
+// A colony's count of destroyed facilities of one kind (docs/spec/08 §3.8.5,
+// §11.2, confirmed: binary): each destruction by sabotage or an event adds to
+// it, and the removal pass that follows takes the count off the colony's
+// facilities of that kind; the count is never reset, so every later removal
+// pass at the colony takes it off again.
+struct DestroyedFacilities {
+    uint32_t facility = 0;   // Facility.txt index
+    int count = 0;
+    bool operator==(const DestroyedFacilities&) const = default;
+};
+
+struct Colony {
+    ObjectId planet;
+    EmpireId owner;
+    std::string colonyType;
+    std::vector<PopulationGroup> population;
+    int anger = kNewColonyAnger;      // whole percent, 0..100 (spec 02 §4); a new colony starts Happy
+    std::vector<uint32_t> facilities; // Facility.txt indices
+    Cargo cargo;
+    ConstructionQueue queue;
+    std::vector<ConstructionQueue> yardQueues;
+    bool yardsCombined = true;
+    int plagueLevel = 0;
+    int atmosphereTurns = 0;          // turns spent with an atmosphere the majority cannot breathe (spec 02 §2)
+    bool minister = false;
+    bool homeworld = false;           // the capital flag: anger never above 80; every starting planet has it (spec 02 §2, §9)
+    uint32_t foundedTurn = 0;
+    int militia = -1;                 // ground combat: militia left to raise; -1 = no invasion (spec 04 §13)
+    // Troops landed by another empire that still fight for the colony (spec 04
+    // §13): they serve `invader`, the empire that owned the ship that dropped
+    // them, not their design's owner. Kept apart from `cargo`, whose units
+    // always serve the colony's owner. Empty (and `invader` invalid) when
+    // nobody invades the colony.
+    EmpireId invader;
+    std::vector<UnitStack> landedTroops;
+    // The colony's order list (spec 03 §8, §12, spec 02 §5.6): Launch Units,
+    // Recover Units, Use Facility and Convert Resources, carried out on day 1
+    // of the movement phase in a simultaneous game, and in a turn-based one at
+    // the start of the owner's turn and when the player gives an order that
+    // runs the list. It follows the list rules of spec 03 §8, Repeat included.
+    std::vector<Order> orders;
+    bool repeatOrders = false;
+    // With Repeat on, how far the list has turned since Repeat was switched
+    // on (repeatShift, below; save format 10).
+    uint16_t repeatShift = 0;
+    // Colony (planetary) cloaking (spec 01 §6.9, confirmed: binary). The cloak
+    // and sensor levels per sight type come from the colony's facilities
+    // alone and are stored: sight::recalculateColony refreshes them, only when
+    // a facility is completed, Scrap Facilities is used, a battle destroys
+    // facilities, the colony is founded or the game is loaded. The cloaked
+    // mark survives every change of owner.
+    bool cloaked = false;
+    std::array<int, kSightTypes> cloakLevels{1, 1, 1, 1, 1};    // at least 1 in each type
+    std::array<int, kSightTypes> sensorLevels{1, 0, 0, 0, 0};   // EM Active at least 1
+    // Never reset (DestroyedFacilities); sorted by facility. Kinds the colony
+    // no longer has go with their last facility (inferred).
+    std::vector<DestroyedFacilities> destroyedFacilities;
+    // What mods' rules scripts keep on it (save format 9).
+    std::vector<ModData> modData;
+
+    int64_t totalPopulation() const {
+        int64_t n = 0;
+        for (const auto& p : population) n += p.millions;
+        return n;
+    }
+    // The highest anger this colony can have: 80 for a capital, else 100 (spec 02 §2, §4).
+    int maxAnger() const { return homeworld ? kCapitalMaxAnger : kMaxAnger; }
+};
+
+// ---- Designs and vehicles ------------------------------------------------------------------
+
+struct DesignEntry {
+    uint32_t component = 0;  // Components.txt index
+    int32_t mount = -1;      // CompEnhancement.txt index, or -1
+    bool operator==(const DesignEntry&) const = default;
+};
+
+struct Design {
+    DesignId id;
+    EmpireId owner;
+    std::string name;
+    std::string designType;
+    uint32_t hull = 0;       // VehicleSize.txt index
+    std::vector<DesignEntry> entries;
+    uint32_t strategy = 0;   // index into the owner's strategies
+    bool obsolete = false;
+    uint32_t createdTurn = 0;
+    // The AI_DesignCreation template the Design minister made it from, the
+    // template's `Name`; empty for hand-made and premade designs. The vehicle
+    // list's entries look designs up by it, and the Design minister's name
+    // counter counts such designs (spec 05 §7.5, confirmed: binary).
+    std::string templateName;
+    // A ship was retrofitted to it: it is no longer a prototype, even with
+    // nothing built (spec 03 §4.1; designIsPrototype, design.hpp).
+    bool retrofitted = false;
+    // "Built at least once", what design theft reads (spec 05 §2.3, open
+    // question 41, confirmed: binary): set when a queue completes a vehicle
+    // or unit of it or a ship is retrofitted to it, cleared only when the
+    // design is saved again in the designer (cmd::EditDesign). No statistics
+    // reset clears it, and nothing else sets it (a lesson's ships of
+    // docs/LEARNING.md do not).
+    bool everBuilt = false;
+    // Statistics (spec 03 §4.1, spec 04 §15); resetDesignStatistics (design.hpp) zeroes them.
+    // There is no kill counter (confirmed: binary).
+    int built = 0;
+    int lost = 0;
+    int64_t enemyTonnageDestroyed = 0;  // hull tonnage of the enemy vehicles its vehicles destroyed
+    // "Number Scrapped": scrapped, analyzed or self-destructed (spec 04 §15,
+    // spec 03 §15). In service is constructed - lost - scrapped.
+    int scrapped = 0;
+    // Its own picture (save format 9, the modding SDK; docs/sdk/packages-and-data.md
+    // "A design's own picture"): a base name that the client looks up as it
+    // does a hull's bitmap names (Mini_<picture> and Portrait_<picture> in the
+    // race's folder, then the generic one), in place of its hull's. Empty: the
+    // hull's pictures, as in the original. It changes nothing in the rules.
+    std::string picture;
+};
+
+enum class VehicleStatus : uint8_t { Normal, Mothballed, Cloaked };
+
+struct Vehicle {
+    VehicleId id;
+    // Its slot in the game's one object list, shared with the stellar objects
+    // (SpaceObject::slot): the order objects act in during the simultaneous
+    // movement phase and every other "object order" (spec 03 §6.3 step 5,
+    // §19 Q62, confirmed: binary). A new vehicle takes the lowest slot no
+    // object of any kind holds, else a new one at the end
+    // (GameState::addVehicle).
+    uint32_t slot = 0;
+    EmpireId owner;
+    DesignId design;                // a unit group that mixes designs: its first design
+    std::string name;
+    Location location;
+    int count = 1;                  // unit groups in space: the number of units, all designs together
+    // A unit group in space that mixes designs (spec 03 §12): each design and
+    // how many units of it, in the order they joined (at least two stacks).
+    // Empty when the vehicle holds one design, which is then `design` × `count`.
+    // Read and change it through the group helpers of design.hpp
+    // (groupStacks, addGroupUnits, removeGroupUnits, setGroupStacks).
+    std::vector<UnitStack> mixed;
+    std::vector<int> damage;        // per entry of `design`; destroyed when >= structure (a unit group: its front unit's, from mines)
+    int64_t supply = 0;
+    int movement = 0;               // movement points left this turn
+    std::vector<Order> orders;
+    bool repeatOrders = false;
+    // With Repeat on, how many completed orders have gone from the front of
+    // the list to its end since Repeat was switched on (save format 10). The
+    // original keeps a repeating list in place and steps a current-order
+    // index through it; OpenSE4 keeps the current order first, so the list is
+    // the original's turned by this many places (orderListShift, spec 03 §8).
+    uint16_t repeatShift = 0;
+    FleetId fleet;
+    Cargo cargo;
+    int experience = 0;
+    int experienceTenths = 0;       // tenths of a point beyond `experience` (0-9; combat gains, spec 04 §15)
+    VehicleStatus status = VehicleStatus::Normal;
+    bool minister = false;
+    ConstructionQueue queue;        // used when the design has a Space Yard
+    uint32_t builtTurn = 0;
+    uint32_t immobileUntil = 0;     // no movement while turn < this (sabotage/events, spec 05 §2.3)
+    // The sector the vehicle last left when it moved during turn `cameFromTurn`
+    // (spec 04 §3: attackers and start boxes). Movement records it on each step;
+    // it counts only while cameFromTurn == GameState::turn.
+    Location cameFrom;
+    uint32_t cameFromTurn = 0;
+    // Its heading, 0..7 in 45° steps clockwise from up (spec 06 §2.4, §7 Q62,
+    // confirmed: binary): a new vehicle faces up, each step within a system
+    // sets it to that step's bearing (movement::headingFor), a warp keeps it.
+    // Saved with the game, so a mini faces the same way after loading and at
+    // the start of a movement log replay. Whether the mini is drawn turned is
+    // the client's (engineless hulls, satellites and mines never are).
+    uint8_t heading = 0;
+    // Its place on its system's own object list (spec 05 §7.5 "Placement",
+    // confirmed: binary): that list holds the objects in the order they were
+    // placed in or entered the system, so the planets come before the ships
+    // that arrived or were built later. A stamp from GameState::arrivals,
+    // taken when the vehicle is placed (addVehicle) or enters another system
+    // (a warp, an event); a smaller one came first.
+    uint64_t arrival = 0;
+    // What mods' rules scripts keep on it (save format 9).
+    std::vector<ModData> modData;
+};
+
+// A fleet (spec 03 §9, confirmed: binary). It has no order list of its own:
+// its orders are copies in the lists of its members at its location (spec 03
+// §8, §19 Q65; fleetOrders). Its location is its own record: set where it is
+// formed, it follows whichever member moved last (fleetMemberMoved), and a
+// fleet left with no member there is disbanded at once (GameState::tidyFleets).
+struct Fleet {
+    FleetId id;
+    EmpireId owner;
+    std::string name;
+    std::vector<VehicleId> members;
+    VehicleId leader;               // the chosen leader; invalid: the first member in object order leads (fleetLeader)
+    Location location;
+    uint32_t formation = 0;         // Formations.txt index
+    uint32_t strategy = 0;          // owner's strategy index
+    int experience = 0;
+    int experienceTenths = 0;       // tenths beyond `experience` (0-9)
+    bool minister = false;
+};
+
+// ---- Diplomacy ---------------------------------------------------------------------------
+
+enum class MessageType : uint8_t {
+    General,
+    ProposeTreaty, AcceptTreaty, RefuseTreaty, CounterTreaty, BreakTreaty, DeclareWar,
+    ProposeTrade, AcceptTrade, RefuseTrade, CounterTrade,
+    Gift, Tribute, AcceptGift, RefuseGift,
+    Surrender, GrantIndependence,
+    // Non-binding demands and requests (spec 05 §3.4).
+    DemandGift, DemandTribute, DemandSurrender, DemandRemoveShips, DemandRemoveColonies, DemandLeavePlanet,
+    RequestStopHostilities, RequestBreakTreaty, RequestDeclareWar, RequestMakePeace, RequestSupport,
+    RequestAttackEmpire, RequestAttackPlanet, DemandStopEspionage, DemandStopSabotage, DemandStopAttacks,
+    AcceptDemand, RefuseDemand,
+    Count
+};
+std::string_view displayName(MessageType t);
+
+struct PackageItem {
+    enum class Kind : uint8_t { Resources, Technology, Planet, Vehicle, StarChart, Treaty, CommChannel, System };
+    Kind kind = Kind::Resources;
+    Resources resources;
+    ruleset::TechAreaId tech;
+    ObjectId planet;
+    VehicleId vehicle;
+    SystemId system;
+    Treaty treaty = Treaty::None;
+    EmpireId empire;   // comm channel target
+};
+
+struct DiplomaticMessage {
+    MessageId id;
+    EmpireId from;
+    EmpireId to;
+    uint32_t sentTurn = 0;
+    MessageType type = MessageType::General;
+    int tone = 1;                        // 0 pleading, 1 neutral, 2 demanding
+    std::string text;
+    Treaty treaty = Treaty::None;        // treaty messages
+    std::vector<PackageItem> offer;      // trade/gift/tribute: what the sender gives
+    std::vector<PackageItem> request;    // what the sender asks for
+    EmpireId thirdEmpire;                // requests about another empire
+    SystemId system;
+    ObjectId planet;
+    MessageId inReplyTo;
+    bool delivered = false;
+    bool answered = false;
+    // The date of its political entry in the recipient's log, set at delivery
+    // (spec 05 §7.4 "Answer window", confirmed: binary), as a GameState::turn
+    // number: the unadvanced date for the players' messages of a simultaneous
+    // turn and in turn-based games, the advanced date (turn + 1) for those a
+    // computer player or minister sends during the start-of-turn step of a
+    // simultaneous turn.
+    uint32_t dated = 0;
+};
+
+// ---- Combat records (replays and reports) ----------------------------------------------------
+
+struct CombatEvent {
+    // UnitsLost: unit group `piece` loses `amount` units to a hit by `target`
+    // (it may be Destroyed next, when none is left).
+    // Boarding: ship `piece` boarded ship `target`, which belonged to empire
+    // `component` then; `amount` is the outcome (kBoardingFailed,
+    // kBoardingTaken, kBoardingSelfDestruct), for the boarding message boxes
+    // (spec 06 §1.10.2). Recovered: carrier `target` took `amount` units of
+    // the launched group `piece` back aboard; with none left the group leaves
+    // the map (save format 10).
+    enum class Kind : uint8_t { Move, Fire, Hit, Miss, Destroyed, Captured, Launch, Seeker, UnitsLost, Boarding, Recovered };
+    Kind kind = Kind::Move;
+    uint8_t round = 0;
+    uint32_t piece = 0;       // index into CombatRecord::pieces
+    uint32_t target = 0;
+    int16_t x = 0, y = 0;
+    int32_t amount = 0;
+    uint32_t component = 0;
+    // A Hit's outcome, for the battle windows' drawing (spec 06 §1.10.3, §7
+    // Q77): kStructure when it damaged the target's structure or destroyed it
+    // (an explosion is drawn; without it the shields took it all), kDestroyed
+    // when the target did not survive it.
+    uint8_t flags = 0;
+    static constexpr uint8_t kStructure = 1;
+    static constexpr uint8_t kDestroyed = 2;
+    static constexpr int32_t kBoardingFailed = 0;
+    static constexpr int32_t kBoardingTaken = 1;
+    static constexpr int32_t kBoardingSelfDestruct = 2;
+    // A Hit's damage as the Tactical Combat window's target panel writes it
+    // (spec 06 §1.10.1, confirmed: binary): what the target's shields and its
+    // current hit points lost (a ship's: its intact structure less its damage
+    // pool, so damage that only filled the pool counts); a hit that destroys
+    // the target counts all the shields and hit points it had left.
+    int32_t shieldDamage = 0;
+    int32_t structureDamage = 0;
+};
+
+struct CombatPiece {
+    enum class Kind : uint8_t { Vehicle, Planet, UnitGroup, Seeker, Obstacle };
+    Kind kind = Kind::Vehicle;
+    EmpireId owner;
+    VehicleId vehicle;
+    ObjectId planet;
+    DesignId design;                   // a unit group that mixes designs: its first
+    std::string name;
+    int16_t startX = 0, startY = 0;
+    int32_t count = 1;                 // units in a group at the start (seekers: members)
+    // Fixed when the battle ends, for the Log's combat details (spec 06 §4.1,
+    // §7 Q43, confirmed: binary): the Damage percentage (logDamagePercent) of
+    // a piece present when the battle began, -1 for one without a row (a unit
+    // group launched during the battle, a seeker, a neutral obstacle); and the
+    // empire owning it then if it survived (invalid: destroyed, or a planet
+    // whose colony died), from which the Log reads "Dead" and "Taken".
+    int16_t damage = -1;
+    EmpireId survivor;
+};
+
+// The Log's Damage of a piece (spec 06 §4.1, confirmed: binary): 100 less
+// remaining / full in percent rounded half to even; 100 when full is 0 and 0
+// when remaining exceeds full.
+constexpr int logDamagePercent(int64_t full, int64_t remaining) {
+    if (full <= 0) return 100;
+    if (remaining > full) return 0;
+    if (remaining < 0) remaining = 0;
+    const int64_t scaled = remaining * 100;
+    int64_t kept = scaled / full;
+    const int64_t twice = (scaled % full) * 2;
+    if (twice > full || (twice == full && kept % 2 == 1)) ++kept;
+    return static_cast<int>(100 - kept);
+}
+
+// The counts left after one round of a ground combat (spec 06 §1.10.6): each
+// stack of GroundCombat::attackers and ::defenders, in their order, and the militia.
+struct GroundRound {
+    std::vector<int32_t> attackers;
+    std::vector<int32_t> defenders;
+    int32_t militia = 0;
+};
+
+// A ground combat (spec 04 §11, §13): what the Ground Combat window shows
+// (spec 06 §1.10.6). One fought during a space battle, when troops landed, is
+// kept in its battle's record; the colony owner's end-of-turn fight is handed
+// to the client when a window shows it (turn.hpp, BattleQuestion).
+struct GroundCombat {
+    uint8_t round = 0;                      // the combat turn the troops landed in (0: the colony owner's end-of-turn fight)
+    uint32_t planetPiece = 0;               // index into CombatRecord::pieces
+    uint32_t troopShip = 0;                 // the piece that dropped them
+    uint32_t event = 0;                     // the landing: its Launch event's index in CombatRecord::events
+    ObjectId planet;
+    EmpireId attacker, defender;
+    int64_t population = 0;                 // millions when the troops landed
+    std::vector<uint32_t> facilities;       // Facilities.txt indices
+    std::vector<UnitStack> attackers;       // the invading troops at the start
+    std::vector<UnitStack> defenders;       // the planet's troops and other stored units at the start
+    std::vector<UnitStack> attackersLeft;   // the same stacks after the fight
+    std::vector<UnitStack> defendersLeft;
+    int militia = 0, militiaLeft = 0;       // the militia raised for the fight, and those left
+    int rounds = 0;
+    bool captured = false;                  // the planet fell
+    std::vector<GroundRound> perRound;      // the counts after every round
+};
+
+struct CombatRecord {
+    uint32_t turn = 0;
+    Location location;
+    // The "current player" when the battle was fought, who counts it as
+    // Attacking in the anger terms (spec 05 §7.3, confirmed: binary): the
+    // player whose turn it is in a turn-based game; in a simultaneous game the
+    // highest player number, left over from the start-of-turn loop.
+    EmpireId currentPlayer;
+    std::vector<EmpireId> participants;
+    std::vector<CombatPiece> pieces;
+    std::vector<CombatEvent> events;
+    std::vector<std::string> summary;  // human-readable lines
+    std::vector<GroundCombat> grounds; // troops landed during the battle
+};
+
+// ---- Events and options ------------------------------------------------------------------------
+
+// Something that changes population mood (Happiness.txt triggers, spec 02 §4).
+// Each empire's happiness update uses up the events raised since its previous
+// update; those raised after it in the same turn wait for the next turn's.
+struct MoodEvent {
+    EmpireId empire;           // whose population reacts
+    std::string trigger;       // Happiness.txt trigger identifier
+    SystemId system;           // where it happened (invalid = empire-wide)
+    ObjectId planet;           // the planet it happened at (optional)
+    int count = 1;
+};
+
+// One slot of the timed-event list (spec 05 §4, spec 08 §3.4, confirmed:
+// binary): an event that struck is emptied, never removed, and nothing is
+// scheduled once the list has events::kMaxTimedEventSlots slots, free or not.
+struct PendingEvent {
+    // `eventType` of a free slot.
+    static constexpr uint32_t kFree = UINT32_MAX;
+    uint32_t eventType = 0;   // Events.txt index, or kFree
+    EmpireId empire;          // the empire recorded when it was scheduled
+    ObjectId object;
+    VehicleId vehicle;
+    SystemId system;
+    uint32_t fireTurn = 0;
+    bool isFree() const { return eventType == kFree; }
+};
+
+// The values a new game's Victory Conditions page shows, every condition
+// off (observed, spec 01 §11, spec 07 sessions 3 and 5). The "years" values
+// are kept in turns (tenths of a year), as the original keeps them; the
+// setup shows them with one decimal (confirmed: binary).
+struct VictoryConditions {
+    bool score = false;             int64_t scoreValue = 5'000'000;
+    bool years = false;             int yearsTurns = 100;
+    bool percentOfSecond = false;   int percentOfSecondValue = 300;
+    bool techPercent = false;       int techPercentValue = 50;
+    bool peace = false;             int peaceTurns = 10;
+    bool delay = false;             int delayTurns = 50;
+};
+
+struct GameOptions {
+    // Quadrant (spec 01 §2.2).
+    std::string quadrantType;
+    int systemCount = 0;                 // 0: rolled from quadrantSize; > 0: exactly this many
+    int quadrantSize = 1;                // 0 small, 1 medium, 2 large
+    bool allWarpPointsConnected = true;
+    bool noWarpPoints = false;
+    bool warpPointsAnywhere = false;
+    bool allSystemsSeen = false;
+    bool omnipresent = false;
+    bool finiteResources = false;
+    // Events.
+    int eventFrequency = 1;              // 0 none, 1 low (the default, spec 01 §2.2), 2 medium, 3 high
+    int maxEventSeverity = 3;            // 0 low .. 3 catastrophic (the default, observed: spec 01 §2.2)
+    // Technology.
+    int techCost = 1;                    // Technology Cost: 0 low, 1 medium (the default), 2 high (spec 05 §1.3)
+    int startTechLevel = 0;              // 0 low, 1 medium, 2 high
+    std::vector<uint8_t> techAreasAllowed;  // per tech area; empty = all
+    // Players.
+    Resources startingResources{20000, 20000, 20000};
+    int racialPoints = 2000;
+    int homePlanetValue = 1;             // 0 low, 1 medium, 2 high (Bad, Average, Good)
+    int startingPlanets = 1;             // 1, 3, 5 or 10
+    bool allPlanetsSameSize = true;      // every homeworld has the Home Planet Value size
+    bool sameSystemAllowed = false;
+    bool evenlyDistributed = true;
+    // Game settings.
+    // "No Tactical Combat" (spec 04 §2): every battle strategic. Off by
+    // default, so turn-based games ask (inferred: an opt-out check box).
+    // Simultaneous games never offer tactical combat either way.
+    bool noTacticalCombat = false;
+    // "Players can see the complete tech tree" (spec 01 §2.2), off by default:
+    // with it on the Research window has its Tech Tree button, the only way to
+    // the Tech Tree window; it changes nothing else (spec 06 §7 Q92, confirmed: binary).
+    bool splitConstruction = false; // Browser extension: independent planetary and yard production.
+    bool completeTechTree = false;
+    bool allowGifts = true;
+    bool allowTechTrades = true;
+    bool allowIntel = true;
+    bool noRuins = false;
+    bool onlyBreathable = false;
+    bool onlyHomeType = false;
+    bool teamMode = false;
+    std::vector<uint8_t> teamAssignments; // 0 independent; positive fixed custom team, indexed by empire
+    // "Allow Surrender" (spec 05 §3.4, §7.4, confirmed: binary), on by default:
+    // with it off a Surrender message does nothing at all, and a computer
+    // player never considers a surrender demand.
+    bool allowSurrender = true;
+    int scoreDisplay = 1;                // Score Display: 0 own, 1 own and Non-Aggression or better (the default), 2 all (spec 05 §5)
+    int maxShipsPerPlayer = 200;
+    int maxUnitsPerPlayer = 1000;
+    int aiDifficulty = kDifficultyMedium;  // Computer Player Difficulty: the level random AI players get
+    int aiBonus = 0;
+    VictoryConditions victory;
+    bool playersCanSaveMap = false;      // "Players can save map during a game": off by default; Save Map is disabled without it (spec 01 §2.2, §12, confirmed: binary)
+    // Mechanics.
+    int autosaveTurns = 0;               // Autosave: 0 None (the default), else every 1, 2, 3, 5 or 10 turns (spec 01 §2.2, §14 Q18)
+    // Multiplayer. Turn style (spec 01 §2.2, spec 05 §8): simultaneous (every
+    // player gives orders, then one turn processing carries them all out) or
+    // turn-based (one player after another; orders execute as they are given,
+    // turn_based in turn.hpp). A new game, Quick Start included, is
+    // turn-based (spec 01 §2.2, §14 Q39, confirmed: binary).
+    bool simultaneous = false;
+    // Per EmpireId: 1 for players added by "Random Computer/Neutral Players".
+    // Only they get the chosen aiDifficulty (spec 05 §7.1).
+    std::vector<uint8_t> randomAiPlayers;
+    // Script computer players (save format 9; docs/sdk/ai-protocol.md §3, §7).
+    // "Computer players see everything": their view is the whole game, not
+    // what their empire knows. Off by default.
+    bool aiSeesEverything = false;
+    // Bytecodes a script player may run for one request: a planning call
+    // (politics, orders, economy) and any other call.
+    int64_t aiPlanningBudget = 200'000'000;
+    int64_t aiCallBudget = 5'000'000;
+    // The most a script player's memory may take, as JSON text.
+    int64_t aiMemoryLimit = int64_t{1} << 20;
+    // Mods' rules (save format 9; docs/sdk/rules.md). The values of the
+    // options the game's mods declare, by mod and name (a declared option
+    // missing here has its default).
+    std::vector<ModOption> modOptions;
+    // Bytecodes one call of a mod's rules hook may run, and all of one mod's
+    // hooks in one game turn.
+    int64_t rulesHookBudget = 50'000'000;
+    int64_t rulesTurnBudget = 2'000'000'000;
+    // The most one mod's data on one thing may take, as JSON text.
+    int64_t modDataLimit = int64_t{1} << 20;
+};
+
+// ---- Turn-based games ----------------------------------------------------------------------
+
+// Unused since 2026-10-14, kept so that the save format stays the same:
+// OpenSE4 used to count the steps each vehicle made in the player turn in
+// progress and the movement Emergency Energy gave it, and capped its movement
+// left at that maximum plus the bonus, less the steps. The original keeps no
+// such count: a recompute of the maximum caps the movement left at the new
+// maximum alone (movement::capMovement; spec 03 §6.1, §19 Q85). The list is
+// cleared at every player's turn start and nothing fills it.
+struct TurnMoves {
+    VehicleId vehicle;
+    int steps = 0;
+    int bonus = 0;
+    bool operator==(const TurnMoves&) const = default;
+};
+
+// Units launched during the player turn in progress, per launcher and unit
+// kind: the per-game-turn launch budget (spec 03 §12). `kind` is the
+// launcher's AbilityKind.
+struct TurnLaunches {
+    VehicleId vehicle;
+    ObjectId planet;
+    uint16_t kind = 0;
+    int64_t count = 0;
+};
+
+// A human player's group stopped before a sector with enemy forces: the
+// player is asked whether to enter it (spec 03 §6.2) and answers with
+// cmd::EnterSector. `vehicle` is invalid when a fleet moves together. A
+// tagged group (spec 03 §8 "Tagged vehicles") is asked once for all its
+// vehicles: `tagged` lists them in tag order, the first acting, and
+// `vehicle` and `fleet` are invalid.
+struct EntryQuestion {
+    VehicleId vehicle;
+    FleetId fleet;
+    Location where;
+    std::vector<VehicleId> tagged;
+    bool operator==(const EntryQuestion&) const = default;
+};
+
+// The player turn in progress in a turn-based game (spec 05 §8 "Turn-based
+// game"). Unused in simultaneous games.
+struct PlayerTurn {
+    EmpireId empire;                    // whose turn it is; invalid: the next round has not started
+    bool started = false;               // its start of turn has run (movement, continued orders, ministers)
+    std::vector<TurnMoves> moves;       // unused, always empty (TurnMoves)
+    std::vector<TurnLaunches> launched;
+    // The player's Attack Sector questions still open, oldest first. Kept in
+    // the game so that a saved or network game asks them again (inferred).
+    std::vector<EntryQuestion> questions;
+    // Save format 10: the Lose ending is due at this turn's start. The human
+    // whose turn it is owned no colony and no vehicle when the turn came up,
+    // before its start of turn (spec 06 §7 Q83, Q99, confirmed: binary); the
+    // client shows the ending (score::ownsNothing).
+    bool loseEnding = false;
+};
+
+// Facilities left on a planet for a later owner. Nothing makes these any
+// more: an abandoned colony that keeps facilities stays with its owner (spec
+// 06 §7 Q47, confirmed: binary). The list stays in the state, always empty in
+// a new game, so that the save format is unchanged.
+struct LeftFacilities {
+    ObjectId planet;
+    std::vector<uint32_t> facilities;   // Facilities.txt indices
+};
+
+// ---- The decision journal (docs/sdk/ai-protocol.md §8) ---------------------------------------
+
+// One answer a script or external player gave: the request it answered (its
+// call, and a digest of its call, empire, turn and arguments) and the
+// response as the engine took it, as JSON text: the player's own fields, its
+// memory only when it changed, and `applied`, the commands its `apply`
+// service carried out during the request.
+struct JournalEntry {
+    uint32_t turn = 0;
+    EmpireId empire;
+    std::string call;
+    uint64_t digest = 0;
+    std::string response;
+    bool operator==(const JournalEntry&) const = default;
+};
+
+// The answers of the turns being played, so that playing a turn or a call
+// again gives the same answers without asking the players again. Kept in
+// memory only (never saved, sent or hashed): only the host plays turns.
+struct DecisionJournal {
+    // Every answer, in order, of the game turn in progress and the one before.
+    std::vector<JournalEntry> entries;
+    // Answers to give again, in order, instead of asking: those of a call
+    // that stopped for a battle answer and is made again, or of a turn played
+    // again (game::replayJournal). A request that differs from the next one
+    // drops them all.
+    std::vector<JournalEntry> replay;
+};
+
+// ---- Mods' rules (docs/sdk/rules.md) --------------------------------------------------------------
+
+// What the game keeps about one rules mod (save format 9): whether computer
+// players see their own things' data of it, and its failures and budget in
+// the game turn `turn` (docs/sdk/rules.md "Budgets and failures").
+struct ModRulesState {
+    std::string mod;
+    bool playersSee = false;                  // mod.toml [rules] players_see_mod_data
+    uint32_t turn = 0;                        // the game turn the counters below count
+    int failures = 0;                         // its hook calls that failed in that turn
+    int64_t budgetUsed = 0;                   // bytecodes its hooks ran in that turn
+    std::vector<std::string> failedHooks;     // hooks skipped for the rest of that turn, by name
+    bool operator==(const ModRulesState&) const = default;
+};
+
+// A scenario the game was started from (docs/sdk/rules.md "Scenarios"; save
+// format 9): its mod and name, and the objectives met so far, as
+// "<objective>@<empire id>".
+struct ScenarioState {
+    std::string mod;
+    std::string name;
+    std::vector<std::string> met;
+    bool operator==(const ScenarioState&) const = default;
+};
+
+// A game started from one of the original's scenarios, the tutorial among
+// them (docs/spec/06 §5.6, spec 08 §3.4; save format 10), apart from the
+// mods' scenarios (ScenarioState). The scenario's text pages are not kept:
+// the client reads them again from `stem` on every load. The page each
+// empire saw last is InterfaceOptions::scenarioPage. Set when the game
+// starts from the scenario and never changed in play.
+struct ClassicScenarioState {
+    bool active = false;     // a scenario game: its pages show, Ctrl+H shows the last one again
+    bool tutorial = false;   // the scenario is the tutorial: its T buttons
+    std::string stem;        // the files' full path without "_Settings.txt" and "_Text.txt"
+    bool operator==(const ClassicScenarioState&) const = default;
+};
+
+// ---- The game --------------------------------------------------------------------------------
+
+struct GameState {
+    uint32_t turn = 0;   // game date = 2400.0 + turn / 10
+    uint64_t seed = 0;
+    GameOptions options;
+    Galaxy galaxy;
+    std::vector<std::optional<Colony>> colonies;  // indexed by ObjectId (planets)
+    std::vector<Empire> empires;
+    std::vector<Design> designs;                  // indexed by DesignId
+    std::vector<Vehicle> vehicles;                // sorted by id
+    std::vector<Fleet> fleets;                    // sorted by id
+    std::vector<DiplomaticMessage> messages;      // not yet answered/expired
+    std::vector<PendingEvent> pendingEvents;
+    // Raised after an empire's happiness update, for its next one. Kept in
+    // memory only: no game file holds them, so a loaded game starts with
+    // none (spec 02 §4, confirmed: binary).
+    std::vector<MoodEvent> pendingMood;
+    // Battles of the last processed turn. Turn-based games keep those of the
+    // game turn in progress and of the one before (CombatRecord::turn).
+    std::vector<CombatRecord> combats;
+    uint32_t nextVehicleId = 0;
+    uint32_t nextFleetId = 0;
+    uint64_t arrivals = 0;          // the last Vehicle::arrival stamp given
+    uint32_t nextMessageId = 0;
+    uint32_t peacefulTurns = 0;
+    // No further turn is played: a turn-based game whose last turn every
+    // player has played, or a mod's victory condition or scenario.
+    bool gameOver = false;
+    // The victory check was met (save format 10: the original's "completed"
+    // mark, spec 05 §6, confirmed: binary). From the next turn on every
+    // empire's start-of-turn step skips its ministers and computer player
+    // (and, turn-based, the movement refill and the orders run at the turn's
+    // start), and its end-of-turn processing is skipped entirely. Turn-based:
+    // the game turn in progress is the last, every player plays it after the
+    // Victory ending, and when it ends the game is over (gameOver). A
+    // simultaneous game is never ended by it: the host may go on processing
+    // turns, every player seeing the Victory ending each turn.
+    bool lastTurn = false;
+    EmpireId winner;
+    Rng rng;
+    PlayerTurn playerTurn;                        // turn-based games only
+    // The starting points the game still holds, for Save Map during the game
+    // (spec 01 §12, confirmed: binary): a game started from a map keeps all of
+    // the map's specific points and the common points no player took; a
+    // generated game has none.
+    std::vector<StartingPoint> startingPoints;
+    std::vector<LeftFacilities> leftFacilities;   // sorted by planet
+    // The mods the game is played with, in load order (save format 9): a game
+    // whose game-affecting mods a computer lacks does not load there
+    // (docs/sdk/packages-and-data.md). Empty for a game without mods.
+    std::vector<ruleset::ModRecord> mods;
+    // What script and external players answered (not saved, sent or hashed).
+    DecisionJournal journal;
+    // Mods' rules (save format 9): their data on the game, what the game
+    // keeps about each rules mod, the scenario it was started from, and why
+    // it ended when a mod's victory condition or scenario ended it (the
+    // classic conditions leave it empty).
+    std::vector<ModData> modData;
+    std::vector<ModRulesState> modRules;
+    ScenarioState scenario;
+    std::string endReason;
+    // The original's scenario the game was started from, if any (save format 10).
+    ClassicScenarioState classicScenario;
+
+    // Accessors.
+    Empire& empire(EmpireId id) { return empires[id.index()]; }
+    const Empire& empire(EmpireId id) const { return empires[id.index()]; }
+    Design& design(DesignId id) { return designs[id.index()]; }
+    const Design& design(DesignId id) const { return designs[id.index()]; }
+
+    Colony* colony(ObjectId planet) {
+        return planet.index() < colonies.size() && colonies[planet.index()] ? &*colonies[planet.index()] : nullptr;
+    }
+    const Colony* colony(ObjectId planet) const { return const_cast<GameState*>(this)->colony(planet); }
+
+    Vehicle* vehicle(VehicleId id) {
+        auto it = std::lower_bound(vehicles.begin(), vehicles.end(), id, [](const Vehicle& v, VehicleId x) { return v.id < x; });
+        return it != vehicles.end() && it->id == id ? &*it : nullptr;
+    }
+    const Vehicle* vehicle(VehicleId id) const { return const_cast<GameState*>(this)->vehicle(id); }
+
+    Fleet* fleet(FleetId id) {
+        auto it = std::lower_bound(fleets.begin(), fleets.end(), id, [](const Fleet& f, FleetId x) { return f.id < x; });
+        return it != fleets.end() && it->id == id ? &*it : nullptr;
+    }
+    const Fleet* fleet(FleetId id) const { return const_cast<GameState*>(this)->fleet(id); }
+
+    // Game date as tenths of a year since 2400 (display: 2400 + turn/10).
+    int year() const { return 2400 + static_cast<int>(turn / 10); }
+
+    // Adds with a fresh id (keeps `vehicles`/`fleets` sorted). References are
+    // invalidated by the next add. A new vehicle takes freeSlot(); a new fleet
+    // without a location is placed at its first member's.
+    Vehicle& addVehicle(Vehicle v);
+    // The vehicle enters another system (Vehicle::arrival).
+    void arrived(Vehicle& v) { v.arrival = ++arrivals; }
+    Fleet& addFleet(Fleet f);
+    // The game's one object list (spec 03 §6.3 step 5, §19 Q62; spec 02 §13
+    // Q52, confirmed: binary): stars, planets, asteroid fields, storms, warp
+    // points, ships, bases and unit groups each hold a slot. A removed object
+    // (a vehicle taken out of `vehicles`, a stellar object taken off its
+    // system's list) leaves its slot empty; freeSlot() is the lowest slot no
+    // object holds, so a new object of any kind takes the slot any kind left.
+    uint32_t freeSlot() const;
+    // A stellar object made during play (stellar manipulation, events): a fresh
+    // id, freeSlot(), its place in the system's list (kept in object order),
+    // and the per-object lists (colonies, known warp links) grown to match.
+    ObjectId addObject(SpaceObject obj, SystemId system);
+    // Drops vehicles with count <= 0, then tidyFleets().
+    void removeDeadVehicles();
+    // Fleet membership after vehicles left or were removed (spec 03 §9): a
+    // member that is gone or no longer carries the fleet's tag is dropped, a
+    // chosen leader that left is no longer chosen, and a fleet with no member
+    // left at its location is disbanded (disbandFleet). A fleet with no
+    // members at all is one Fleet Transfer made (cmd::CreateFleet): it is kept,
+    // through turn processing too, unless `keepEmpty` is false (loading a
+    // saved game, as the original disbands memberless fleets then).
+    void tidyFleets(bool keepEmpty = true);
+    std::vector<const Vehicle*> vehiclesAt(Location where) const;
+};
+
+// One entry of the game's object list: a stellar object (`object`) or a
+// vehicle (`vehicle`); exactly one is valid.
+struct ObjectRef {
+    ObjectId object;
+    VehicleId vehicle;
+    uint32_t slot = 0;
+    bool operator==(const ObjectRef&) const = default;
+};
+// Every object in the game's object order, by slot: the stellar objects on
+// their systems' lists and every vehicle (dead ones not yet removed
+// included). Whatever the rules do "in object order" follows this list.
+std::vector<ObjectRef> objectOrder(const GameState& s);
+// The vehicles alone, in object order.
+std::vector<VehicleId> vehiclesInObjectOrder(const GameState& s);
+
+// ---- Fleets (spec 03 §8, §9, §19 Q61, Q65; confirmed: binary) ---------------------------------------
+
+// The chosen leader, else the first member in object order.
+const Vehicle* fleetLeader(const GameState& s, const Fleet& f);
+// The members at the fleet's location, alive, in member order.
+std::vector<VehicleId> fleetMembersAt(const GameState& s, const Fleet& f);
+// The members that carry out the fleet's orders as one group: every member at
+// its location, mothballed ones included, in member order. Nothing in fleet
+// handling tests a member's status: a mothballed member gets copies of the
+// fleet's orders, is in the group and can act for it, and its maximum
+// movement of 0 holds the fleet's speed at 0 (spec 03 §9, §19 Q74, confirmed:
+// binary).
+std::vector<VehicleId> fleetGroup(const GameState& s, const Fleet& f);
+// The vehicle is one of its fleet's group (fleetGroup).
+bool inFleetGroup(const GameState& s, const Vehicle& v);
+// The vehicles an order to a tagged selection goes to (spec 03 §8 "Tagged
+// vehicles", spec 06 §2.5): `tagged` in tag order, each of the empire's
+// living vehicles once, a fleet member standing for every member of its
+// fleet's group (fleetGroup), in member order, at the place of the first one
+// of them named. Others' vehicles and missing ones are left out.
+std::vector<VehicleId> taggedVehicles(const GameState& s, EmpireId empire, std::span<const VehicleId> tagged);
+// The fleet's orders as one list: the list of the first member of its group,
+// in object order, that has orders; that member acts for the fleet. Each
+// member holds its own copy, so a member that joined after orders were given
+// holds only the later ones. nullptr / an empty list when nobody has orders.
+const Vehicle* fleetOrderHolder(const GameState& s, const Fleet& f);
+const std::vector<Order>& fleetOrders(const GameState& s, const Fleet& f);
+bool fleetRepeats(const GameState& s, const Fleet& f);
+
+// ---- Repeating order lists (spec 03 §8, §19 Q76, confirmed: binary) ----------------------------
+// The original keeps a repeating list in place and steps a current-order
+// index through it: switching Repeat on or off puts the index back on the
+// list's first order, and an order added goes at the end of the list, after
+// its last order. OpenSE4 keeps the current order first (a completed order
+// goes to the end while Repeat is on) and counts in `repeatShift` the places
+// the list has turned; these keep the two alike.
+
+// The places a list has turned: 0 with Repeat off or an empty list.
+size_t orderListShift(const std::vector<Order>& orders, bool repeat, uint16_t shift);
+// The head order is done: it leaves the list, or with Repeat on goes to its end.
+void completeHeadOrder(std::vector<Order>& orders, bool repeat, uint16_t& shift);
+// The head order is taken out of the list, Repeat or not.
+void removeHeadOrder(std::vector<Order>& orders, bool repeat, uint16_t& shift);
+// The list as the original holds it: turned back to its first order.
+std::vector<Order> originalOrderList(const std::vector<Order>& orders, bool repeat, uint16_t shift);
+// cmd::SetOrders' change to one list. `full` is the new list; when `added`
+// holds a value, the list held exactly full's first *added orders and the
+// rest were added to it. Added orders go where the original adds them, at
+// the end of its list (in front of its first order while the list turns). A
+// change of the Repeat switch restarts the list at its first order. Any
+// other list replaces the old one.
+void changeOrderList(std::vector<Order>& orders, bool& repeat, uint16_t& shift, std::vector<Order> full, std::optional<size_t> added,
+                     bool newRepeat);
+// A fleet member moved, by any means (a step, a warp, drift, an event): the
+// fleet's location goes with it.
+void fleetMemberMoved(GameState& s, const Vehicle& v);
+// The vehicle leaves its fleet and loses its orders; a chosen leader is no
+// longer chosen, and a fleet left with no member at its location is
+// disbanded.
+void leaveFleet(GameState& s, Vehicle& v);
+// The vehicle joins the fleet (by Fleet Transfer or the Join Fleet order) and
+// its list is cleared: it gets only the orders given after it joined (spec 03
+// §9, §19 Q65). The caller has checked the sector and the kind of vehicle.
+void joinFleet(Fleet& f, Vehicle& v);
+// Every member leaves the fleet and loses its orders; the fleet is deleted.
+void disbandFleet(GameState& s, FleetId id);
+
+// Appends to an empire's log for the current turn and returns the entry (null
+// for an invalid empire; valid until the log changes again). Goto's target is
+// the Research window for Research entries, else the entry's location.
+LogEntry* addLog(GameState& s, EmpireId empire, LogCategory category, std::string title, std::string text = {},
+                 std::optional<Location> where = std::nullopt, std::string picture = {});
+// Sets the Goto target of an entry addLog just made (null: nothing).
+inline LogEntry* logGoto(LogEntry* entry, LogGoto target) {
+    if (entry) entry->target = target;
+    return entry;
+}
+
+// Appends a line dated the current turn to an empire's history record.
+// `about` is the empire the event concerns (invalid: the General list).
+void addHistory(GameState& s, EmpireId empire, EmpireId about, std::string text, std::optional<Location> where = std::nullopt);
+
+// Foreign designs an empire has seen (Knowledge::seenDesigns).
+bool knowsDesign(const Knowledge& k, DesignId d);
+// When `d` was last seen; nullopt when it is not known.
+std::optional<uint32_t> designSeenTurn(const Knowledge& k, DesignId d);
+// Records that the design was seen at `turn`; a design already known keeps
+// the later of the two turns.
+void seeDesign(Knowledge& k, DesignId d, uint32_t turn);
+// The designs of the list, in order.
+std::vector<DesignId> seenDesignIds(const Knowledge& k);
+
+} // namespace opense4::game

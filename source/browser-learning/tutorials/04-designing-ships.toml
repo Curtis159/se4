@@ -1,0 +1,33 @@
+# Browser adaptation of OpenSE4 learning topics; original sources retained upstream.
+title = "Designing ships"
+summary = "Create a researched design and build it in a shipyard."
+minutes = 15
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+starting_ships = []
+[[step]]
+title = "Choose a hull"
+text = "Open Designs, choose New design and select a researched hull. Give it a name, then choose Next: Core systems."
+done = { window = "create-design" }
+[[step]]
+title = "Required systems"
+text = "Required systems are fitted automatically using researched parts. A Master Computer can replace the bridge, life support and crew quarters. You may remove or change the fitted parts."
+done = { design_components = 3 }
+[[step]]
+title = "Equip the ship"
+text = "Choose Equipment. Engines, weapons, armor, shields, colony modules, cargo, supplies and other components are grouped by category. Stay within the hull capacity."
+[[step]]
+title = "Save the design"
+text = "Use Review to check the capacity, cost and validation issues, then Save Design."
+done = { command = "CreateDesign" }
+[[step]]
+title = "Build it"
+text = "Select a colony with a shipyard, choose your design in its shipyard queue and Add."
+done = { command = "QueueAdd" }
+[[step]]
+title = "Design versus ship"
+text = "A design is a blueprint. The ship becomes available only after construction finishes. End a turn to begin work."
+done = { turns_passed = 1 }

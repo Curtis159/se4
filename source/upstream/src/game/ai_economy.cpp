@@ -1,0 +1,845 @@
+// Computer player: colony types and the construction ministers (spec 05 §7.5
+// AI_Planet_Types, AI_Construction_Facilities, AI_Construction_Vehicles,
+// confirmed: binary unless marked).
+
+#include "datafile/datafile.hpp"
+#include "game/ai_planner.hpp"
+#include "game/economy.hpp"
+#include "game/query.hpp"
+
+#include <algorithm>
+#include <map>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace opense4::game::ai {
+
+namespace {
+
+using datafile::keysEqual;
+using namespace detail;
+
+int stellarRank(std::string_view name) {
+    static constexpr std::array<std::string_view, 5> kSizes{"Tiny", "Small", "Medium", "Large", "Huge"};
+    for (size_t i = 0; i < kSizes.size(); ++i)
+        if (keysEqual(name, kSizes[i])) return static_cast<int>(i);
+    return -1;
+}
+
+int planetRank(const Rules& r, const SpaceObject& planet) {
+    if (const ruleset::PlanetSize* ps = planetSize(r, planet)) return ps->constructed ? 5 : stellarRank(ps->stellarSize);
+    return stellarRank(planet.size);
+}
+
+// The size a `Minimum Planet Size for Type` entry names: a PlanetSize.txt
+// entry, or a stellar size name.
+int namedRank(const Rules& r, std::string_view name) {
+    for (const ruleset::PlanetSize& ps : r.data().planetSizes)
+        if (keysEqual(ps.name, name)) return ps.constructed ? 5 : stellarRank(ps.stellarSize);
+    return stellarRank(name);
+}
+
+bool allResearchDone(const Rules& r, const GameState& s, const Empire& e) {
+    for (uint32_t a = 0; a < r.data().techAreas.size(); ++a) {
+        const ruleset::TechAreaId id{a};
+        if (r.techVisible(s, e, id) && e.techLevel(id) < r.tech(id).maxLevel) return false;
+    }
+    return true;
+}
+
+bool sameType(std::string_view a, std::string_view b) {
+    const ColonyType ta = parseColonyType(a), tb = parseColonyType(b);
+    if (ta != ColonyType::Count || tb != ColonyType::Count) return ta == tb;
+    return keysEqual(a, b);
+}
+
+} // namespace
+
+std::string colonyTypeAtColonization(const Rules& r, const GameState& s, EmpireId id, ObjectId planetId) {
+    const Empire& e = s.empire(id);
+    const AiProfile& prof = profileFor(r, e);
+    const AiState state = stateOf(e);
+    const SpaceObject& planet = s.galaxy.object(planetId);
+    const EconomyReport& eco = e.economy;
+    const std::string mining(displayName(ColonyType::Mining));
+
+    // Pre-rules.
+    if (e.stockpile[Resource::Minerals] <= 2000 && planet.value[0] > 80) return mining;
+    const Resources production = eco.colonies + eco.remoteMining + eco.otherIncome;
+    const Resources deficit = eco.maintenance - (eco.trade + eco.tariffsIn) - production;
+    if (deficit[Resource::Organics] > 2000 && planet.value[1] >= 50) return std::string(displayName(ColonyType::Farming));
+    if (deficit[Resource::Minerals] > 2000 && planet.value[0] >= 50) return mining;
+    if (deficit[Resource::Radioactives] > 2000 && planet.value[2] >= 50) return std::string(displayName(ColonyType::Refining));
+
+    // The first AI_Planet_Types row that passes all its tests.
+    int64_t colonies = 0;
+    for (const auto& c : s.colonies) colonies += c && c->owner == id && c->planet != planetId;
+    const int64_t low = r.setting("Planet Value Low Resources", 0), high = r.setting("Planet Value High Resources", 0);
+    const int64_t mid = low + (high - low) / 2;
+    for (const PlanetTypeRow& row : prof.planetTypes) {
+        if (!(row.states & maskOf(state))) continue;
+        const ColonyType type = parseColonyType(row.type);
+        if (type == ColonyType::ResearchCompound &&
+            (allResearchDone(r, s, e) || eco.research >= prof.settings.maxResearchPoints))
+            continue;
+        if (type == ColonyType::IntelligenceCompound && (eco.intelligence >= prof.settings.maxIntelligencePoints || !s.options.allowIntel))
+            continue;
+        int64_t ofType = 0, inSystem = 0;
+        for (const auto& c : s.colonies) {
+            if (!c || c->owner != id || c->planet == planetId || !sameType(c->colonyType, row.type)) continue;
+            ++ofType;
+            inSystem += s.galaxy.object(c->planet).system == planet.system;
+        }
+        if (row.maxInEmpire > 0 && ofType >= row.maxInEmpire) continue;
+        if (row.maxPerSystem > 0 && inSystem >= row.maxPerSystem) continue;
+        if (row.percentOfColonies > 0 && ofType * 100 > colonies * row.percentOfColonies) continue;
+        if (!row.minimumSize.empty() && planetRank(r, planet) < namedRank(r, row.minimumSize)) continue;
+        bool values = true;
+        for (size_t k = 0; k < 3; ++k) {
+            const int64_t t = row.values[k];
+            if (t <= 100) continue;  // only thresholds above 100 count
+            if (s.options.finiteResources ? int64_t{planet.value[k]} * 100 < mid * t : planet.value[k] < t) values = false;
+        }
+        if (!values) continue;
+        return row.type;
+    }
+    return mining;
+}
+
+namespace detail {
+
+namespace {
+
+// ---- Facilities -----------------------------------------------------------------------------
+
+// The research and intelligence abilities whose facilities the caps block
+// (spec 05 §7.5 `AI_Construction_Facilities`, confirmed: binary). The
+// `Generate Points` abilities are on neither list.
+bool researchAbility(AbilityKind k) {
+    return k == AbilityKind::PointGenResearch || k == AbilityKind::PlanetPointGenModResearch || k == AbilityKind::SystemPointGenModResearch;
+}
+bool intelAbility(AbilityKind k) {
+    return k == AbilityKind::PointGenIntelligence || k == AbilityKind::PlanetPointGenModIntelligence ||
+           k == AbilityKind::SystemPointGenModIntelligence || k == AbilityKind::ChangeBadIntelChanceSystem;
+}
+// With finite resources, the resource (0..2) of a `Resource Generation` or
+// `Resource Gen Modifier Planet` ability, or -1 for any other ability: the
+// system modifiers and the planet-value abilities are not blocked.
+int extractedResource(AbilityKind k) {
+    switch (k) {
+        case AbilityKind::ResourceGenMinerals:
+        case AbilityKind::ResourceGenModPlanetMinerals: return 0;
+        case AbilityKind::ResourceGenOrganics:
+        case AbilityKind::ResourceGenModPlanetOrganics: return 1;
+        case AbilityKind::ResourceGenRadioactives:
+        case AbilityKind::ResourceGenModPlanetRadioactives: return 2;
+        default: return -1;
+    }
+}
+// The abilities a system needs only one of among the empire's colonies there
+// (spec 05 §7.5, confirmed: binary): a fixed list, which holds none of the
+// stellar `System - ...` abilities.
+bool onePerSystem(AbilityKind k) {
+    switch (k) {
+        case AbilityKind::Palace:
+        case AbilityKind::ResourceGenModSystemMinerals:
+        case AbilityKind::ResourceGenModSystemOrganics:
+        case AbilityKind::ResourceGenModSystemRadioactives:
+        case AbilityKind::SystemPointGenModResearch:
+        case AbilityKind::SystemPointGenModIntelligence:
+        case AbilityKind::CombatModifierSystem:
+        case AbilityKind::DamageModifierSystem:
+        case AbilityKind::ShieldModifierSystem:
+        case AbilityKind::PlanetValueChangeSystem:
+        case AbilityKind::PlanetConditionsChangeSystem:
+        case AbilityKind::ChangeBadEventChanceSystem:
+        case AbilityKind::ChangeBadIntelChanceSystem:
+        case AbilityKind::ChangePopulationHappinessSystem:
+        case AbilityKind::ChangePopulationSystem:
+        case AbilityKind::ModifyReproductionSystem:
+        case AbilityKind::PlaguePreventionSystem:
+        case AbilityKind::ShipTraining:
+        case AbilityKind::FleetTraining:
+        case AbilityKind::ShipTrainingSystem:
+        case AbilityKind::FleetTrainingSystem:
+        case AbilityKind::ResourceConversion:
+        case AbilityKind::LongRangeScannerSystem:
+        case AbilityKind::ReducedMaintenanceSystem:
+        case AbilityKind::StopStarDestroyer:
+        case AbilityKind::StopNebulaeCreator:
+        case AbilityKind::StopBlackHoleCreator:
+        case AbilityKind::StopOpenWarpPoint:
+        case AbilityKind::StopCloseWarpPoint: return true;
+        default: return false;
+    }
+}
+
+int facilitiesWith(const Rules& r, const Colony& c, std::string_view ability) {
+    int n = 0;
+    for (uint32_t f : c.facilities) n += facilityHas(r, f, ability);
+    for (const QueueItem& q : c.queue.items) n += q.kind == QueueItem::Kind::Facility && facilityHas(r, q.facility, ability);
+    return n;
+}
+
+bool systemHas(const Planner& p, SystemId sys, std::string_view ability) {
+    for (const auto& c : p.st.colonies)
+        if (c && c->owner == p.id && p.st.galaxy.object(c->planet).system == sys && facilitiesWith(p.r, *c, ability) > 0) return true;
+    return false;
+}
+
+// Is the planet's atmosphere already right for the majority race?
+bool atmosphereSuits(const GameState& s, const Colony& c) {
+    EmpireId majority;
+    int64_t most = -1;
+    for (const PopulationGroup& g : c.population)
+        if (g.millions > most) {
+            most = g.millions;
+            majority = g.race;
+        }
+    if (!majority.valid() || majority.index() >= s.empires.size()) return true;
+    return keysEqual(s.galaxy.object(c.planet).atmosphere, s.empire(majority).race.atmosphere);
+}
+
+// Spec 05 §7.5: the rules that block a facility entry.
+bool blocked(const Planner& p, const Colony& c, const FacilityEntry& entry) {
+    const auto kind = parseAbilityKind(entry.ability).value_or(AbilityKind::Unknown);
+    const SystemId sys = p.st.galaxy.object(c.planet).system;
+    if (entry.amount <= 0 || facilitiesWith(p.r, c, entry.ability) >= entry.amount) return true;
+    switch (kind) {
+        case AbilityKind::Spaceport: return systemHas(p, sys, entry.ability) || p.r.hasTrait(p.emp().race, "No Spaceports");
+        case AbilityKind::SupplyGeneration: return systemHas(p, sys, entry.ability);
+        case AbilityKind::SpaceYard: return facilitiesWith(p.r, c, entry.ability) > 0;
+        case AbilityKind::PlanetChangeAtmosphere: return c.totalPopulation() <= 0 || atmosphereSuits(p.st, c);
+        default: break;
+    }
+    const EconomyReport& eco = p.emp().economy;
+    if (researchAbility(kind) && (allResearchDone(p.r, p.st, p.emp()) || eco.research >= p.prof.settings.maxResearchPoints)) return true;
+    if (intelAbility(kind) && (!p.st.options.allowIntel || eco.intelligence >= p.prof.settings.maxIntelligencePoints)) return true;
+    // One per system: the empire's colonies there count with what they have built or queued.
+    if (onePerSystem(kind) && systemHas(p, sys, entry.ability)) return true;
+    if (p.st.options.finiteResources)
+        if (const int res = extractedResource(kind); res >= 0 && p.st.galaxy.object(c.planet).value[static_cast<size_t>(res)] == 0) return true;
+    return false;
+}
+
+// A colony without a type (spec 05 §7.5 "Later"): Homeworld in the home
+// system, else the strictly highest resource value; nothing on a tie.
+std::string laterType(const Planner& p, const Colony& c) {
+    const SpaceObject& planet = p.st.galaxy.object(c.planet);
+    if (planet.system == p.sit.home) return std::string(displayName(ColonyType::Homeworld));
+    const auto& v = planet.value;
+    if (v[0] > v[1] && v[0] > v[2]) return std::string(displayName(ColonyType::Mining));
+    if (v[1] > v[0] && v[1] > v[2]) return std::string(displayName(ColonyType::Farming));
+    if (v[2] > v[0] && v[2] > v[1]) return std::string(displayName(ColonyType::Refining));
+    return {};
+}
+
+Resources queueItemCost(const Planner& p, const cmd::QueueTarget& t, const QueueItem& item) { return economy::itemCost(p.r, p.st, p.id, t, item); }
+
+// Every fifth turn (spec 05 §7.5, confirmed: binary): obsolete facilities
+// are upgraded to the newest researched version, planet by planet in queue
+// order, while what was queued so far is at most half of one turn's net
+// income in all three resources, checked before each planet (so a zero
+// budget still upgrades the first planet). A planet's queue need not be
+// empty, and every queued facility of an older version switches to the
+// newest one in place, keeping its count and what was paid into it
+// (cmd::QueueReplaceFacility, spec 02 §6.6).
+void planUpgrades(Planner& p, const std::vector<ObjectId>& planets) {
+    // The net income the start-of-turn step worked out (spec 05 §7.5 *Net income*).
+    const Resources net = p.startOfTurnNet ? *p.startOfTurnNet : p.netIncome();
+    const Resources half{net.v[0] / 2, net.v[1] / 2, net.v[2] / 2};  // division toward zero
+    Resources queued;
+    for (ObjectId planet : planets) {
+        if (queued[Resource::Minerals] > half[Resource::Minerals] || queued[Resource::Organics] > half[Resource::Organics] ||
+            queued[Resource::Radioactives] > half[Resource::Radioactives])
+            break;
+        const Colony* c = p.st.colony(planet);
+        if (!c) continue;
+        const cmd::QueueTarget target{planet, {}};
+        // Queued facilities of an older version switch to the newest one in place.
+        for (size_t i = 0; i < c->queue.items.size(); ++i) {
+            const QueueItem& item = c->queue.items[i];
+            if (item.kind != QueueItem::Kind::Facility || p.r.facility(item.facility).family == 0) continue;
+            const auto latest = p.r.latestFacilityOfFamily(p.emp(), p.r.facility(item.facility).family);
+            if (!latest || *latest == item.facility || p.r.facility(*latest).romanNumeral <= p.r.facility(item.facility).romanNumeral) continue;
+            p.emit(cmd::QueueReplaceFacility{target, static_cast<uint32_t>(i), *latest});
+            c = p.st.colony(planet);
+        }
+        c = p.st.colony(planet);
+        std::vector<int> families;
+        for (uint32_t f : c->facilities) {
+            const int family = p.r.facility(f).family;
+            if (family == 0 || std::find(families.begin(), families.end(), family) != families.end()) continue;
+            const auto latest = p.r.latestFacilityOfFamily(p.emp(), family);
+            if (!latest || p.r.facility(*latest).romanNumeral <= p.r.facility(f).romanNumeral) continue;
+            bool pending = false;
+            for (const QueueItem& q : c->queue.items)
+                pending = pending || (q.kind == QueueItem::Kind::Upgrade && p.r.facility(q.facility).family == family);
+            if (pending) continue;
+            families.push_back(family);
+            const QueueItem item = economy::upgradeItem(p.r, *c, *latest);  // to the newest level (spec 02 §6.6)
+            const Resources cost = queueItemCost(p, target, item);
+            if (p.emit(cmd::QueueAdd{target, item, -1})) queued += cost;
+            c = p.st.colony(planet);
+        }
+    }
+}
+
+// ---- Vehicles -------------------------------------------------------------------------------
+
+bool colonyShipType(std::string_view t) { return t.starts_with("Colony"); }
+
+bool positive(const Resources& b) { return b[Resource::Minerals] > 0 && b[Resource::Organics] > 0 && b[Resource::Radioactives] > 0; }
+
+// A queue's backlog in turns (spec 05 §7.5, confirmed: binary): the sum over
+// its items of each item's turns, the largest over the resources the queue
+// has a positive rate for of what the item still costs ÷ that rate, rounded
+// up. The first item counts only what is still unpaid. A queue whose rates
+// are all 0 counts 9,999.
+int64_t backlogTurns(const Planner& p, const cmd::QueueTarget& target, const ConstructionQueue& q, const Resources& rate) {
+    if (rate[Resource::Minerals] <= 0 && rate[Resource::Organics] <= 0 && rate[Resource::Radioactives] <= 0) return 9999;
+    int64_t total = 0;
+    for (size_t i = 0; i < q.items.size(); ++i) {
+        const QueueItem& item = q.items[i];
+        Resources left = economy::itemCost(p.r, p.st, p.id, target, item);
+        if (i == 0) left = max(left - item.spent, Resources{});
+        int64_t turns = 0;
+        for (Resource k : kResources)
+            if (rate[k] > 0 && left[k] > 0) turns = std::max(turns, (left[k] + rate[k] - 1) / rate[k]);
+        total += turns;
+    }
+    return total;
+}
+
+// Units come in batches of as many as the queue finishes in one turn, at
+// least one; recon satellites one at a time (spec 05 §7.5).
+int batchSize(const DesignInfo& di, const Resources& rate) {
+    if (keysEqual(di.aiType, "Recon Satellite")) return 1;
+    int64_t n = INT64_MAX;
+    for (Resource k : kResources)
+        if (di.stats.cost[k] > 0) n = std::min(n, rate[k] / di.stats.cost[k]);
+    return static_cast<int>(std::clamp<int64_t>(n == INT64_MAX ? 1 : n, 1, 1'000'000));
+}
+
+class ShipBuilder {
+public:
+    explicit ShipBuilder(Planner& p) : p_(p) {}
+
+    void run() {
+        const VehicleQueue* table = p_.prof.vehicleQueue(p_.state);
+        takeCounts();  // before the clean-up (confirmed: binary)
+        cleanUp();
+        // One turn of net income less the unit reserve (the reserve quirk, unitReserve()).
+        budget_ = p_.netIncome().percent(100 - std::clamp<int64_t>(unitReserve(), 0, 100));
+        if (table) vehicles(*table);
+        units();
+    }
+
+private:
+    Planner& p_;
+    Resources budget_;
+    // Own vehicles with a working space yard under this minister, found once
+    // per turn: queueing ships changes neither (place() asks for every item).
+    std::optional<std::vector<VehicleId>> yardShips_;
+    // Whether a design may be queued at a target. Nothing the builder does
+    // changes the answer during its turn (queueing builds no ship yet).
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t,int>, bool> queueable_;
+    std::map<uint32_t, int64_t> production_;
+
+    // The queue's own refusals (spec 02 §6.5). Nothing looks at the ship
+    // limit: at the limit the computer player keeps queueing ships and bases,
+    // which wait in the queues (spec 05 §7.5, question 81, confirmed: binary).
+    bool queueable(DesignId design, const cmd::QueueTarget& target) {
+        const auto key = std::tuple(design.value, target.planet.value, target.vehicle.value,target.yard);
+        if (auto it = queueable_.find(key); it != queueable_.end()) return it->second;
+        QueueItem probe;
+        probe.kind = QueueItem::Kind::Vehicle;
+        probe.design = design;
+        return queueable_[key] = queueItemProblem(p_.r, p_.st, p_.id, target, probe).empty();
+    }
+
+    // A unit row's design is under-supplied only when some queue owner of the
+    // empire has a working space yard (workingYard) with free cargo space of
+    // at least the design's tonnage; for satellites, troops, drones and
+    // weapon platforms that owner must be a colony (spec 05 §7.5 step 1,
+    // confirmed: binary). Placement then follows its own rules, on any
+    // colony's queue.
+    bool yardRoomFor(DesignId design) {
+        using ruleset::VehicleType;
+        const VehicleType type = p_.info(design).stats.vehicleType;
+        const bool colonyOnly = type == VehicleType::Satellite || type == VehicleType::Troop || type == VehicleType::Drone ||
+                                type == VehicleType::WeaponPlatform;
+        const int64_t tonnage = designTonnage(p_.r, p_.st.design(design));
+        for (const cmd::QueueTarget& t : queueList(p_)) {
+            if (!workingYard(p_, t)) continue;
+            int64_t free = 0;
+            if (t.vehicle.valid()) {
+                if (colonyOnly) continue;
+                const Vehicle& v = *p_.st.vehicle(t.vehicle);
+                free = vehicleCargoCapacity(p_.r, p_.st, v) - cargoSpaceUsed(p_.r, p_.st, v.cargo);
+            } else {
+                const Colony& c = *p_.st.colony(t.planet);
+                free = colonyCargoCapacity(p_.r, p_.st, c) - cargoSpaceUsed(p_.r, p_.st, c.cargo);
+            }
+            if (free >= tonnage) return true;
+        }
+        return false;
+    }
+
+    const std::vector<VehicleId>& yardShips() {
+        if (!yardShips_) {
+            yardShips_.emplace();
+            for (const Vehicle& v : p_.st.vehicles)
+                if (p_.controlsVehicle(v, Minister::ShipConstruction) && vehicleHasSpaceYard(p_.r, p_.st, v)) yardShips_->push_back(v.id);
+        }
+        return *yardShips_;
+    }
+
+    // The reserve quirk (spec 05 §7.5 "Units file", confirmed: binary): what
+    // the turn hands over, the value left by the nearest empire before this
+    // one whose units step ran (ai::unitReserveLeft).
+    int64_t unitReserve() const { return p_.unitReserve; }
+
+    // The design an entry builds (spec 05 §7.5, confirmed: binary): first the
+    // AI's own buildable design made from the AI_DesignCreation template of
+    // that name (ignoring case), newest first; only then does a design-type
+    // entry take the newest buildable design of the type, hand-made ones
+    // included, and a Colonizer entry the colony ship of the first uncovered
+    // target. Any other text builds nothing. Neither lookup reads the obsolete mark.
+    std::optional<DesignId> designFor(const VehicleEntry& entry) {
+        if (auto d = p_.newestFromTemplate(entry.type)) return d;
+        if (isAiDesignType(entry.type)) return p_.newestDesign(entry.type, true);
+        if (keysEqual(entry.type, "Colonizer")) return colonizerDesign();
+        return std::nullopt;
+    }
+
+    // The vehicle list of the AI state (spec 05 §7.5).
+    void vehicles(const VehicleQueue& table) {
+        const bool soft = p_.overCap(0), hard = p_.overCap(20);
+        const int64_t colonies = p_.colonyCount();
+        int placed = 0;
+        size_t i = 0;
+        // The first row of the turn whose item found no queue (confirmed:
+        // binary): never forgotten; when that same row fails again, after a
+        // placement has restarted the scan, the whole list stops for the turn.
+        std::optional<size_t> firstBlocked;
+        while (i < table.entries.size() && placed < 1000 && positive(budget_)) {
+            const VehicleEntry& entry = table.entries[i];
+            const std::optional<DesignId> design = designFor(entry);
+            if (!design) {
+                ++i;
+                continue;
+            }
+            // The count and the maintenance-cap gate use the chosen design's own type.
+            const std::string type = p_.info(*design).aiType;
+            const bool open = type == "Open Warp Point";
+            const bool colonyShip = colonyShipType(type);
+            if ((hard && !open) || (soft && !open && !colonyShip)) {
+                ++i;
+                continue;
+            }
+            // In the same gate, a neutral empire's colony-ship rows qualify only
+            // while the colonization targets this step reads hold an entry,
+            // settleable or not (confirmed: binary, question 64).
+            if (colonyShip && p_.neutral && p_.sit.colonyTargets.empty()) {
+                ++i;
+                continue;
+            }
+            const int64_t count = have(type, colonyShip);
+            bool under = count < entry.mustHave || (entry.planetsPerItem > 0 && count * entry.planetsPerItem < colonies * 10);
+            if (under && isUnitType(p_.info(*design).stats.vehicleType)) under = yardRoomFor(*design);
+            if (!under) {
+                ++i;
+                continue;
+            }
+            if (place(*design)) {
+                ++placed;
+                i = 0;  // restart the scan from the top
+                continue;
+            }
+            if (firstBlocked == i) break;
+            if (!firstBlocked) firstBlocked = i;
+            ++i;  // after a failure the scan goes on below
+        }
+    }
+
+    // `_AI_Construction_Units` (spec 05 §7.5 "Units file", confirmed: binary):
+    // after the vehicle list, from a fresh budget of one full turn of net
+    // income, colony by colony in queue order. A colony qualifies when its
+    // queue is empty, it has no free facility slot and all three resources
+    // of the budget are above 0. Its row is the last record whose Colony
+    // Type text contains the colony's type name (ignoring case); a colony
+    // without a type gets nothing. The first entry that names an AI design
+    // type exactly, whose units in the colony's cargo take less than its
+    // Maximum in kT, whose type has a newest valid design and whose design
+    // tonnage is below the free cargo space, gets one batch.
+    // The colonies are visited in the empire's queue-list order (queueList:
+    // system by system, then the system's object order). A units file that
+    // reported a loading error is not used for this step (its reserve still
+    // holds, unitReserveLeft; confirmed: binary).
+    void units() {
+        if (p_.prof.units.empty() || p_.prof.unitsErrors) return;
+        Resources budget = p_.netIncome();
+        std::vector<ObjectId> planets;
+        for (const cmd::QueueTarget& t : queueList(p_))
+            if (const Colony* c = t.planet.valid() ? p_.st.colony(t.planet) : nullptr; c && p_.controlsColony(*c, Minister::ShipConstruction))
+                planets.push_back(c->planet);
+        for (ObjectId planet : planets) {
+            if (!positive(budget)) return;
+            const Colony& c = *p_.st.colony(planet);
+            if (!c.queue.items.empty() || static_cast<int>(c.facilities.size()) < facilitySlots(p_.r, p_.st, c) || c.colonyType.empty()) continue;
+            const UnitQueue* row = p_.prof.unitQueue(c.colonyType);
+            if (!row) continue;
+            const cmd::QueueTarget target{planet, {}};
+            const Resources rate = economy::constructionRate(p_.r, p_.st, p_.id, target);
+            const int64_t free = colonyCargoCapacity(p_.r, p_.st, c) - cargoSpaceUsed(p_.r, p_.st, c.cargo);
+            for (const UnitEntry& entry : row->entries) {
+                const bool named = std::any_of(aiDesignTypes().begin(), aiDesignTypes().end(), [&](std::string_view t) { return t == entry.type; });
+                if (!named) continue;
+                int64_t heldKt = 0;
+                for (const UnitStack& u : c.cargo.units)
+                    if (u.count > 0 && p_.info(u.design).aiType == entry.type)
+                        heldKt += int64_t{u.count} * designTonnage(p_.r, p_.st.design(u.design));
+                if (heldKt >= entry.maxKt) continue;
+                const std::optional<DesignId> design = p_.newestDesign(entry.type);
+                if (!design || designTonnage(p_.r, p_.st.design(*design)) >= free) continue;
+                QueueItem item;
+                item.kind = QueueItem::Kind::Vehicle;
+                item.design = *design;
+                item.count = batchSize(p_.info(*design), rate);
+                if (!queueItemProblem(p_.r, p_.st, p_.id, target, item).empty()) continue;
+                const Resources cost = economy::itemCost(p_.r, p_.st, p_.id, target, item);
+                if (!p_.emit(cmd::QueueAdd{target, item, -1})) continue;
+                budget -= min(cost, rate);
+                break;  // at most one item per colony
+            }
+        }
+    }
+
+    std::vector<std::pair<cmd::QueueTarget, const ConstructionQueue*>> queues() const {
+        std::vector<std::pair<cmd::QueueTarget, const ConstructionQueue*>> out;
+        for (const auto& c : p_.st.colonies)
+            if (c && c->owner == p_.id) {out.push_back({{c->planet, {}}, &c->queue});if(p_.st.options.splitConstruction)for(size_t i=0;i<c->yardQueues.size();++i)if(!c->yardsCombined||i==0)out.push_back({{c->planet,{},static_cast<int>(i)},&c->yardQueues[i]});}
+        for (const Vehicle& v : p_.st.vehicles)
+            if (v.owner == p_.id && !v.queue.items.empty()) out.push_back({{{}, v.id}, &v.queue});
+        return out;
+    }
+
+    // The vehicle table's counts (spec 05 §7.5, confirmed: binary): per AI
+    // design type, the existing vehicles (units one by one) plus the items in
+    // all queues, taken once before the clean-up and grown only by what the
+    // loop places (count()), so an item the clean-up removes this turn still
+    // counts for its type until the next turn.
+    std::map<std::string, int64_t> counts_;
+    // The queued colony ships of each colony-ship type that the Colonizer
+    // rows use, taken with the counts and grown by one per placement
+    // (confirmed: binary): an item counts once, whatever it builds.
+    std::map<std::string, int64_t> queuedColonyShips_;
+
+    void takeCounts() {
+        counts_.clear();
+        queuedColonyShips_.clear();
+        auto add = [&](DesignId d, int64_t n) {
+            if (d.valid() && d.index() < p_.st.designs.size()) counts_[p_.info(d).aiType] += n;
+        };
+        for (const Vehicle& v : p_.st.vehicles) {
+            if (v.owner != p_.id) continue;
+            if (v.mixed.empty()) {
+                add(v.design, std::max(1, v.count));
+            } else {
+                for (const UnitStack& u : v.mixed) add(u.design, u.count);
+            }
+            for (const UnitStack& u : v.cargo.units) add(u.design, u.count);
+        }
+        for (const auto& c : p_.st.colonies)
+            if (c && c->owner == p_.id)
+                for (const UnitStack& u : c->cargo.units) add(u.design, u.count);
+        for (const auto& [target, q] : queues())
+            for (const QueueItem& item : q->items)
+                if (item.kind == QueueItem::Kind::Vehicle) {
+                    add(item.design, std::max(1, item.count));
+                    if (item.design.valid() && item.design.index() < p_.st.designs.size() && p_.info(item.design).role == Role::Colonizer)
+                        ++queuedColonyShips_[p_.info(item.design).aiType];
+                }
+    }
+
+    // An item the loop placed: its batch to its type's count, one to the
+    // queued colony ships when it is one.
+    void count(DesignId design, int64_t n) {
+        counts_[p_.info(design).aiType] += n;
+        if (p_.info(design).role == Role::Colonizer) ++queuedColonyShips_[p_.info(design).aiType];
+    }
+
+    // The count of a type; the three colony-ship types share one count.
+    int64_t have(std::string_view type, bool colonyShips) const {
+        int64_t n = 0;
+        for (const auto& [t, c] : counts_)
+            if (colonyShips ? colonyShipType(t) : t == type) n += c;
+        return n;
+    }
+
+    // The colony-ship type of the first target no queued colony ship covers;
+    // the race's own surface when all are covered; nothing without a target.
+    std::optional<DesignId> colonizerDesign() {
+        std::map<std::string, int64_t> queued = queuedColonyShips_;
+        bool any = false;
+        for (const ColonyTarget& t : p_.sit.colonyTargets) {
+            if (!t.settleable) continue;
+            any = true;
+            const std::string type = colonyTypeName(p_.st.galaxy.object(t.planet).surface);
+            if (queued[type] > 0) {
+                --queued[type];
+                continue;
+            }
+            return p_.newestDesign(type, true);
+        }
+        if (!any) return std::nullopt;
+        return p_.newestDesign(colonyTypeName(p_.emp().race.nativeSurface), true);
+    }
+
+    // Spec 05 §7.5 "Placement" (confirmed: binary): one queue is chosen, and
+    // the item is placed there or nowhere, only while that queue's backlog
+    // is under 5 turns.
+    bool place(DesignId design) {
+        const DesignInfo& di = p_.info(design);
+        if (di.aiType == "Defense Base") return placeDefenseBase(design);
+        const bool unit = isUnitType(di.stats.vehicleType);
+        const bool held = heldUnit(di.stats.vehicleType);
+        struct Option {
+            cmd::QueueTarget target;
+            Resources rate;
+            int64_t backlog = 0;
+            int64_t freeCargo = 0;  // the mines, satellites, weapon platforms and fighters only
+            int64_t heldOfKind = 0;  // every unit in the colony's cargo
+            int size = 0;
+            int64_t production = 0;
+        };
+        std::vector<Option> options;
+        auto consider = [&](const cmd::QueueTarget& target, const ConstructionQueue& q) {
+            if (!queueable(design, target)) return;
+            const Resources rate = economy::constructionRate(p_.r, p_.st, p_.id, target);
+            Option o{target, rate, backlogTurns(p_, target, q, rate)};
+            if (held) {
+                const Colony& c = *p_.st.colony(target.planet);
+                o.freeCargo = colonyCargoCapacity(p_.r, p_.st, c) - cargoSpaceUsed(p_.r, p_.st, c.cargo);
+                // Units "of that kind" are in fact every unit in the colony's
+                // cargo, whatever its kind (confirmed: binary, spec 05 Q60).
+                for (const UnitStack& u : c.cargo.units) o.heldOfKind += std::max(0, u.count);
+                o.size = planetRank(p_.r, p_.st.galaxy.object(c.planet));
+                o.production = production(c);
+            }
+            options.push_back(o);
+        };
+        // Ships and bases need a space yard; units can use any colony's queue.
+        for (const auto& c : p_.st.colonies)
+            if (c && p_.controlsColony(*c, Minister::ShipConstruction) && (unit || colonyHasSpaceYard(p_.r, *c))) {if(p_.st.options.splitConstruction&&!unit){for(size_t i=0;i<c->yardQueues.size();++i)if(!c->yardsCombined||i==0)consider({c->planet,{},static_cast<int>(i)},c->yardQueues[i]);}else consider({c->planet, {}}, c->queue);}
+        if (!unit)
+            for (VehicleId id : yardShips())
+                if (const Vehicle* v = p_.st.vehicle(id)) consider({{}, id}, v->queue);
+        if (options.empty()) return false;
+        // The first queue in order (total orders: yard ships tie on everything but their id).
+        const Option& o = *std::min_element(options.begin(), options.end(), [&](const Option& a, const Option& b) {
+            if (held)
+                return std::tuple(a.backlog, -a.freeCargo, a.heldOfKind, -a.size, -a.production, -a.rate.total(), a.target.planet) <
+                       std::tuple(b.backlog, -b.freeCargo, b.heldOfKind, -b.size, -b.production, -b.rate.total(), b.target.planet);
+            return std::tuple(a.backlog, -a.rate.total(), a.target.planet, a.target.vehicle) <
+                   std::tuple(b.backlog, -b.rate.total(), b.target.planet, b.target.vehicle);
+        });
+        if (o.backlog >= 5) return false;
+        QueueItem item;
+        item.kind = QueueItem::Kind::Vehicle;
+        item.design = design;
+        if (unit) item.count = batchSize(di, o.rate);
+        // Without the cargo space for the batch, nothing is placed.
+        if (held && designTonnage(p_.r, p_.st.design(design)) * item.count > o.freeCargo) return false;
+        const Resources cost = economy::itemCost(p_.r, p_.st, p_.id, o.target, item);
+        if (!p_.emit(cmd::QueueAdd{o.target, item, -1})) return false;
+        budget_ -= min(cost, o.rate);  // what the item takes from that queue this turn
+        count(design, std::max(1, item.count));
+        return true;
+    }
+
+    // Spec 05 §7.5 "Placement" (confirmed: binary): a Defense Base goes to
+    // the K-th queue of the empire's queue list, K being the number of its
+    // queues with a working space yard, while some yard colony counts at most
+    // two bases; otherwise to a queue of the list drawn at random. The
+    // backlog test is made on that queue alone. A colony queue without a space
+    // yard takes the base, which the empire's construction step then drops
+    // (spec 02 §6.1).
+    bool placeDefenseBase(DesignId design) {
+        const std::vector<cmd::QueueTarget> list = queueList(p_);
+        if (list.empty()) return false;
+        int64_t queuedBases = 0;  // an item counts as many bases as it builds (inferred, spec 05 Q60)
+        for (const cmd::QueueTarget& t : list)
+            if (const ConstructionQueue* q = queueOf(t))
+                for (const QueueItem& item : q->items)
+                    if (item.kind == QueueItem::Kind::Vehicle && p_.info(item.design).stats.vehicleType == ruleset::VehicleType::Base)
+                        queuedBases += std::max(1, item.count);
+        size_t k = 0;
+        bool roomy = false;
+        for (const cmd::QueueTarget& t : list) {
+            if (!workingYard(p_, t)) continue;
+            ++k;
+            if (t.planet.valid() && basesAt(locationOf(p_.st.galaxy, t.planet)) + queuedBases <= 2) roomy = true;
+        }
+        const cmd::QueueTarget target = roomy ? list[k - 1] : list[static_cast<size_t>(p_.rng.below(list.size()))];
+        const ConstructionQueue* q = queueOf(target);
+        if (!q) return false;
+        const Resources rate = economy::constructionRate(p_.r, p_.st, p_.id, target);
+        if (backlogTurns(p_, target, *q, rate) >= 5) return false;
+        QueueItem item;
+        item.kind = QueueItem::Kind::Vehicle;
+        item.design = design;
+        const Resources cost = economy::itemCost(p_.r, p_.st, p_.id, target, item);
+        if (!queueable(design, target) || !p_.emit(cmd::QueueAdd{target, item, -1})) return false;
+        budget_ -= min(cost, rate);
+        count(design, 1);
+        return true;
+    }
+
+    const ConstructionQueue* queueOf(const cmd::QueueTarget& t) const {
+        if (t.vehicle.valid()) {
+            const Vehicle* v = p_.st.vehicle(t.vehicle);
+            return v ? &v->queue : nullptr;
+        }
+        const Colony* c = p_.st.colony(t.planet);
+        return c ? (p_.st.options.splitConstruction&&t.yard>=0&&t.yard<static_cast<int>(c->yardQueues.size())?&c->yardQueues[t.yard]:&c->queue) : nullptr;
+    }
+
+    // The empire's bases in a sector.
+    int64_t basesAt(Location at) {
+        int64_t n = 0;
+        for (const Vehicle& v : p_.st.vehicles)
+            if (v.owner == p_.id && v.count > 0 && v.location == at && p_.info(v.design).stats.vehicleType == ruleset::VehicleType::Base) ++n;
+        return n;
+    }
+
+    // A colony's resource production (minerals, organics and radioactives),
+    // which queueing does not change.
+    int64_t production(const Colony& c) {
+        auto it = production_.find(c.planet.value);
+        if (it == production_.end()) it = production_.emplace(c.planet.value, economy::colonyOutput(p_.r, p_.st, c).production.total()).first;
+        return it->second;
+    }
+
+    // Mines, satellites, weapon platforms and fighters: the units whose
+    // queue choice looks at the colonies' cargo.
+    static bool heldUnit(ruleset::VehicleType t) {
+        using ruleset::VehicleType;
+        return t == VehicleType::Mine || t == VehicleType::Satellite || t == VehicleType::WeaponPlatform || t == VehicleType::Fighter;
+    }
+
+    // Obsolete designs leave the queues (except a first item already paid
+    // into), and units too large for the planet's free cargo space.
+    void cleanUp() {
+        for (const auto& c : p_.st.colonies) {
+            if (!c || !p_.controlsColony(*c, Minister::ShipConstruction)) continue;
+            clean({c->planet, {}});
+        }
+        for (const Vehicle& v : p_.st.vehicles)
+            if (p_.controlsVehicle(v, Minister::ShipConstruction) && !v.queue.items.empty()) clean({{}, v.id});
+    }
+    void clean(const cmd::QueueTarget& target) {
+        auto queue = [&]() -> const ConstructionQueue* {
+            if (target.vehicle.valid()) {
+                const Vehicle* v = p_.st.vehicle(target.vehicle);
+                return v ? &v->queue : nullptr;
+            }
+            const Colony* c = p_.st.colony(target.planet);
+            return c ? (p_.st.options.splitConstruction&&target.yard>=0&&target.yard<static_cast<int>(c->yardQueues.size())?&c->yardQueues[target.yard]:&c->queue) : nullptr;
+        };
+        const ConstructionQueue* q = queue();
+        if (!q) return;
+        for (size_t i = q->items.size(); i-- > 0;) {
+            q = queue();
+            if (!q || i >= q->items.size()) continue;
+            const QueueItem& item = q->items[i];
+            if (item.kind != QueueItem::Kind::Vehicle) continue;
+            bool drop = p_.st.design(item.design).obsolete && !(i == 0 && !item.spent.isZero());
+            if (!drop && target.planet.valid() && isUnitType(p_.info(item.design).stats.vehicleType)) {
+                const Colony* c = p_.st.colony(target.planet);
+                const int64_t room = colonyCargoCapacity(p_.r, p_.st, *c) - cargoSpaceUsed(p_.r, p_.st, c->cargo);
+                drop = int64_t{p_.r.hull(p_.st.design(item.design).hull).tonnage} * std::max(1, item.count) > room;
+            }
+            if (drop) p_.emit(cmd::QueueRemove{target, static_cast<uint32_t>(i)});
+        }
+    }
+};
+
+} // namespace
+
+namespace {
+
+bool carriesYard(const Planner& p, const Vehicle& v) {
+    for (const DesignEntry& en : p.st.design(v.design).entries)
+        if (hasAbility(p.r.componentAbilities(en.component), AbilityKind::SpaceYard)) return true;
+    return false;
+}
+
+} // namespace
+
+std::vector<cmd::QueueTarget> queueList(const Planner& p) {
+    std::vector<std::tuple<uint32_t, int, uint64_t, cmd::QueueTarget>> keyed;
+    for (const auto& c : p.st.colonies)
+        if (c && c->owner == p.id)
+            keyed.emplace_back(p.st.galaxy.object(c->planet).system.value, 0, objectOrderKey(p.st, c->planet), cmd::QueueTarget{c->planet, {},p.st.options.splitConstruction&&colonyHasSpaceYard(p.r,*c)?0:-1});
+    for (const Vehicle& v : p.st.vehicles)
+        if (v.owner == p.id && v.count > 0 && carriesYard(p, v)) keyed.emplace_back(v.location.system.value, 1, v.arrival, cmd::QueueTarget{{}, v.id});
+    std::stable_sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) {
+        return std::tuple(std::get<0>(a), std::get<1>(a), std::get<2>(a)) < std::tuple(std::get<0>(b), std::get<1>(b), std::get<2>(b));
+    });
+    std::vector<cmd::QueueTarget> out;
+    for (const auto& k : keyed) out.push_back(std::get<3>(k));
+    return out;
+}
+
+bool workingYard(const Planner& p, const cmd::QueueTarget& t) {
+    if (t.vehicle.valid()) {
+        const Vehicle* v = p.st.vehicle(t.vehicle);
+        return v && v->status != VehicleStatus::Cloaked && vehicleHasSpaceYard(p.r, p.st, *v);
+    }
+    const Colony* c = p.st.colony(t.planet);
+    return c && colonyHasWorkingYard(p.r, *c);
+}
+
+void planFacilities(Planner& p, bool firstPass) {
+    economy::prepareConstruction(p.r,p.st);
+    std::vector<ObjectId> planets;
+    for (const auto& c : p.st.colonies)
+        if (c && p.controlsColony(*c, Minister::FacilityConstruction)) planets.push_back(c->planet);
+    // The upgrades of every fifth turn come first (confirmed: binary): a
+    // planet that receives one no longer has an empty queue and gets no new
+    // facility in this pass.
+    if (!firstPass && p.date % 5 == 0) planUpgrades(p, planets);
+    for (ObjectId planet : planets) {
+        const Colony* c = p.st.colony(planet);
+        if (!c || !c->queue.items.empty() || static_cast<int>(c->facilities.size()) >= facilitySlots(p.r, p.st, *c)) continue;
+        if (c->colonyType.empty())
+            if (std::string type = laterType(p, *c); !type.empty()) p.emit(cmd::SetColonyType{planet, std::move(type)});
+        c = p.st.colony(planet);
+        const ColonyType type = parseColonyType(c->colonyType);
+        const std::string_view queueType = type == ColonyType::Count ? displayName(ColonyType::Homeworld) : displayName(type);
+        const FacilityQueue* row = p.prof.facilityQueue(p.state, queueType);
+        if (!row) continue;
+        for (const FacilityEntry& entry : row->entries) {
+            const auto facility = bestFacilityFor(p.r, p.emp(), entry.ability);
+            if (!facility || blocked(p, *p.st.colony(planet), entry)) continue;
+            QueueItem item;
+            item.kind = QueueItem::Kind::Facility;
+            item.facility = *facility;
+            // The queue must accept it (its slots, one space yard, research; spec
+            // 02 §6.5). A colony without population takes it too and builds it
+            // once it has people.
+            if (!queueItemProblem(p.r, p.st, p.id, {planet, {}}, item).empty()) continue;
+            if (p.emit(cmd::QueueAdd{{planet, {}}, item, -1})) break;
+        }
+    }
+}
+
+void planShips(Planner& p) { ShipBuilder(p).run(); }
+
+} // namespace detail
+
+} // namespace opense4::game::ai

@@ -1,0 +1,149 @@
+#pragma once
+
+// Sight, cloaking and empire knowledge (docs/spec/01 §6, confirmed: binary).
+//
+// Sight is resolved per system. An empire's sensor vector in a system is the
+// per-type maximum over its sensor sources there (ships and bases, fighter,
+// satellite and drone groups, owned planets, populated or not; never mine
+// fields), each with the baseline EM Active 1, raised to its partners' vectors. Sharing is one-way:
+// an empire gets the sensors of every empire it holds a Partnership with, and
+// this is repeated five times so chains pass sight along. An object the empire
+// does not own is seen when the system is explored and some sight type's
+// sensor level reaches the object's obscuration. Partners' objects get no
+// exception.
+
+#include "game/rules.hpp"
+#include "game/state.hpp"
+
+#include <array>
+#include <string>
+#include <vector>
+
+namespace opense4::game::sight {
+
+using SightVector = std::array<int, kSightTypes>;
+
+// Recomputes Knowledge::present / visibleVehicles / explored / lastSeen for
+// every empire.
+// A system is explored by the empire's own sensor sources; partners' maps are
+// shared by diplomacy. Omnipresence and the Galaxy Seen trait reveal every
+// system and link.
+void updateKnowledge(const Rules& r, GameState& s);
+
+// Live checks (they reflect the current positions, also mid-turn).
+bool canSeeVehicle(const Rules& r, const GameState& s, EmpireId viewer, const Vehicle& v);
+// "Seeing the planet" (spec 01 §6.9 "What other players see", confirmed:
+// binary): whether the viewer's windows show a stellar object of an explored
+// system at all (the system panel, the sector click, the Planets window).
+// Its owner always sees an own colony's planet; anyone else when, in some
+// sight type, the planet's obscuration (planetObscuration: a cloaked
+// colony's cloak levels, raised by storms and nebulae) is no more than the
+// viewer's sensor level in the system, EM Active counted as at least 1. No
+// sensor source is needed, so only a storm, a nebula or a colony's cloak
+// hides a planet. Stars, storms and warp points are never hidden. The
+// windows also show only explored systems, which this test keeps.
+bool canSeePlanet(const Rules& r, const GameState& s, EmpireId viewer, ObjectId planet);
+// A colony as the movement rules see it (bad squares, the Attack Sector
+// question, the Ship Orders options, Sentry, stellar manipulation; spec 03
+// §6.2, §6.4, §8, §19 Q70, confirmed: binary): the detection rule of spec 01
+// §6.3 applied to its planet, the same test as for a ship. Its owner always
+// sees it; another empire only when it has explored the system and its
+// sensor level there (its own sources, its partners', omnipresence) reaches
+// the planet's obscuration in some sight type. Without sensors in the system
+// no foreign colony is seen, cloaked or not, even where the planet is
+// (canSeePlanet). Every window that asks whether a colony is seen uses this
+// test: the map's colony mark, the planet report, the Planets window, the
+// galaxy map's presence colours and the intelligence picker (spec 01 §6.9).
+// The Colonize order's "seen" test is this rule applied to the planet
+// whether or not it has a colony (spec 03 §8, §19 Q80): a planet without a
+// colony has the obscuration of its sector and system, at least 1.
+bool canSeeColony(const Rules& r, const GameState& s, EmpireId viewer, ObjectId planet);
+// True when the viewer has a sensor source in the system (its own or a
+// partner's whose sensors it gets), or the game is omnipresent.
+bool hasPresence(const Rules& r, const GameState& s, EmpireId viewer, SystemId sys);
+
+// The viewer plus every empire whose sensors reach it through Partnerships
+// (the viewer's own Partnership, and chains of them), sorted.
+std::vector<EmpireId> sightGroup(const GameState& s, EmpireId viewer);
+// The viewer's sensor levels in a system (all zero without a sensor source).
+SightVector sensorLevels(const Rules& r, const GameState& s, EmpireId viewer, SystemId sys);
+// Obscuration per sight type: baseline 1; cloak levels (a ship's only while it
+// is cloaked, a unit group's always); and the environment: the system-wide
+// value and the largest `Sector - Sight Obscuration` of the storms, planets
+// and asteroid fields (their own rolled abilities), ships and bases in its
+// sector. Unit groups, stars, warp points, comets and colony facilities never
+// obscure a sector.
+SightVector obscuration(const Rules& r, const GameState& s, const Vehicle& v);
+// Obscuration of a stellar body: storms and nebulae hide planets, asteroid
+// fields and comets, never stars, storms or warp points. A planet whose colony
+// is cloaked has the colony's cloak levels in place of 1, raised by the
+// sector's and the system's obscuration (spec 01 §6.9).
+SightVector planetObscuration(const Rules& r, const GameState& s, ObjectId planet);
+constexpr bool detects(const SightVector& sensors, const SightVector& obsc) {
+    for (size_t t = 0; t < kSightTypes; ++t)
+        if (sensors[t] > 0 && sensors[t] >= obsc[t]) return true;
+    return false;
+}
+// Ships, bases, fighter, satellite and drone groups give sensors and presence;
+// mine fields (and troops) do not.
+bool isSensorSource(ruleset::VehicleType t);
+
+// ---- Colony cloaking (spec 01 §6.9, confirmed: binary) -------------------------------------------
+
+// Refreshes the colony's stored cloak and sensor levels from its facilities
+// alone (the planet's own abilities, population, facility damage and racial
+// traits play no part): per sight type the largest `Cloak Level`, at least 1,
+// and the largest `Sensor Level`, EM Active at least 1. A cloaked colony that
+// can no longer cloak is decloaked, without a message. Called only at the
+// moments spec 01 §6.9 names: a facility completed there (not an upgrade),
+// Scrap Facilities, a battle that destroyed facilities, the founding of the
+// colony, the host's reading of a player's turn file that carries the colony,
+// and (every colony, recalculateColonies) every reading of a game file.
+// Returns true when it decloaked the colony: the caller then carries out the
+// rest of the Decloak order's step, sight and the first-contact check (spec
+// 01 §14 Q44, confirmed: binary; diplomacy::recalculateColony does both).
+bool recalculateColony(const Rules& r, Colony& c);
+// Every colony; true when any was decloaked.
+bool recalculateColonies(const Rules& r, GameState& s);
+// The colony can cloak: its stored cloak level is 2 or more in some sight
+// type. Cloaking needs no supply and costs nothing.
+bool colonyCanCloak(const Colony& c);
+
+// Long-range scanning (spec 01 §6.6, spec 03 §3.3, spec 05 §8 "Design
+// knowledge", confirmed: binary): the viewer sees the foreign vehicle, it
+// carries no Scanner Jammer, and some object of the viewer in its system (a
+// vehicle, or a colony through its facilities, population or not) either has
+// a Long Range Scanner whose largest value reaches it, or has Long Range
+// Scanner - System and the target is a ship or base (unit groups are not
+// covered by it).
+bool scannerReaches(const Rules& r, const GameState& s, EmpireId viewer, const Vehicle& target);
+// The viewer's long-range scanners would reach the vehicle but its Scanner
+// Jammer blocks them (spec 06 §1.4: its report says so).
+bool scannerBlocked(const Rules& r, const GameState& s, EmpireId viewer, const Vehicle& target);
+// The designs a vehicle's report dates (spec 05 §8 "Design knowledge", open
+// question 43, confirmed: binary): a ship's or base's own design, never the
+// units in its cargo; every design of a unit group, sorted.
+std::vector<DesignId> reportDesigns(const Rules& r, const GameState& s, const Vehicle& v);
+// A human player opens the report of a foreign vehicle its scanners reach:
+// the designs the report shows are dated as seen this turn, whatever tab
+// shows. Nothing is learned from scanners otherwise, and computer players
+// never learn this way. In a simultaneous game only ship and base reports
+// reach the host, so a unit group's report dates nothing (OpenSE4 skips it
+// on the player's machine too, where the original dates it until the turn
+// ends). True when a date changed (cmd::OpenVehicleReport).
+bool learnFromReport(const Rules& r, GameState& s, EmpireId viewer, VehicleId vehicle);
+
+// End-of-turn step 12 (spec 05 §8, confirmed: binary): the empire forgets the
+// foreign designs it last saw more than kDesignMemoryTurns turns ago.
+// Returns how many were forgotten.
+size_t forgetOldDesigns(GameState& s, EmpireId e);
+
+// Knowledge updates used by movement (arrival, warp transit).
+void markExplored(GameState& s, EmpireId e, SystemId sys);
+void learnWarpLink(GameState& s, EmpireId e, ObjectId warpPoint);
+bool knowsWarpLink(const GameState& s, EmpireId e, ObjectId warpPoint);
+// A warp point's name for a viewer: the word for warp point, followed by the
+// destination system's name once the viewer has explored it (spec 01 §5.4).
+std::string warpPointName(const GameState& s, EmpireId viewer, ObjectId warpPoint);
+
+} // namespace opense4::game::sight

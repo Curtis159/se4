@@ -1,0 +1,7 @@
+{
+  "totalBytes": 26336074,
+  "largestBytes": 2883845,
+  "files": 2062,
+  "indexBytes": 3453,
+  "engineCompression": "gzip chunks, browser DecompressionStream, SHA-256 verification"
+}

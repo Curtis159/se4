@@ -1,0 +1,670 @@
+#include "client/app.hpp"
+
+#include "assets/assets.hpp"
+
+#include "client/audio.hpp"
+
+#include "client/classic/classic_mode.hpp"
+#include "client/classic/command_line.hpp"
+#include "client/classic/ui.hpp"
+#include "client/script/items.hpp"
+#include "client/script/sdl_input.hpp"
+#include "client/ui/imgui_errors.hpp"
+#include "client/ui/theme.hpp"
+#include "client/window_hit.hpp"
+#include "core/log.hpp"
+#include "mods/mod_set.hpp"
+#include "net/secure.hpp"
+#include "ruleset/ruleset.hpp"
+#include "sdk/process.hpp"
+
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <SDL3/SDL.h>
+
+#include <algorithm>
+#include <cfloat>
+#include <cstdio>
+#include <format>
+
+// The SDL3 backend's key mapping (imgui_impl_sdl3.cpp), for the system's key repeats.
+ImGuiKey ImGui_ImplSDL3_KeyEventToImGuiKey(SDL_Keycode keycode, SDL_Scancode scancode);
+
+namespace opense4::client {
+
+namespace {
+
+std::filesystem::path findDir(const std::string& override, const char* name, const char* marker) {
+    namespace fs = std::filesystem;
+    if (!override.empty()) return override;
+    std::vector<fs::path> candidates;
+    if (const char* base = SDL_GetBasePath()) {
+        const fs::path b(base);
+        candidates = {b / name, b / ".." / name, b / ".." / ".." / name, b / ".." / ".." / ".." / name};
+    }
+#ifdef OPENSE4_SOURCE_DIR
+    candidates.push_back(fs::path(OPENSE4_SOURCE_DIR) / name);
+#endif
+    for (const fs::path& c : candidates) {
+        std::error_code ec;
+        if (fs::exists(c / marker, ec)) return fs::weakly_canonical(c, ec);
+    }
+    // Not found: the fonts built into the executable are used instead
+    // (core/embedded.hpp), so a missing directory is not an error.
+    return candidates.empty() ? fs::path(name) : candidates.front();
+}
+
+void fatal(const std::string& message) {
+    log::error("{}", message);
+    // -nd: no box for the whole run (spec 05 §9.2).
+    if (!classic::noDialogs()) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenSE4", message.c_str(), nullptr);
+}
+
+// Neither renderer started: what the game needs, what to do about it, and why each
+// one failed. Older systems (Windows 7 among them) seldom have a Vulkan 1.3
+// driver, so there the OpenGL 3.3 of the graphics card maker's driver is what counts.
+std::string noRendererMessage(const std::string& vulkanError, const std::string& openglError) {
+    std::string text =
+        "OpenSE4 found no graphics driver to draw with. It needs Vulkan 1.3 or OpenGL 3.3.\n\n"
+        "Install the current driver for your graphics card from its maker (NVIDIA, AMD or Intel). "
+        "The basic display driver that comes with Windows has no OpenGL 3.3, and a Remote "
+        "Desktop session may have none either.\n";
+    if (!vulkanError.empty()) text += "\nVulkan: " + vulkanError;
+    text += "\nOpenGL: " + openglError;
+    return text;
+}
+
+// The system's question for a press in the window without its title bar
+// (client/window_hit.hpp): the answer from the areas the frame drawn last
+// published.
+SDL_HitTestResult SDLCALL windowHitTest(SDL_Window*, const SDL_Point* point, void*) {
+    switch (windowHitNow(static_cast<float>(point->x), static_cast<float>(point->y))) {
+        case WindowHit::Normal: return SDL_HITTEST_NORMAL;
+        case WindowHit::Drag: return SDL_HITTEST_DRAGGABLE;
+        case WindowHit::ResizeTopLeft: return SDL_HITTEST_RESIZE_TOPLEFT;
+        case WindowHit::ResizeTop: return SDL_HITTEST_RESIZE_TOP;
+        case WindowHit::ResizeTopRight: return SDL_HITTEST_RESIZE_TOPRIGHT;
+        case WindowHit::ResizeRight: return SDL_HITTEST_RESIZE_RIGHT;
+        case WindowHit::ResizeBottomRight: return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+        case WindowHit::ResizeBottom: return SDL_HITTEST_RESIZE_BOTTOM;
+        case WindowHit::ResizeBottomLeft: return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+        case WindowHit::ResizeLeft: return SDL_HITTEST_RESIZE_LEFT;
+    }
+    return SDL_HITTEST_NORMAL;
+}
+
+// The original's command line as the host (docs/spec/05 §9.2): the game
+// file's turn is processed from the players' orders files, saved, and the
+// program quits, with no window. A game file that is not found (or no name)
+// quits at once without a word, with exit code 0, and a wrong host password
+// with exit code 1 (the log and standard error say why); OpenSE4's other
+// refusals show a box unless -nd.
+int hostFromCommandLine(const AppOptions& options, const classic::CommandLineGame& line, const std::filesystem::path& dataDir) {
+    auto refuse = [&](const std::string& why, bool box) {
+        log::error("{}", why);
+        if (box && !options.noDialogs) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "OpenSE4", why.c_str(), nullptr);
+        return classic::kHostRefused;
+    };
+    const std::filesystem::path gameRoot = dataDir.parent_path();
+    const auto file = classic::findGameFile(line.gameFile, classic::gameFileFolders(line, gameRoot));
+    if (!file) {
+        log::error("The game file {} was not found: the program quits (spec 05 §9.2).", line.gameFile);
+        return classic::kGameFileNotFound;
+    }
+    log::info("Command line: hosting the turn of {}", file->string());
+    // The data set with the mods given (--mod, the command line's mod
+    // folder), else with the game's own, as `opense4-server pbem process`.
+    // A mod folder that does not exist changes nothing: the original then
+    // finds every file in the game's own folders.
+    std::vector<std::string> mods = options.mods;
+    bool modsGiven = options.modsGiven;
+    if (const auto folder = classic::commandLineModFolder(line.modFolder, gameRoot)) {
+        mods.push_back(folder->string());
+        modsGiven = true;
+    }
+    const std::filesystem::path userDir = userDataDirectory();
+    mods::ModFolders folders;
+    folders.user = options.modsDir.empty() ? mods::modsFolderIn(userDir) : std::filesystem::path(options.modsDir);
+    if (!options.noBundledMods) folders.bundled = mods::bundledModsFolder(sdk::executableDir());
+    mods::OpenOptions open;
+    open.cacheDir = mods::modCacheIn(userDir);
+    auto rules = classic::rulesForHosting(dataDir, *file, mods, modsGiven, folders, open);
+    if (!rules) return refuse(rules.error(), true);
+    // The host's key, the one the game's own host uses (host_key.txt in the user folder).
+    const std::filesystem::path keyFile = userDir / net::secure::kHostKeyFileName;
+    auto key = net::secure::loadOrCreateHostKey(keyFile);
+    if (!key) return refuse(key.error(), true);
+    if (!key->warning.empty()) log::warn("{}", key->warning);
+    log::info("Play-by-e-mail host key {} ({}): players see it when they open their turn files",
+              net::crypto::fingerprint(key->keys.pbem.signing.publicKey), keyFile.string());
+    const classic::HostOutcome outcome = classic::hostTurn(**rules, *file, line.password, options.pbemOrdersDir, key->keys.pbem);
+    if (outcome.exitCode != 0) {
+        refuse(outcome.error, !outcome.wrongPassword);
+        return outcome.exitCode;
+    }
+    // Saved without a notice, as the original; the report goes to standard output.
+    for (const std::string& l : outcome.report) std::printf("%s\n", l.c_str());
+    std::fflush(stdout);
+    log::info("Command line: the turn of {} is processed and the game saved{}", file->string(),
+              outcome.report.empty() ? std::string() : ": " + outcome.report.front());
+    return 0;
+}
+
+std::string videoDriver() {
+    const char* name = SDL_GetCurrentVideoDriver();
+    return name ? name : "?";
+}
+
+} // namespace
+
+int App::run(const AppOptions& options) {
+    options_ = options;
+    // The identifier is the Wayland app ID and X11 window class, which desktops
+    // match to packaging/linux/io.github.lowlevelmetal.OpenSE4.desktop.
+    SDL_SetAppMetadata("OpenSE4", OPENSE4_CLIENT_VERSION, "io.github.lowlevelmetal.OpenSE4");
+    // The original's `nd` switch holds for the whole run (spec 05 §9.2).
+    classic::setNoDialogs(options.noDialogs);
+    // The game is the player's own installed copy: without one there is nothing
+    // to play. Checked before any window or renderer exists.
+    const auto dataDir = ruleset::findInstalledDataDir(options.installDir);
+    if (!dataDir) {
+        fatal(missingInstallMessage(options.installDir));
+        SDL_Quit();
+        return 1;
+    }
+    // The original's command line without a player number: the host's turn, and no window.
+    const auto commandLine = classic::commandLineGame(options.positional);
+    if (commandLine && commandLine->host()) {
+        const int code = hostFromCommandLine(options, *commandLine, *dataDir);
+        SDL_Quit();
+        return code;
+    }
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        fatal(std::format("SDL_Init failed: {}", SDL_GetError()));
+        return 1;
+    }
+    assetsDir_ = findDir(options.assetsDir, "assets", "fonts");
+
+    if (!createWindowAndDevice()) {
+        shutdown();
+        return 1;
+    }
+    initImGui();
+    const bool scripted = options.inputScript || !options.recordInput.empty();
+    if (scripted || options.lessonAudit) script::collectItems(true);   // the widgets scripts name (client/script/items.hpp)
+
+    const Platform platform{window_, device_.get(), &fonts_, assetsDir_, rendererInfo_, this};
+    // Saved display settings (a screenshot or script run keeps the plain window it asked for).
+    if (options.screenshotPath.empty() && !options.inputScript) applyGraphics();
+    std::string error;
+    ClassicOptions co;
+    co.installDir = dataDir->string();
+    co.mods = options.mods;
+    co.modsGiven = options.modsGiven;
+    co.modsDir = options.modsDir;
+    co.noBundledMods = options.noBundledMods;
+    co.commandLineModFolder = assets::modDirectoryFromArguments(options.positional);
+    co.commandLine = commandLine;
+    co.seed = options.seed;
+    co.seedGiven = options.seedGiven;
+    co.systemCount = options.systemCount;
+    co.empireCount = options.empireCount;
+    co.quadrantType = options.quadrantType;
+    co.skipIntro = options.quickStart || (!options.screenshotPath.empty() && !options.inputScript);
+    co.race = options.race;
+    co.autoTurns = options.autoTurns;
+    co.select = options.select;
+    co.openWindow = options.openWindow;
+    co.turnBased = options.turnBased;
+    co.aiPlayer = options.aiPlayer;
+    co.loadFile = options.loadFile;
+    co.pbemFile = options.pbemFile;
+    co.pbemEmpire = options.pbemEmpire;
+    co.pbemPassword = options.pbemPassword;
+    co.pbemOrdersDir = options.pbemOrdersDir;
+    co.pbemEndTurn = options.pbemEndTurn;
+    co.pbemExit = options.pbemEndTurn && options.screenshotPath.empty();
+    co.tutorial = options.tutorial;
+    co.training = options.training;
+    co.manual = options.manual;
+    co.learnDir = options.learnDir;
+    co.lessonCheck = options.lessonCheck;
+    co.lessonAudit = options.lessonAudit;
+    co.lessonCheckQuits = options.screenshotPath.empty();
+    co.scripted = scripted;
+    int failure = 1;
+    mode_ = ClassicMode::create(platform, co, error, failure);
+    if (!mode_) {
+        // Empty: nothing to show (a wrong password on the command line, as the original); -nd: no box.
+        if (!error.empty() && options.noDialogs) log::error("{}", error);
+        else if (!error.empty()) fatal(error);
+        shutdown();
+        return failure;
+    }
+    // Sound needs a real session: not with --no-audio, and not for screenshots or
+    // scripts unless --audio asks for it (to check the audio itself).
+    if (!options.noAudio && (options.audio || (options.screenshotPath.empty() && !options.inputScript))) audio().open();
+    if (options.inputScript) {
+        std::filesystem::path out = options.scriptOutput;
+        if (out.empty()) {
+            std::error_code ec;
+            out = std::filesystem::temp_directory_path(ec) / "opense4-scripts";
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(out, ec);
+        player_ = std::make_unique<script::Player>(*options.inputScript, out);
+        log::info("Input script {} ({} steps)", options.inputScript->file, options.inputScript->steps.size());
+    }
+    if (!options.recordInput.empty()) recorder_ = std::make_unique<script::Recorder>(options.recordInput, options.recordOptions);
+
+    SDL_ShowWindow(window_);
+    lastTicks_ = SDL_GetTicksNS();
+    while (frame()) {
+    }
+    int code = mode_->exitCode();
+    if (player_) {
+        // The script's verdict: every step done, or where it stopped.
+        const script::Script& sc = player_->script();
+        if (player_->finished() && !player_->failed()) {
+            std::printf("input-script %s: passed (%zu steps, %llu frames)\n", sc.file.c_str(), sc.steps.size(),
+                        static_cast<unsigned long long>(player_->frame()));
+        } else {
+            const std::string why = player_->failed() ? player_->failure() : "the game quit before the script ended";
+            std::printf("input-script %s: FAILED\n%s\n", sc.file.c_str(), why.c_str());
+            if (player_->failed()) std::printf("  picture: %s\n", player_->failureShot().string().c_str());
+            code = 1;
+        }
+        std::fflush(stdout);
+    }
+    if (recorder_) {
+        std::string problem;
+        if (recorder_->save(problem)) log::info("Recorded the session as {}", recorder_->file().string());
+        else log::error("{}", problem);
+    }
+    mode_.reset();
+    shutdown();
+    return code;
+}
+
+bool App::createWindowAndDevice() {
+    const SDL_WindowFlags common = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN |
+                                   (options_.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+    gfx::DeviceOptions deviceOptions{options_.vsync, options_.validation};
+    std::string error;
+    std::string vulkanError;  // why Vulkan did not start, for the message if OpenGL does not either
+
+    if (options_.renderer != AppOptions::Renderer::OpenGL) {
+        window_ = SDL_CreateWindow("OpenSE4", options_.width, options_.height, common | SDL_WINDOW_VULKAN);
+        if (window_) {
+            device_ = gfx::createVulkanDevice(window_, deviceOptions, error);
+            if (!device_) {
+                SDL_DestroyWindow(window_);
+                window_ = nullptr;
+            }
+        } else {
+            error = SDL_GetError();
+        }
+        if (!device_) {
+            if (options_.renderer == AppOptions::Renderer::Vulkan) {
+                fatal("Vulkan renderer unavailable: " + error);
+                return false;
+            }
+            log::warn("Vulkan unavailable ({}); falling back to OpenGL", error);
+            vulkanError = error;
+        }
+    }
+
+    if (!device_) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG |
+                                                      (options_.validation ? SDL_GL_CONTEXT_DEBUG_FLAG : 0));
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+        window_ = SDL_CreateWindow("OpenSE4", options_.width, options_.height, common | SDL_WINDOW_OPENGL);
+        if (!window_) {
+            fatal(std::format("Could not create a window: {}", SDL_GetError()));
+            return false;
+        }
+        device_ = gfx::createOpenGLDevice(window_, deviceOptions, error);
+        if (!device_) {
+            fatal(noRendererMessage(vulkanError, error));
+            return false;
+        }
+    }
+
+    rendererInfo_ = std::format("{}: {}", gfx::backendName(device_->backend()), device_->deviceName());
+    log::info("Renderer: {}", rendererInfo_);
+    SDL_SetWindowMinimumSize(window_, 800, 600);  // the classic 800x600 layout fits (docs/spec/06 §2.1.1)
+    renderer_ = std::make_unique<gfx::Renderer2D>(*device_);
+    return true;
+}
+
+void App::minimize() { SDL_MinimizeWindow(window_); }
+
+void App::applyTitleBar() {
+    if (!window_) return;
+    // A fullscreen window has no title bar anyway: the setting waits until the
+    // game is in a window again (SDL_EVENT_WINDOW_LEAVE_FULLSCREEN, handleEvent).
+    if (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) return;
+    titleBarNote_.clear();
+    if (!appSettings().graphics.hideTitleBar) {
+        if (hitTestInstalled_) SDL_SetWindowHitTest(window_, nullptr, nullptr);
+        hitTestInstalled_ = false;
+        if (SDL_GetWindowFlags(window_) & SDL_WINDOW_BORDERLESS) {
+            SDL_SetWindowBordered(window_, true);
+            log::info("The window has its title bar again");
+        }
+        return;
+    }
+    // A window without a title bar that the game's top row cannot move would
+    // be stuck where it is: then it keeps its title bar.
+    if (!hitTestInstalled_ && !SDL_SetWindowHitTest(window_, windowHitTest, nullptr)) {
+        titleBarNote_ = "This system cannot move a window by the game's own top row, so the window keeps its title bar.";
+        log::warn("Hiding the title bar: the video driver {} cannot let the game move the window ({}); the title bar stays", videoDriver(),
+                  SDL_GetError());
+        return;
+    }
+    hitTestInstalled_ = true;
+    SDL_SetWindowBordered(window_, false);
+    if (!(SDL_GetWindowFlags(window_) & SDL_WINDOW_BORDERLESS)) {
+        SDL_SetWindowHitTest(window_, nullptr, nullptr);
+        hitTestInstalled_ = false;
+        titleBarNote_ = "This system cannot take the title bar off the window.";
+        log::warn("Hiding the title bar: the video driver {} cannot take it off the window", videoDriver());
+        return;
+    }
+    SDL_SyncWindow(window_);
+    // Windows and X11 say what frame the window has now; Wayland's and macOS's
+    // windows cannot tell (a Wayland desktop may keep a title bar it draws itself).
+    int top = 0;
+    if (SDL_GetWindowBordersSize(window_, &top, nullptr, nullptr, nullptr) && top > 0) {
+        titleBarNote_ = "The desktop kept a title bar on the window. The game's top row moves the window as well.";
+        log::info("Hiding the title bar: the window manager kept a frame of {} pixels at the top (video driver {})", top, videoDriver());
+        return;
+    }
+    log::info("The window has no title bar: the game's top row moves it, its edges resize it (video driver {})", videoDriver());
+}
+
+void App::publishHitAreas(int windowWidth, int windowHeight) {
+    const SDL_WindowFlags flags = SDL_GetWindowFlags(window_);
+    const bool active = appSettings().graphics.hideTitleBar && !(flags & SDL_WINDOW_FULLSCREEN);
+    const bool resizable = (flags & SDL_WINDOW_RESIZABLE) && !(flags & SDL_WINDOW_MAXIMIZED);
+    publishWindowHitAreas(takeWindowHitAreas(static_cast<float>(windowWidth), static_cast<float>(windowHeight),
+                                             resizable ? windowResizeBorder(uiScale_) : 0.0f, windowResizeCorner(uiScale_), active));
+}
+
+void App::applyGraphics() {
+    const GraphicsSettings& g = appSettings().graphics;
+    device_->setVSync(g.vsync);
+    switch (g.displayMode) {
+        case DisplayMode::Windowed:
+            SDL_SetWindowFullscreen(window_, false);
+            SDL_SetWindowSize(window_, g.windowWidth, g.windowHeight);
+            break;
+        case DisplayMode::Borderless:
+            SDL_SetWindowFullscreenMode(window_, nullptr);  // the desktop mode
+            SDL_SetWindowFullscreen(window_, true);
+            break;
+        case DisplayMode::Fullscreen: {
+            SDL_DisplayMode mode{};
+            const SDL_DisplayID display = SDL_GetDisplayForWindow(window_);
+            const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
+            const int w = g.fullscreenWidth > 0 ? g.fullscreenWidth : desktop ? desktop->w : g.windowWidth;
+            const int h = g.fullscreenHeight > 0 ? g.fullscreenHeight : desktop ? desktop->h : g.windowHeight;
+            if (SDL_GetClosestFullscreenDisplayMode(display, w, h, g.fullscreenRefresh, true, &mode))
+                SDL_SetWindowFullscreenMode(window_, &mode);
+            else
+                SDL_SetWindowFullscreenMode(window_, nullptr);
+            SDL_SetWindowFullscreen(window_, true);
+            break;
+        }
+    }
+    SDL_SyncWindow(window_);
+    applyTitleBar();
+}
+
+std::vector<DisplayModeInfo> App::displayModes() const {
+    std::vector<DisplayModeInfo> out;
+    int count = 0;
+    SDL_DisplayMode** modes = SDL_GetFullscreenDisplayModes(SDL_GetDisplayForWindow(window_), &count);
+    if (!modes) return out;
+    for (int i = 0; i < count; ++i) out.push_back({modes[i]->w, modes[i]->h, modes[i]->refresh_rate});
+    SDL_free(modes);
+    return out;
+}
+
+void App::initImGui() {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;  // fixed layout for now
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // A widget used the wrong way goes to opense4.log. Players never see Dear
+    // ImGui's tooltip or assert: release builds only log. Debug builds keep
+    // both, but an input script fails with the message instead of asserting.
+#ifdef NDEBUG
+    constexpr bool kRelease = true;
+#else
+    constexpr bool kRelease = false;
+#endif
+    setupImGuiErrors(io, kRelease, options_.inputScript.has_value());
+    ImGui_ImplSDL3_InitForOther(window_);
+    fonts_ = loadFonts(assetsDir_);
+    updateUiScale();
+    imguiRenderer_ = std::make_unique<gfx::ImGuiRenderer>(*device_);
+    imguiReady_ = true;
+}
+
+void App::updateUiScale() {
+    const float density = SDL_GetWindowPixelDensity(window_);
+    const float display = SDL_GetWindowDisplayScale(window_);
+    uiScale_ = (density > 0.0f && display > 0.0f) ? std::clamp(display / density, 0.5f, 4.0f) : 1.0f;
+    applyTheme(uiScale_);
+    if (mode_) mode_->restyle();
+}
+
+EventVerdict App::handleEvent(SDL_Event& event, bool& running) {
+    if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) event.key.mod = altGrAsAlt(event.key.mod);
+    // The mode may hold input back (a tutorial's input lock) before ImGui sees it.
+    const EventVerdict verdict = mode_->filterEvent(event);
+    switch (verdict) {
+        case EventVerdict::Pass:
+            ImGui_ImplSDL3_ProcessEvent(&event);
+            // The system's repeat of a held key: Dear ImGui keeps its own
+            // timing, the main window acts on the system's (input.hpp).
+            if (event.type == SDL_EVENT_KEY_DOWN && event.key.repeat)
+                noteSystemKeyRepeat(ImGui_ImplSDL3_KeyEventToImGuiKey(event.key.key, event.key.scancode));
+            break;
+        case EventVerdict::Drop: break;
+        case EventVerdict::PointerAway: ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX); break;
+    }
+    // Closing the window: the mode may ask first (a game in progress asks whether to quit it).
+    const bool closing = event.type == SDL_EVENT_QUIT ||
+                         (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && event.window.windowID == SDL_GetWindowID(window_));
+    if (closing && !mode_->closeRequested()) running = false;
+    if (event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED) updateUiScale();
+    // Back in a window from fullscreen (Alt+Enter): with or without its title bar, as set.
+    if (event.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN && event.window.windowID == SDL_GetWindowID(window_)) applyTitleBar();
+    return verdict;
+}
+
+bool App::frame() {
+    bool running = true;
+    // A screenshot or script run (automation) must give the same picture on
+    // every machine: a fixed frame time instead of the wall clock, and no
+    // pointer over the window but the script's (the desktop's pointer would
+    // hover over whatever is under it).
+    const bool automation = !options_.screenshotPath.empty() || player_;
+    audio().update();
+    // An input script: this frame's events, from what the frame drawn last
+    // showed (docs/BUILDING.md "Input scripts").
+    const script::Probe* probe = mode_->probe();
+    script::FrameOutput scripted;
+    if (player_ && !probe) {
+        log::error("This mode cannot play input scripts");
+        running = false;
+    } else if (player_) {
+        scripted = player_->tick(*probe);
+        for (const std::string& m : scripted.messages) {
+            if (m.starts_with("FAILED")) log::error("{}", m);
+            else log::info("script{}", m.starts_with("  ") ? m.substr(1) : ": " + m);
+        }
+        captures_ = std::move(scripted.captures);
+    }
+    if (recorder_ && probe) recorder_->frame(*probe, time_);
+    const SDL_WindowID window = SDL_GetWindowID(window_);
+    clearSystemKeyRepeats();   // this frame's repeats come with its events
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        if (player_ && script::isUserInput(event)) continue;   // a script plays alone
+        if (recorder_ && probe && script::isUserInput(event)) recorder_->event(event, *probe, time_);
+        handleEvent(event, running);
+        // The window going into the background or coming back: a player's own
+        // run follows the system; automation keeps its sound unless its script
+        // says otherwise (a window-event step, below).
+        if (!automation) presence_.follow(event, window);
+    }
+    // The script's events go the same way as a player's.
+    if (player_) {
+        std::vector<script::Verdict> verdicts;
+        for (const script::InputEvent& e : scripted.events) {
+            SDL_Event ev = script::toSdlEvent(e, window);
+            if (recorder_ && probe) recorder_->event(ev, *probe, time_);   // recording a script run tests the recorder
+            const EventVerdict verdict = handleEvent(ev, running);
+            presence_.follow(ev, window);
+            // Where Dear ImGui has the pointer now: the event's place, or nowhere when the lock said so.
+            const bool pointer = e.kind == script::InputEvent::Kind::Motion || e.kind == script::InputEvent::Kind::ButtonDown ||
+                                 e.kind == script::InputEvent::Kind::ButtonUp || e.kind == script::InputEvent::Kind::Wheel;
+            if (pointer && verdict == EventVerdict::PointerAway) scriptPointer_ = ImVec2(-FLT_MAX, -FLT_MAX);
+            else if (pointer && verdict == EventVerdict::Pass) scriptPointer_ = e.pos;
+            switch (verdict) {
+                case EventVerdict::Pass: verdicts.push_back(script::Verdict::Pass); break;
+                case EventVerdict::Drop: verdicts.push_back(script::Verdict::Drop); break;
+                case EventVerdict::PointerAway: verdicts.push_back(script::Verdict::PointerAway); break;
+            }
+        }
+        player_->verdicts(verdicts);
+        // Done or failed: this frame is the last (with its picture).
+        if (player_->finished() || player_->failed()) {
+            if (player_->finished() && !options_.screenshotPath.empty()) captures_.emplace_back(options_.screenshotPath);
+            running = false;
+        }
+    }
+    // Once per frame, after all of its events: a window covered and uncovered
+    // in one go (as Wayland does while resizing) does not dip the sound.
+    audio().setBackground(presence_.background());
+    if (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) {
+        // Windows reports minimizing (Wayland mostly does not): keep the game's
+        // network traffic going, or the host would drop us.
+        mode_->background();
+        SDL_Delay(50);
+        lastTicks_ = SDL_GetTicksNS();
+        return running;
+    }
+
+    const uint64_t now = SDL_GetTicksNS();
+    const float dt = automation ? 1.0f / 60.0f : std::min(static_cast<float>(now - lastTicks_) * 1e-9f, 0.1f);
+    lastTicks_ = now;
+    time_ += dt;
+
+    ImGui_ImplSDL3_NewFrame();
+    if (automation) {
+        ImGui::GetIO().DeltaTime = dt;
+        // The pointer is the script's, or none: while the window has the focus and
+        // no button is down, the SDL backend puts the desktop's pointer in on the
+        // video drivers that report it (Windows, X11, macOS), which would move
+        // the script's pointer to wherever the real mouse is.
+        const ImVec2 p = player_ ? scriptPointer_ : ImVec2(-FLT_MAX, -FLT_MAX);
+        ImGui::GetIO().AddMousePosEvent(p.x, p.y);
+    }
+    ImGui::NewFrame();
+    const AppSettings& prefs = appSettings();
+    ImGui::GetIO().MouseDoubleClickTime = prefs.controls.doubleClickSeconds;
+    // The fullscreen toggle (Alt+Enter by default) switches between the window and borderless fullscreen.
+    if (prefs.controls.bindings.pressed(Action::ToggleFullscreen))
+        SDL_SetWindowFullscreen(window_, (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) == 0);
+    // Frame rate, for the optional counter.
+    ++fpsFrames_;
+    if (now - fpsWindowStart_ >= 500'000'000ull) {
+        fps_ = static_cast<float>(fpsFrames_) * 1e9f / static_cast<float>(now - fpsWindowStart_);
+        fpsFrames_ = 0;
+        fpsWindowStart_ = now;
+    }
+    if (prefs.graphics.showFps)
+        ImGui::GetForegroundDrawList()->AddText(ImVec2(6, 4), IM_COL32(255, 230, 120, 230), std::format("{:.0f} fps", fps_).c_str());
+    int ww = 0, wh = 0, pw = 0, ph = 0;
+    SDL_GetWindowSize(window_, &ww, &wh);
+    SDL_GetWindowSizeInPixels(window_, &pw, &ph);
+    FrameState fs{gfx::FrameInfo{static_cast<uint32_t>(pw), static_cast<uint32_t>(ph)},
+                  ww > 0 ? static_cast<float>(pw) / static_cast<float>(ww) : 1.0f, uiScale_, time_, dt};
+
+    if (!mode_->update(fs)) running = false;
+    script::endItemFrame();
+    ImGui::Render();
+    publishHitAreas(ww, wh);
+    // An input script fails on any error Dear ImGui reported in the frame: a
+    // window that misuses a widget shows players nothing, but must not pass.
+    if (player_ && probe && imguiErrorCount() != imguiErrorsSeen_) {
+        imguiErrorsSeen_ = imguiErrorCount();
+        const script::FrameOutput failed = player_->abort("Dear ImGui reported an error: " + lastImGuiError(), *probe);
+        for (const std::string& m : failed.messages) log::error("{}", m);
+        captures_.insert(captures_.end(), failed.captures.begin(), failed.captures.end());
+        running = false;
+    }
+
+    // Frame limit when vsync is off.
+    if (const int limit = prefs.graphics.frameLimit; limit > 0 && !prefs.graphics.vsync) {
+        const uint64_t period = 1'000'000'000ull / static_cast<uint64_t>(limit);
+        const uint64_t t = SDL_GetTicksNS();
+        if (nextFrameNs_ > t) SDL_DelayPrecise(nextFrameNs_ - t);
+        nextFrameNs_ = std::max(nextFrameNs_ + period, SDL_GetTicksNS());
+    }
+
+    if (auto frameInfo = device_->beginFrame(mode_->clearColor())) {
+        fs.frame = *frameInfo;
+        mode_->render(*renderer_, fs);
+        imguiRenderer_->render(ImGui::GetDrawData());
+
+        ++frameCount_;
+        // --screenshot: frame N; with a script, the pictures it asks for (and the last frame).
+        const bool screenshotFrame = !player_ && !options_.screenshotPath.empty() && frameCount_ == options_.screenshotFrames;
+        if (screenshotFrame) captures_.emplace_back(options_.screenshotPath);
+        const bool capture = !captures_.empty();
+        if (capture) device_->requestCapture();
+        device_->endFrame();
+        if (auto image = device_->takeCapture()) {
+            for (const std::filesystem::path& file : captures_) {
+                if (gfx::writePng(file.string(), *image)) log::info("Saved screenshot {} ({}x{})", file.string(), image->width, image->height);
+                else log::error("Could not write {}", file.string());
+            }
+            if (screenshotFrame) running = false;
+        } else if (capture) {
+            log::error("Screenshot capture is not supported by this backend/surface");
+            if (screenshotFrame) running = false;
+        }
+        captures_.clear();
+    }
+    return running;
+}
+
+void App::shutdown() {
+    if (device_) device_->waitIdle();
+    mode_.reset();
+    audio().close();
+    if (imguiReady_) {
+        imguiRenderer_.reset();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        imguiReady_ = false;
+    }
+    renderer_.reset();
+    device_.reset();
+    if (window_) SDL_DestroyWindow(window_);
+    window_ = nullptr;
+    SDL_Quit();
+}
+
+} // namespace opense4::client

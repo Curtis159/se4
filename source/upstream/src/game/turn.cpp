@@ -1,0 +1,518 @@
+#include "game/turn.hpp"
+
+#include "game/ai.hpp"
+#include "game/combat.hpp"
+#include "game/design.hpp"
+#include "game/diplomacy.hpp"
+#include "game/economy.hpp"
+#include "game/events.hpp"
+#include "game/hooks.hpp"
+#include "game/intel.hpp"
+#include "game/movement.hpp"
+#include "game/players.hpp"
+#include "game/research.hpp"
+#include "game/score.hpp"
+#include "game/sight.hpp"
+#include "game/turn_internal.hpp"
+
+#include <algorithm>
+#include <format>
+#include <memory>
+#include <optional>
+#include <utility>
+
+namespace opense4::game {
+
+namespace detail {
+
+bool ministersPlan(const GameState& s, EmpireId e, Control c) {
+    switch (c) {
+        case Control::Computer: return true;
+        case Control::Absent: return false;
+        case Control::Player:
+        case Control::StandIn: return ai::ministersActive(s, e);
+    }
+    return false;
+}
+
+void applyCommands(TurnContext& ctx, EmpireId e, std::vector<Command> commands) {
+    if (commands.empty()) return;
+    applyOrders(ctx.rules, ctx.state, EmpireOrders{e, ctx.state.turn, std::move(commands)}, ctx.rejected);
+}
+
+CommandResult applyCommand(TurnContext& ctx, EmpireId e, const Command& c) {
+    CommandResult res = apply(ctx.rules, ctx.state, e, c);
+    if (!res.ok) ctx.rejected.emplace_back(e, std::format("{}: {}", commandName(c), res.error));
+    return res;
+}
+
+void planCall(TurnContext& ctx, EmpireId e, PlanCall call, const CommandSink& sink, const std::function<void()>& classic) {
+    if (playedByController(ctx, e) && ctx.players->plan(ctx, e, call, sink)) return;
+    classic();
+}
+
+bool living(const GameState& s, EmpireId e) { return e.valid() && e.index() < s.empires.size() && s.empire(e).alive; }
+
+void resetCameFrom(const Rules& r, GameState& s, EmpireId e) {
+    for (Vehicle& v : s.vehicles) {
+        if (v.owner != e || v.count <= 0) continue;
+        const ruleset::VehicleType type = vehicleType(r, s, v);
+        if (type == ruleset::VehicleType::Ship || type == ruleset::VehicleType::Base || type == ruleset::VehicleType::Fighter ||
+            type == ruleset::VehicleType::Drone)
+            v.cameFrom = v.location;
+    }
+}
+
+void keepStartFigures(TurnContext& ctx, EmpireId e, const std::optional<ai::StartOfTurnFigures>& figures) {
+    if (ctx.aiStartFigures.size() <= e.index()) ctx.aiStartFigures.resize(e.index() + 1);
+    ctx.aiStartFigures[e.index()] = figures;
+}
+
+void keepStartTerritory(TurnContext& ctx, EmpireId e, std::optional<std::vector<SystemId>> territory) {
+    if (ctx.aiStartTerritory.size() <= e.index()) ctx.aiStartTerritory.resize(e.index() + 1);
+    ctx.aiStartTerritory[e.index()] = std::move(territory);
+}
+
+} // namespace detail
+
+using detail::applyCommand;
+using detail::applyCommands;
+using detail::keepStartFigures;
+using detail::keepStartTerritory;
+using detail::planCall;
+using detail::Control;
+using detail::living;
+using detail::ministersPlan;
+using detail::resetCameFrom;
+
+void applyOrders(const Rules& r, GameState& s, const EmpireOrders& orders, std::vector<std::pair<EmpireId, std::string>>& rejected) {
+    for (const Command& c : orders.commands) {
+        const CommandResult res = apply(r, s, orders.empire, c);
+        if (!res.ok) rejected.emplace_back(orders.empire, std::format("{}: {}", commandName(c), res.error));
+    }
+}
+
+void empireEndOfTurn(TurnContext& ctx, EmpireId e, bool ministers) {
+    const Rules& r = ctx.rules;
+    GameState& s = ctx.state;
+    if (!living(s, e)) return;
+    // Once the victory check has marked the game completed, every empire's
+    // end-of-turn processing is skipped entirely: no player files,
+    // intelligence, research, income, trade, maintenance, planets, happiness,
+    // construction, repair, design forgetting, supply, storage cap, system
+    // abilities, ground combat or log pruning (spec 05 §6, confirmed: binary).
+    if (s.lastTurn) return;
+
+    // 1. The ministers' end-of-turn actions (spec 05 §7.1 group 2): Design,
+    // Research, Intelligence and the construction ministers. The queues need
+    // no refresh of their own: their rates are worked out when they run
+    // (inferred).
+    // The units reserve the vehicle list applies is what the nearest empire
+    // before it left; in a turn-based game its own start-of-turn step has
+    // just reset it to 0 (spec 05 §7.5 "Units file"). The colonization
+    // targets are those the last start-of-turn step left, if any are left
+    // (the first economy step of a simultaneous turn: the last empire's), and
+    // the step removes them (spec 05 §7.2 "Whose lists the economy step reads").
+    // An empire a script or external player plays gets its `economy` call
+    // instead (docs/sdk/ai-protocol.md); without an answer the ministers act
+    // as for any computer player. When it keeps the classic state, the step's
+    // own bookkeeping follows whoever answered: the lists and its figures are
+    // read (the classic answers of the call plan with them) and removed, and
+    // its units step leaves the reserve. Otherwise a player's answer leaves
+    // the shared lists and the units reserve as an empire whose ministers do
+    // not act does.
+    auto ministersAct = [&] {
+        const std::optional<std::vector<ObjectId>> lists = std::move(ctx.aiColonyTargets);
+        ctx.aiColonyTargets.reset();
+        std::optional<ai::StartOfTurnFigures> figures;
+        if (e.index() < ctx.aiStartFigures.size()) figures = std::exchange(ctx.aiStartFigures[e.index()], std::nullopt);
+        applyCommands(ctx, e, ai::planEconomyStep(r, s, e, s.options.simultaneous ? ctx.unitReserve : 0, lists ? &*lists : nullptr,
+                                                  figures ? &*figures : nullptr));
+        if (living(s, e) && ai::ministerOn(s.empire(e), Minister::ShipConstruction)) ctx.unitReserve = ai::unitReserveLeft(r, s.empire(e));
+    };
+    if (ministers && playedByController(ctx, e)) {
+        const CommandSink sink{[&](const Command& c) { return applyCommand(ctx, e, c); }, [] {}};
+        planCall(ctx, e, PlanCall::Economy, sink, ministersAct);
+        if (classicStateKept(ctx, e)) {
+            ctx.aiColonyTargets.reset();
+            keepStartFigures(ctx, e, std::nullopt);
+            if (living(s, e) && ai::ministerOn(s.empire(e), Minister::ShipConstruction)) ctx.unitReserve = ai::unitReserveLeft(r, s.empire(e));
+        }
+        keepStartTerritory(ctx, e, std::nullopt);
+    } else if (ministers) {
+        ministersAct();
+    }
+    // 2. The statistics row of the Scores and Comparisons windows (spec 05 §5;
+    // OpenSE4 keeps every empire's in the save), and for a human player the
+    // lines of its statistics, history and log text files (TurnResult::records).
+    score::recordStatistics(ctx, e);
+    // The mods' empire_end_of_turn hooks run before and after each of the
+    // steps below that they name, each followed by the events it raised
+    // (hooks.hpp; nothing without rules mods).
+    auto step = [&](EndStep which, auto&& body) {
+        auto around = [&](bool after) {
+            if (!ctx.hooks || !living(s, e)) return;
+            HookArgs a;
+            a.empire = e;
+            a.step = which;
+            a.after = after;
+            runHook(ctx, Hook::EmpireEndOfTurn, a);
+            deliverHooks(ctx);
+        };
+        around(false);
+        body();
+        around(true);
+    };
+    // 3-4. Intelligence, then research: each spends the pool the previous
+    // turn's income and trade filled, then empties it (spec 05 §1.1, §2.1).
+    step(EndStep::Intelligence, [&] { intel::intelStep(ctx, e); });
+    step(EndStep::Research, [&] { research::researchStep(ctx, e); });
+    // 5. Income: production, tariffs to a master (paid to it at once), the
+    // computer bonus; research and intelligence go into the pools.
+    step(EndStep::Income, [&] { economy::collectIncome(ctx, e); });
+    // 6. Treaties and trade: consistency, a master's view of designs, trade
+    // income, Partnership maps and designs, the trade counters.
+    diplomacy::treatyStep(ctx, e);
+    // 7. Maintenance.
+    step(EndStep::Maintenance, [&] { economy::payMaintenance(ctx, e); });
+    // 8. Planets: growth, planet changes, plague.
+    step(EndStep::Population, [&] { economy::processPlanets(ctx, e); });
+    // 9. Happiness, from the mood events raised since the last update.
+    step(EndStep::Happiness, [&] { economy::updateHappiness(ctx, e); });
+    // 10. Construction.
+    step(EndStep::Construction, [&] { economy::runConstruction(ctx, e); });
+    // 11. Repair.
+    step(EndStep::Repair, [&] { movement::repairEmpire(ctx, e); });
+    // 12. Foreign designs last seen more than 50 turns ago are forgotten.
+    sight::forgetOldDesigns(s, e);
+    // 13. Supply, with the per-turn upkeep of unit groups and cloaks (the
+    // per-object upkeep of step 16 is part of it, inferred).
+    step(EndStep::Supply, [&] { movement::supplyEmpire(ctx, e); });
+    // 14. Storage cap.
+    economy::applyStorageCap(ctx, e);
+    // 15. System-wide abilities and training.
+    economy::applySystemAbilities(ctx, e);
+    movement::trainEmpire(ctx, e);
+    // 16. Each ship, base, fighter group and drone group records its current
+    // sector as the one it comes from: in a turn-based game a vehicle that
+    // moved in its owner's turn counts as an arrival only until now (spec 05
+    // §8 step 16, spec 04 §3, confirmed: binary; which vehicles, open question 46).
+    resetCameFrom(ctx.rules, s, e);
+    // 17. Ground combat on the empire's colonies where landed troops still
+    // fight (spec 04 §13: the colony owner's step).
+    step(EndStep::GroundCombat, [&] {
+        combat::runGroundCombat(ctx, e);
+        s.removeDeadVehicles();
+    });
+    // The mods' colony_end_of_turn hooks: each of the empire's colonies, in
+    // planet order (hooks.hpp).
+    if (hookWanted(ctx, Hook::ColonyEndOfTurn)) {
+        std::vector<ObjectId> planets;
+        for (const auto& c : s.colonies)
+            if (c && c->owner == e) planets.push_back(c->planet);
+        for (ObjectId planet : planets) {
+            const Colony* c = s.colony(planet);
+            if (!c || c->owner != e || !living(s, e)) continue;
+            HookArgs a;
+            a.empire = e;
+            a.planet = planet;
+            runHook(ctx, Hook::ColonyEndOfTurn, a);
+        }
+        deliverHooks(ctx);
+        s.removeDeadVehicles();
+    }
+    // 18. The log keeps only this turn's entries (spec 05 §3.4).
+    if (living(s, e)) std::erase_if(s.empire(e).log, [&](const LogEntry& l) { return l.turn < s.turn; });
+}
+
+namespace {
+
+TurnResult simultaneousTurn(const Rules& r, GameState& s, std::span<const EmpireOrders> orders, const TurnOptions& options,
+                            TurnContext::Battles* battles);
+
+} // namespace
+
+bool simultaneousBattlesShown(const Rules& r) { return r.settingFlag("Simultaneous Games Show Strategic Combat", false); }
+
+TurnResult processTurn(const Rules& r, GameState& s, std::span<const EmpireOrders> orders, const TurnOptions& options) {
+    if (s.gameOver) return {};
+    if (!s.options.simultaneous) return detail::playTurnBasedTurn(r, s, orders, options);
+    // On one machine, with the Settings flag on, every battle, computer-only
+    // ones included, stops the turn to be shown (turn.hpp; spec 06 §1.10.5,
+    // §7 Q76): the turn is played again with the answers so far, up to the
+    // next battle (spec 04 §2).
+    const std::vector<BattleAnswer>* answers = options.battles && simultaneousBattlesShown(r) ? options.battles : nullptr;
+    return detail::withBattles(s, answers, [&](TurnContext::Battles* battles) { return simultaneousTurn(r, s, orders, options, battles); });
+}
+
+namespace {
+
+TurnResult simultaneousTurn(const Rules& r, GameState& s, std::span<const EmpireOrders> orders, const TurnOptions& options,
+                            TurnContext::Battles* battles) {
+    TurnContext ctx{r, s, {}, {}, {}};
+    // The script and external players of this turn (players.hpp) and the
+    // rules hooks of the game's mods (hooks.hpp), if any.
+    CallSession session(ctx);
+    // A game the victory check has marked completed goes on when the host
+    // processes more turns: they read the orders and messages, advance the
+    // date, move and fight, and run the destruction, contact and victory
+    // checks and the event step, but every start-of-turn step (step 4) and
+    // every end-of-turn processing (step 6, empireEndOfTurn) is skipped (spec
+    // 05 §6, confirmed: binary).
+    const bool completed = s.lastTurn;
+    ctx.battles = battles;
+    ctx.movementDay = options.movementDay;
+    ctx.movementStep = options.movementStep;
+    ctx.explainFailedOrders = options.explainFailedOrders;
+    // The Progress window's steps (TurnOptions::progress): four per empire
+    // (its orders, its messages, its start of turn, its end-of-turn
+    // processing) and the 30 movement days (inferred split).
+    const int totalSteps = static_cast<int>(s.empires.size()) * 4 + 30;
+    int stepsDone = 0;
+    auto stepDone = [&](int n = 1) {
+        stepsDone = std::min(totalSteps, stepsDone + n);
+        if (options.progress) options.progress(stepsDone, totalSteps);
+    };
+    if (options.progress) {
+        options.progress(0, totalSteps);
+        ctx.movementDay = [&, observe = options.movementDay](int day, const GameState& st) {
+            if (observe) observe(day, st);
+            stepDone();
+        };
+    }
+    // Mood events raised after an empire's happiness update last turn (spec 02 §4).
+    ctx.moodEvents = std::move(s.pendingMood);
+    s.pendingMood.clear();
+    // The mods' turn_start hooks, before the orders.
+    runHook(ctx, Hook::TurnStart);
+    deliverHooks(ctx);
+    // Human-controlled empires already defeated as this turn began: it is their
+    // last turn, the one the Lose ending announced, and they are destroyed at
+    // its end (spec 06 §7 Q83, confirmed: binary).
+    std::vector<uint8_t> defeatedAtStart(s.empires.size(), 0);
+    for (size_t i = 0; i < s.empires.size(); ++i) defeatedAtStart[i] = s.empires[i].alive && score::defeated(r, s, EmpireId{i}) ? 1 : 0;
+
+    // ---- 1. Orders, in player order. A human whose orders are missing is
+    // played by the computer for this turn: every minister is switched on and
+    // restored afterwards; a player who forbade AI changes only gets the
+    // bookkeeping (spec 05 §7.1, §9.2).
+    std::vector<const EmpireOrders*> byEmpire(s.empires.size(), nullptr);
+    for (const EmpireOrders& o : orders) {
+        if (!o.empire.valid() || o.empire.index() >= s.empires.size()) continue;
+        if (o.turn != s.turn) {
+            ctx.rejected.emplace_back(o.empire, std::format("Orders for turn {} ignored on turn {}", o.turn, s.turn));
+            continue;
+        }
+        byEmpire[o.empire.index()] = &o;
+    }
+    std::vector<Control> control(s.empires.size(), Control::Computer);
+    std::vector<std::pair<EmpireId, ai::MinisterSettings>> standIns;  // their own minister settings, restored at the end
+    for (size_t i = 0; i < s.empires.size(); ++i) {
+        stepDone();
+        Empire& e = s.empires[i];
+        if (!e.alive || e.kind != PlayerKind::Human) continue;
+        if (byEmpire[i]) {
+            control[i] = Control::Player;
+            applyOrders(r, s, *byEmpire[i], ctx.rejected);
+            // Reading a player's orders recalculates each of its colonies they
+            // carry; one that can no longer cloak decloaks as by Decloak (spec
+            // 05 §9.2, spec 01 §6.9, §14 Q44, confirmed: binary).
+            for (ObjectId planet : coloniesNamed(byEmpire[i]->commands))
+                if (Colony* c = s.colony(planet); c && c->owner == e.id) diplomacy::recalculateColony(ctx, *c);
+        } else if (!options.aiForMissing) {
+            control[i] = Control::Player;
+        } else if (e.aiMinimalChanges) {
+            control[i] = Control::Absent;
+        } else {
+            // Planned once below (planOrders, planEconomyStep), and its
+            // political step runs with the Politics minister on (spec 05 §7.1).
+            control[i] = Control::StandIn;
+            standIns.emplace_back(e.id, ai::standIn(e));
+        }
+    }
+    auto controlOf = [&](size_t i) { return i < control.size() ? control[i] : Control::Computer; };
+    // A fleet Fleet Transfer made and left empty stays through the turn, as
+    // the original keeps it: only loading a saved game disbands it (spec 03
+    // §9, confirmed: binary; game::loadGame).
+    s.tidyFleets();
+    // Once the orders are read, sight is recalculated in every system; no
+    // first-contact check runs (spec 05 §9.2, confirmed: binary).
+    sight::updateKnowledge(r, s);
+
+    // ---- 2. Each player's messages, player by player. An acceptance carries
+    // out an offer dated exactly the turn before (spec 05 §3.4, confirmed:
+    // binary: the host's processing of a player's messages before the date
+    // advances).
+    diplomacy::deliverMessages(ctx, std::nullopt, diplomacy::MessageLookup::PreviousTurn);
+    stepDone(static_cast<int>(s.empires.size()));
+
+    // ---- 3. The date advances. GameState::turn stays the number the orders
+    // were given for until the end of the turn (log entries and records carry
+    // it); the steps below that depend on the date get `date`.
+    const uint32_t date = s.turn + 1;
+
+    // ---- 4. Start of turn, empire by empire: the AI state update, the
+    // political step (counting the turn processed before: its battles are
+    // still in GameState::combats; and the messages delivered since the
+    // empire's previous step, those of step 2 included), then the ministers
+    // that act while orders are given. The Politics minister acts first and its messages take
+    // effect as they are sent, so the other ministers already see the
+    // treaties it changed (spec 05 §8 step 4, confirmed: binary). It rewrites
+    // the claims first thing (a trade it accepts then moves a claim until the
+    // receiver's next rewrite); the state update and the ministers after it
+    // use the claims of the previous turn (spec 05 §7.2).
+    for (size_t i = 0; i < s.empires.size(); ++i) {
+        const EmpireId id{i};
+        stepDone();
+        if (!s.empire(id).alive || completed) continue;
+        // An empire that gave no orders of its own (a computer player, or a
+        // human the computer plays) looks up the offer it accepts dated
+        // exactly the advanced date − 2; a player's ministers use the window
+        // (spec 05 §3.4, confirmed: binary).
+        const diplomacy::MessageLookup lookup = byEmpire[i] ? diplomacy::MessageLookup::Window : diplomacy::MessageLookup::Exact;
+        // An empire a script or external player plays (players.hpp): its
+        // player gets the `politics` and `orders` calls in the ministers'
+        // place, the classic ministers answering only when it gives no answer
+        // (docs/sdk/ai-protocol.md). Unless it asked for none, the classic
+        // AI's own steps run around them as for a computer empire: the
+        // figures, the state update (its options and claims are commands of
+        // the classic politics answer instead), the political step, and the
+        // lists the orders step builds, which the economy step reads.
+        if (playedByController(ctx, id)) {
+            const bool own = classicStateKept(ctx, id);
+            std::optional<ai::StartOfTurnFigures> figures;
+            if (own) {
+                figures = ai::startOfTurnFigures(r, s, id);
+                ai::updateAiState(ctx, id, false);
+            }
+            const std::vector<SystemId> territory = s.empire(id).claimedSystems;
+            if (own) {
+                ai::politicalStep(ctx, id, ai::simultaneousWindow(s, id));
+                ai::recordPoliticalStep(s, id);
+            }
+            keepStartFigures(ctx, id, figures);
+            keepStartTerritory(ctx, id, territory);
+            const CommandSink sink{[&](const Command& c) { return applyCommand(ctx, id, c); }, [] {}};
+            planCall(ctx, id, PlanCall::Politics, sink, [&] { applyCommands(ctx, id, classicPlan(ctx, id, PlanCall::Politics)); });
+            diplomacy::deliverMessages(ctx, date, lookup);
+            std::optional<std::vector<ObjectId>> lists;
+            if (own) lists = ai::colonyTargetsNow(r, s, id, &territory);
+            planCall(ctx, id, PlanCall::Orders, sink, [&] {
+                std::vector<ObjectId> targets;
+                applyCommands(ctx, id, ai::planOrdersAfterPolitics(r, s, id, &territory, &targets, figures ? &*figures : nullptr));
+                if (!own) ctx.aiColonyTargets = std::move(targets);
+            });
+            if (own) ctx.aiColonyTargets = std::move(lists);   // the step's lists stay in place
+            diplomacy::deliverMessages(ctx, date, lookup);
+            continue;
+        }
+        // First thing, before the AI state update and the Politics minister,
+        // the step works out the figures its ministers and the economy step
+        // use (spec 05 §7.5 *Net income*, confirmed: binary).
+        std::optional<ai::StartOfTurnFigures> figures;
+        if (ministersPlan(s, id, controlOf(i))) figures = ai::startOfTurnFigures(r, s, id);
+        ai::updateAiState(ctx, id);
+        const std::vector<SystemId> territory = s.empire(id).claimedSystems;
+        if (controlOf(i) != Control::Absent) {
+            ai::politicalStep(ctx, id, ai::simultaneousWindow(s, id));
+            ai::recordPoliticalStep(s, id);
+            ai::claimTerritory(ctx, id);
+        }
+        // Messages sent now carry the advanced date (spec 05 §7.4 "Answer window").
+        if (ministersPlan(s, id, controlOf(i))) {
+            applyCommands(ctx, id, ai::planPoliticsOrders(r, s, id));
+            diplomacy::deliverMessages(ctx, date, lookup);
+            std::vector<ObjectId> targets;
+            applyCommands(ctx, id, ai::planOrdersAfterPolitics(r, s, id, &territory, &targets, figures ? &*figures : nullptr));
+            ctx.aiColonyTargets = std::move(targets);  // the step's lists stay in place
+            keepStartFigures(ctx, id, figures);
+            diplomacy::deliverMessages(ctx, date, lookup);
+        }
+    }
+    if (!completed) ai::recordAiDecisions(ctx);
+    // The mods' orders_applied hooks: every empire's orders for the turn are in.
+    runHook(ctx, Hook::OrdersApplied);
+    deliverHooks(ctx);
+
+    // ---- 5. Movement and space combat: 30 movement phases, each followed by
+    // combat where it applies. Colonize orders found their colonies during the
+    // phases, like any order (spec 05 §8 step 5). Sight then follows the
+    // new positions; first contact was checked at the moments spec 05 §3.1
+    // names (warp arrivals, decloaks), never in a pass of its own.
+    s.combats.clear();  // from here on: this turn's battles
+    movement::startTurn(ctx);
+    movement::runMovementAndCombat(ctx);
+    // After the 30 days the movement routine refills every ship's and every
+    // fighter and drone group's movement to its maximum, as it did before
+    // day 1 (spec 03 §6.3, confirmed: binary): the end of the turn, the
+    // event step and the next turn's orders see full movement.
+    movement::startTurn(ctx);
+    s.removeDeadVehicles();
+    sight::updateKnowledge(r, s);
+
+    // ---- 6. End-of-turn processing, one empire at a time in empire order,
+    // each followed by its destruction check. An empire founded during it
+    // (a rebel colony) starts its own processing next turn (inferred). A
+    // human-controlled empire is destroyed only when it was already defeated
+    // as this turn began, its last turn (spec 06 §7 Q83).
+    const size_t processed = s.empires.size();
+    for (size_t i = 0; i < processed; ++i) {
+        const EmpireId id{i};
+        stepDone();
+        if (!s.empire(id).alive) continue;
+        empireEndOfTurn(ctx, id, ministersPlan(s, id, controlOf(i)));
+        score::checkDestruction(ctx, id, i < defeatedAtStart.size() && defeatedAtStart[i]);
+    }
+
+    // ---- 7. Design cleanup when a new year starts; then, every turn, the
+    // contact check: empires that no warp path links any more lose contact
+    // (spec 05 §3.1, confirmed: binary).
+    if (date % 10 == 0) movement::purgeObsoleteDesigns(ctx);
+    diplomacy::checkContacts(ctx);
+
+    // ---- 8. Victory check; then the mods' check_victory hooks, victory
+    // conditions and scenario objectives, while the game goes on.
+    score::checkVictory(ctx, date);
+    if (!s.gameOver && !s.lastTurn) runHook(ctx, Hook::CheckVictory);
+    deliverHooks(ctx);
+
+    // ---- 9. Event step: hazard damage, the timed events that are due, then
+    // one roll for a new event for the whole galaxy; then the mods' events.
+    movement::runStellarHazards(ctx);
+    {
+        Rng rng = s.rng.fork();
+        events::fireDueEvents(ctx, rng);
+        events::rollNewEvent(ctx, date, rng);
+        if (ctx.hooks) ctx.hooks->eventStep(ctx, rng);
+    }
+    deliverHooks(ctx);
+    s.removeDeadVehicles();
+    // The mods' turn_end hooks.
+    if (ctx.hooks) {
+        runHook(ctx, Hook::TurnEnd);
+        deliverHooks(ctx);
+        s.removeDeadVehicles();
+    }
+
+    // ---- 10. Per-turn flags are cleared; sight follows the events (each
+    // logged event ran its own first-contact check); the AI remembers the turn's battles and spies; stand-ins get
+    // their own ministers back; mood events still waiting carry over.
+    for (Empire& e : s.empires)
+        for (Relation& rel : e.relations) rel.messageSentThisTurn = false;
+    sight::updateKnowledge(r, s);
+    ai::rememberAiEvents(ctx);
+    for (const auto& [id, saved] : standIns) ai::restoreMinisters(s.empire(id), saved);
+    std::erase_if(ctx.moodEvents, [&](const MoodEvent& m) { return !living(s, m.empire); });
+    s.pendingMood = std::move(ctx.moodEvents);
+    // The players' session ends with the turn (docs/sdk/ai-protocol.md §2).
+    session.end();
+    ++s.turn;
+    pruneJournal(s);
+    economy::updateReports(r, s);
+
+    return TurnResult{std::move(ctx.rejected), {}, {}, std::move(ctx.records)};
+}
+
+} // namespace
+
+} // namespace opense4::game

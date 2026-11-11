@@ -1,0 +1,280 @@
+#pragma once
+
+// Contact, treaties, messages, trade and tariffs (docs/spec/05 §3).
+
+#include "game/rules.hpp"
+#include "game/state.hpp"
+
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace opense4::game {
+struct TurnContext;
+}
+
+namespace opense4::game::diplomacy {
+
+// Messages are kept this many turns after they were sent, so replies can
+// refer to them and the UI can show recent history (inferred). Only the
+// newest recent one from an empire can be answered (newestMessage).
+inline constexpr uint32_t kMessageLifetime = 10;
+
+// ---- Answers (spec 05 §3.4 "Answers", confirmed: binary) ---------------------------------------
+
+// How the newest political message from an empire is looked up: the
+// original's one finder, with three date tests. D is the date the lookup
+// runs at (a GameState::turn number, as DiplomaticMessage::dated).
+enum class MessageLookup : uint8_t {
+    // The Communicate window and message processing: dated strictly after D −
+    // 2, or after D − 1 in a turn-based game when the sender's player number
+    // is lower than the reader's.
+    Window,
+    // Processing for an empire the computer plays at a simultaneous turn's
+    // start-of-turn step (no orders of its own): dated exactly that cut-off.
+    Exact,
+    // Processing of the players' messages at a simultaneous turn's start,
+    // before the date advances: dated exactly D − 1.
+    PreviousTurn,
+};
+// The newest delivered message from `from` to `reader` that passes the date
+// test of `mode` at date `date`, whatever its type: the last one in the
+// reader's log. nullptr when there is none.
+const DiplomaticMessage* newestMessage(const GameState& s, EmpireId reader, EmpireId from, uint32_t date, MessageLookup mode = MessageLookup::Window);
+
+// ---- Turn phases -------------------------------------------------------------------------------
+
+// Delivers every message not yet delivered and applies replies: treaty
+// accepts, trades, gifts and tributes, plus the immediate messages (break
+// treaty, declare war, surrender, grant independence). Expired messages are
+// removed. The turn calls it for the players' messages (spec 05 §8 step 2)
+// and after each computer player's and minister's orders (step 4: their
+// messages take effect as they are sent). Each delivered message is dated
+// `date` (DiplomaticMessage::dated; by default GameState::turn): a
+// simultaneous turn passes the advanced date for step 4. An accepted trade,
+// gift or tribute carries out the packages of the proposer's newest message
+// to the accepter, looked up with `lookup` at that date, only when it is the
+// matching offer (spec 05 §3.4, confirmed: binary).
+void deliverMessages(TurnContext& ctx, std::optional<uint32_t> date = std::nullopt, MessageLookup lookup = MessageLookup::Window);
+// Delivers one message not yet delivered, as deliverMessages does, dated
+// `date` (`Politics - Fake Messages`: the date of the attacker's end-of-turn
+// processing). Nothing when it is gone or already delivered. `faked`: a
+// declaration of war sent in the sender's name, whose sender gets no "War
+// Declared" entry (spec 05 §2.3, confirmed: binary).
+void deliverMessage(TurnContext& ctx, MessageId id, uint32_t date, MessageLookup lookup = MessageLookup::Window, bool faked = false);
+// The first-contact check in one system (spec 05 §3.1, confirmed: binary):
+// every pair of living empires that have not both met the other, that each
+// detect an object of the other in `sys` now (a vehicle or a colony there
+// passing the detection rule of spec 01 §6.3 by the current positions and
+// sensors) and that a warp path links both ways, make contact (makeContact),
+// in empire order. An empire without colonies makes no contact. It runs only
+// at the moments the spec names, in the system concerned: a group's arrival
+// through a warp point, any decloak of a ship, unit group or colony, an event
+// once it is logged, a planet or vehicle handed over in a package, and a
+// rebellion project; never on moves within a system or in a per-turn pass.
+// A pair where only one side has met the other (`onlySide` below) completes
+// the missing side.
+// `onlySide` valid: only that empire's side of each new contact is made (its
+// contact mark and its "First Contact" entry); the other empire's side waits
+// for the next check in a system where both detect each other. A player's
+// Decloak in a simultaneous game reaches the host that way (spec 01 §14 Q44,
+// confirmed: binary).
+void firstContactIn(TurnContext& ctx, SystemId sys, EmpireId onlySide = {});
+// The same check in every system, in system order: when the game is created,
+// after the empires are placed, and after a surrender.
+void firstContactEverywhere(TurnContext& ctx);
+// The contact check (spec 05 §3.1, §8 step 7, confirmed: binary), once per
+// game turn in both turn styles, after the design cleanup and before the
+// victory check: each living empire A checks every empire B it has contact
+// with, in empire order. When no colony of B lies in a system warpReach
+// finds from A's colonies, A's side returns to "no contact" (contact off,
+// treaty None), A's intelligence projects against B are removed, and A logs
+// "Contact Lost" (a history line, §3.4). A's anger is unchanged; B's side
+// changes when B is checked.
+void checkContacts(TurnContext& ctx);
+// The systems (per SystemId, 1 = reached) that warp points lead to from the
+// systems holding `e`'s colonies, those systems included: every warp point,
+// known or not, followed in its own direction (spec 05 §3.1).
+std::vector<uint8_t> warpReach(const GameState& s, EmpireId e);
+// Whether a colony of `to` lies in a system warpReach(`from`) finds.
+bool warpLinked(const GameState& s, EmpireId from, EmpireId to);
+// One empire's treaty step (spec 05 §8 end-of-turn step 6, §3.2–§3.3), in
+// this order: the consistency check (two sides that record different
+// treaties both fall to None), a master's view of its subject's designs, the
+// trade income from every partner (economy::collectTrade), Partnership maps
+// and designs, and the trade counters (+1 toward every other living empire).
+void treatyStep(TurnContext& ctx, EmpireId e);
+
+// ---- Treaties and contact ----------------------------------------------------------------------
+
+// The log entries a treaty change makes for both parties: "New Treaty"
+// (breaking a treaty, war, a subject's other treaties), none (an accepted
+// proposal, whose "Message" entry is all, spec 06 §7 Q70), or "Treaty
+// Enacted" (a package's treaty item, spec 06 §7 Q70).
+enum class TreatyEntry : uint8_t { NewTreaty, None, Enacted };
+// Sets a treaty on both sides: dominance for Subjugation/Protectorate
+// (`aDominant`: a is the master), treaty turn, last war turn, trade reset
+// below trade level, the log entries `entry` names and the history lines.
+// No happiness event: Break Treaty, Declare War, the treaties a new subject
+// drops and every other direct change raise none (spec 05 §3.2, confirmed:
+// binary). False when nothing changed.
+bool setTreaty(TurnContext& ctx, EmpireId a, EmpireId b, Treaty t, bool aDominant = false, TreatyEntry entry = TreatyEntry::NewTreaty);
+// The original's routine that enacts an accepted treaty (spec 05 §3.2,
+// confirmed: binary): setTreaty, then the "New Treaty ..." happiness event
+// for each side that changed. Used by a package's Treaty item and by
+// signTreaty.
+void enactTreaty(TurnContext& ctx, EmpireId a, EmpireId b, Treaty t, bool aDominant = false, TreatyEntry entry = TreatyEntry::NewTreaty);
+// An Accept Treaty message (spec 05 §3.2, §3.4, confirmed: binary):
+// enactTreaty (the message gives TreatyEntry::None: its own entry is all),
+// and for a Subjugation the subject's treaties better than None with third
+// empires fall to None, both sides told. A package's Subjugation drops
+// nothing.
+void signTreaty(TurnContext& ctx, EmpireId a, EmpireId b, Treaty t, bool aDominant = false, TreatyEntry entry = TreatyEntry::NewTreaty);
+// The text of a "Treaty Enacted" entry about `other` (the history file finds
+// the empire by it: the entry also writes a contact line, spec 05 §3.4).
+std::string treatyEnactedText(const GameState& s, EmpireId other, Treaty t, std::string_view role = {});
+// Whether a log entry is a "Treaty Enacted" entry about `other`.
+bool treatyEnactedWith(const GameState& s, const LogEntry& l, EmpireId other);
+// Happiness.txt trigger for a new treaty, from `forEmpire`'s side.
+std::string_view treatyTrigger(Treaty t, bool dominant);
+bool inContact(const GameState& s, EmpireId a, EmpireId b);
+// Establishes contact both ways; logs first contact on each side that had
+// not met the other yet.
+void makeContact(TurnContext& ctx, EmpireId a, EmpireId b);
+// The log text of a first contact with `other` (the history file finds the
+// empire by it).
+std::string firstContactText(const GameState& s, EmpireId other);
+// The log text of a contact lost with `other` (likewise).
+std::string contactLostText(const GameState& s, EmpireId other);
+// Declare War (spec 05 §3.4): both sides are at War whatever the treaty was,
+// and both are told ("War Declared"), the sender only with `tellSender` (a
+// declaration `Politics - Fake Messages` makes in its name tells it nothing,
+// §2.3).
+void declareWar(TurnContext& ctx, EmpireId from, EmpireId to, bool tellSender = true);
+// A destroyed empire (spec 05 §6): every relation with it returns to "no
+// contact" (no contact, treaty None, trade counter 0) on both sides.
+void forgetEmpire(GameState& s, EmpireId gone);
+// The empire that `e` pays tariffs to (Subjugation/Protectorate), if any.
+EmpireId masterOf(const GameState& s, EmpireId e);
+// Whether `e` is a subjugated race: it holds a Subjugation as the subordinate
+// side (a Protectorate does not count). Its player can neither propose nor
+// accept a treaty, not even with its master (spec 05 §3.2, confirmed: binary).
+bool isSubjugated(const GameState& s, EmpireId e);
+// The treaties a Propose or Counter Treaty may name (spec 06 §4.2, confirmed:
+// binary): Non-Intercourse, Non-Aggression, Subjugation, Protectorate, Trade
+// Alliance, Trade and Research Alliance, Military Alliance and Partnership;
+// never War or None, so peace after a war is Non-Intercourse or better.
+bool proposableTreaty(Treaty t);
+// Why the original's Communicate window would not send `m` from `from`, or
+// empty when it would (spec 06 §4.2, confirmed: binary): a subjugated race
+// proposing or countering a treaty; a proposal naming a treaty that is not
+// proposable; Break Treaty below Non-Aggression; Declare War at war; a trade
+// with an empty side, or "Any" items on the side we give; a gift or tribute
+// with nothing in it or with "Any" items; a request for a gift or tribute
+// that names nothing; Surrender or the demand for it with Allow Surrender
+// off. The original checks these in the window only; the engine also checks
+// every message a player writes itself (cmd::SendMessage without `minister`)
+// so that a network player cannot get round the window (OpenSE4's).
+std::string playerMessageProblem(const GameState& s, EmpireId from, const DiplomaticMessage& m);
+// Whether `viewer` may see the treaty between `a` and `b` in the treaty grid
+// (spec 05 §3.2, spec 06 §1.5, confirmed: binary): its own treaties, and
+// those of empires it holds Non-Aggression or better with.
+bool treatyVisible(const GameState& s, EmpireId viewer, EmpireId a, EmpireId b);
+
+// ---- Colony cloaking (spec 01 §6.9, §14 Q44, confirmed: binary) ----------------------------------
+
+// The rest of a Decloak's step once the cloaked mark of a colony in `sys` is
+// cleared: sight is recalculated and the first-contact check runs in that
+// system (firstContactIn, with `onlySide` as there).
+void afterDecloak(TurnContext& ctx, SystemId sys, EmpireId onlySide = {});
+// Refreshes a colony's cloak and sensor levels (sight::recalculateColony).
+// A cloaked colony that can no longer cloak is decloaked by the Decloak
+// order's own step (afterDecloak). True when it was decloaked.
+bool recalculateColony(TurnContext& ctx, Colony& c, EmpireId onlySide = {});
+// Every colony, as every reading of a game file does: Load Game, a network
+// host started from a save, a play-by-e-mail game file opened by a player or
+// by the host, a hotseat game passing to the next player. After all are
+// recalculated, sight is recalculated once and the first-contact check runs
+// in each system where a colony decloaked.
+void recalculateColonies(const Rules& r, GameState& s);
+
+// ---- Ownership transfers (packages, surrender, defection, rebellion) ---------------------------
+
+void transferColony(GameState& s, ObjectId planet, EmpireId to);
+// A colony handed over by a package, a surrender or a `Planet - Population
+// Rebel` that joins the source: transferColony, and a new owner whose race
+// has `No Plagues` cures its plague at once, silently (spec 05 §3.4, §2.3,
+// confirmed: binary).
+void handOverColony(const Rules& r, GameState& s, ObjectId planet, EmpireId to);
+// A vehicle changes hands: it leaves its fleet, loses its orders and its
+// minister mark, and its system becomes explored for the new owner.
+void transferVehicle(GameState& s, VehicleId vehicle, EmpireId to);
+// Moves package items from `giver` to `receiver` (spec 05 §3.4, spec 06 §7
+// Q70, confirmed: binary), in package order, each item making its own log
+// entries, the receiver's first, then the giver's; an item no longer valid
+// is skipped without any entry. No game option is tested.
+void executePackage(TurnContext& ctx, EmpireId giver, EmpireId receiver, std::span<const PackageItem> items);
+// True if an item is an unfilled "Any" placeholder (no specific tech, planet, ...).
+bool isPlaceholder(const PackageItem& item);
+// A Surrender message (spec 05 §3.4, confirmed: binary), only with the Allow
+// Surrender game option on: every object of `from` passes to `to`, and the
+// systems where they lie become explored for it; its minerals, organics and
+// radioactives pass; `to` learns its designs and the designs it knew that
+// their owners can still build (dated now), and gains exactly one level in
+// every area where it is behind (allowed, visible to both, requirements met
+// by `from`). Both sides and the living empires in contact with either are
+// told. `from` stays alive, owning nothing, until its next destruction check.
+void surrender(TurnContext& ctx, EmpireId from, EmpireId to);
+
+// ---- Trade and tariffs (the economy's income and trade steps use these) ------------------------
+
+// An empire's production of the five kinds this turn: the base of trade and
+// the score (spec 05 §3.3, §5). What its colonies deliver to the treasury
+// (economy::empireProduction, spec 02 §5.5), without remote mining, Generate
+// Points or the income floor. Tariffs are cut from more (tariffDue).
+struct Generated {
+    Resources resources;
+    int64_t research = 0;
+    int64_t intelligence = 0;
+};
+Generated generated(const Rules& r, const GameState& s, EmpireId e);
+// The trade percentage between two empires (spec 05 §3.3): with Trade
+// Alliance or better, min(trade counter, `Maximum Trade Percentage`), else 0.
+int tradePercent(const Rules& r, const GameState& s, EmpireId e, EmpireId partner);
+// The receiver's trade factor F = 100 + (Political Savvy − 100) + its race's
+// `Trade` trait values + its culture's Trade value (spec 05 §3.3).
+int64_t tradeFactor(const Rules& r, const Empire& receiver);
+// One partner's contribution (confirmed: binary):
+// trunc(round(base × tradePercent / 100) × F / 100), never below 0.
+int64_t tradeShare(int64_t partnerBase, int tradePercent, int64_t factor);
+
+// What `e` receives this turn from trade with `partner` alone: the resources
+// from Trade Alliance up, research from Trade and Research Alliance up,
+// intelligence in a Partnership (the Empires window's Trade Amount, spec 06
+// §1.5).
+Generated tradeFrom(const Rules& r, const GameState& s, EmpireId e, EmpireId partner);
+// Resources `e` receives this turn from resource trade plus the tariffs of
+// its subjects and protectorates.
+Resources tradeIncome(const Rules& r, const GameState& s, EmpireId e);
+// The tariff part of tradeIncome (EconomyReport::tariffsIn).
+Resources tariffsReceived(const Rules& r, const GameState& s, EmpireId e);
+// Research points from Trade & Research Alliances and better.
+int64_t researchTradeIncome(const Rules& r, const GameState& s, EmpireId e);
+// Intelligence points from Partnerships (the economy adds them to its IP).
+int64_t intelTradeIncome(const Rules& r, const GameState& s, EmpireId e);
+// What `e` owes its master on each of its five incomes `income` (spec 05
+// §3.3, confirmed: binary): round(income × pct / 100), never more than the
+// income, with pct the treaty's `Treaty Subjugated/Protectorate Resource
+// Percentage`. The master receives the resources; the research and
+// intelligence parts are simply lost. The economy's income step takes it,
+// once, before the computer bonus (economy::collectIncome).
+Generated tariffOn(const Rules& r, const GameState& s, EmpireId e, const Generated& income);
+// The same on the empire's whole non-trade income this turn: colony
+// production after the income floor, remote mining and `Generate Points`
+// (economy::nonTradeIncome). Trade income is never taxed.
+Generated tariffDue(const Rules& r, const GameState& s, EmpireId e);
+// The resource part of tariffDue; the economy caps it at what the payer holds.
+Resources tariffsPaid(const Rules& r, const GameState& s, EmpireId e);
+
+} // namespace opense4::game::diplomacy

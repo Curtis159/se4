@@ -1,0 +1,24 @@
+{
+  "id": "./",
+  "name": "Space Empires IV",
+  "short_name": "Space Empires",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#09111d",
+  "theme_color": "#132035",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "purpose": "any",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "icon-512.png",
+      "purpose": "any",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "passed": true,
+  "evidence": [
+    "Do Nothing survives turns/save/load and is independent per shipyard lane",
+    "Adding construction clears Do Nothing while preserving Pause Construction",
+    "Occupied yard rejects Do Nothing atomically",
+    "Uncolonized worlds expose native survey values and race-specific capacities",
+    "Research unlock metadata and native queue estimates are present; even split defaults off",
+    "Counter-Intelligence 1 has no prerequisite; level 2 is locked; zero intelligence cannot progress",
+    "Custom colony type list persists natively",
+    "Actual colonization requests a colony type; setting it clears the request and persists after save/load"
+  ]
+}

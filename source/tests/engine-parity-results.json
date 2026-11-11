@@ -1,0 +1,210 @@
+{
+  "passed": true,
+  "engine": "all upstream opense4_game sources",
+  "toolchain": "Emscripten 4.0.19",
+  "allPresets": [
+    {
+      "file": "abbidon.emp",
+      "checksum": "5540089031825291227"
+    },
+    {
+      "file": "amonkrie.emp",
+      "checksum": "14931135450022672055"
+    },
+    {
+      "file": "cuecappa.emp",
+      "checksum": "10405686305926534535"
+    },
+    {
+      "file": "drushocka.emp",
+      "checksum": "3452469466424086873"
+    },
+    {
+      "file": "eee.emp",
+      "checksum": "9851155544463783036"
+    },
+    {
+      "file": "fazrah.emp",
+      "checksum": "6984255863305851366"
+    },
+    {
+      "file": "jraenar.emp",
+      "checksum": "6725134486827511483"
+    },
+    {
+      "file": "krill.emp",
+      "checksum": "13861927631399891657"
+    },
+    {
+      "file": "norak.emp",
+      "checksum": "6674330298201061216"
+    },
+    {
+      "file": "phong.emp",
+      "checksum": "6661844273535218844"
+    },
+    {
+      "file": "praetorian.emp",
+      "checksum": "17344873722319801535"
+    },
+    {
+      "file": "sallega.emp",
+      "checksum": "9906226455398236137"
+    },
+    {
+      "file": "sergetti.emp",
+      "checksum": "15925925215132306918"
+    },
+    {
+      "file": "terran.emp",
+      "checksum": "1963240628596350699"
+    },
+    {
+      "file": "ukratal.emp",
+      "checksum": "1297353809652048061"
+    },
+    {
+      "file": "xiati.emp",
+      "checksum": "16045094202279302692"
+    }
+  ],
+  "evidence": [
+    {
+      "file": "terran.emp",
+      "seed": 12345,
+      "turn": 1,
+      "checksum": "10835525969358764333",
+      "stockpile": [
+        32120,
+        22240,
+        22284
+      ]
+    },
+    {
+      "file": "terran.emp",
+      "seed": 12345,
+      "turn": 2,
+      "checksum": "16940974354803857345",
+      "stockpile": [
+        38180,
+        23360,
+        23426
+      ]
+    },
+    {
+      "file": "terran.emp",
+      "seed": 12345,
+      "turn": 3,
+      "checksum": "3252863848564284091",
+      "stockpile": [
+        44240,
+        24480,
+        24568
+      ]
+    },
+    {
+      "file": "eee.emp",
+      "seed": 7,
+      "turn": 1,
+      "checksum": "13962670492620340618",
+      "stockpile": [
+        31088,
+        22262,
+        22560
+      ]
+    },
+    {
+      "file": "eee.emp",
+      "seed": 7,
+      "turn": 2,
+      "checksum": "14896313831484741618",
+      "stockpile": [
+        36632,
+        23393,
+        23840
+      ]
+    },
+    {
+      "file": "eee.emp",
+      "seed": 7,
+      "turn": 3,
+      "checksum": "14071537334747165414",
+      "stockpile": [
+        42176,
+        24524,
+        25120
+      ]
+    },
+    {
+      "file": "xiati.emp",
+      "seed": 999,
+      "turn": 1,
+      "checksum": "18245278996311601907",
+      "stockpile": [
+        31536,
+        22216,
+        22560
+      ]
+    },
+    {
+      "file": "xiati.emp",
+      "seed": 999,
+      "turn": 2,
+      "checksum": "7809984571970847755",
+      "stockpile": [
+        37304,
+        23324,
+        23840
+      ]
+    },
+    {
+      "file": "xiati.emp",
+      "seed": 999,
+      "turn": 3,
+      "checksum": "3909030941307384459",
+      "stockpile": [
+        43072,
+        24432,
+        25120
+      ]
+    }
+  ],
+  "quickStart": [
+    {
+      "seed": 1,
+      "empires": 5,
+      "checksum": "6115849349299980544",
+      "turn1Checksum": "11707469580106586290"
+    },
+    {
+      "seed": 2,
+      "empires": 4,
+      "checksum": "1375204280640304611",
+      "turn1Checksum": "9848052043118356564"
+    },
+    {
+      "seed": 3,
+      "empires": 6,
+      "checksum": "10752390337612120900",
+      "turn1Checksum": "16168998730316366187"
+    },
+    {
+      "seed": 4,
+      "empires": 4,
+      "checksum": "1651596254853016346",
+      "turn1Checksum": "622129201967107382"
+    },
+    {
+      "seed": 5,
+      "empires": 5,
+      "checksum": "10522716194623062759",
+      "turn1Checksum": "4084549516797197676"
+    },
+    {
+      "seed": 12345,
+      "empires": 5,
+      "checksum": "8185768484004526020",
+      "turn1Checksum": "8227770801039366790"
+    }
+  ]
+}

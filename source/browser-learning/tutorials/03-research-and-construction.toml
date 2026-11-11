@@ -1,0 +1,32 @@
+# Browser adaptation of OpenSE4 learning topics; original sources retained upstream.
+title = "Research and construction"
+summary = "Fund technologies and keep independent production queues working."
+minutes = 15
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+starting_ships = ["Attack Ship"]
+[[step]]
+title = "Choose research"
+text = "Open Research. Choose one or more projects. Unlocks lists the equipment and abilities gained at the next level."
+done = { research_queued = 1 }
+[[step]]
+title = "Allocate the points"
+text = "Check the unallocated total. Add projects until all useful points are funded. Split points evenly shares funding; otherwise earlier projects are funded first."
+[[step]]
+title = "Choose construction"
+text = "Open Colonies or select your homeworld on the map. Add a facility, unit, or ship to an appropriate queue. If a facility cannot fit, scrap an unwanted one first."
+done = { construction_queued = 1 }
+[[step]]
+title = "Independent yards"
+text = "The planet builds facilities and units independently of its shipyards. With multiple yard facilities, choose Combined for speed or Separate to build different ships in parallel."
+[[step]]
+title = "Process the turn"
+text = "Complete or skip the blue-button tasks and end one turn."
+done = { turns_passed = 1 }
+[[step]]
+title = "Read the results"
+text = "Open Log. Return to the queues to see paid progress or completed construction."
+done = { window = "log" }

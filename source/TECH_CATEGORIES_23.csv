@@ -1,0 +1,86 @@
+﻿order,technology,proposedCategory,originalGroup,maximumLevel,access,prerequisites,description
+1,Rock Planet Colonization,Expansion & Colonies,Applied Science,1,Standard,None,Creation of colonies which can survive on rock based planets.
+2,Ice Planet Colonization,Expansion & Colonies,Applied Science,1,Standard,None,Creation of colonies which can survive on ice based planets.
+3,Gas Giant Colonization,Expansion & Colonies,Applied Science,1,Standard,None,Creation of colonies which can survive within gas giant planets.
+4,Ship Construction,"Ships, Units & Logistics",Applied Science,9,Standard,None,The construction of starships and their support components.
+5,Base Construction,"Ships, Units & Logistics",Applied Science,3,Standard,None,The construction of bases which exist completely in space.
+6,Fighters,"Ships, Units & Logistics",Applied Science,5,Standard,Construction 1,The construction of fighter vehicles and their support components.
+7,Troops,"Ships, Units & Logistics",Applied Science,3,Standard,Construction 1,The construction of ground troops used to capture planets.
+8,Mines,"Ships, Units & Logistics",Applied Science,5,Standard,Construction 1,The construction of small space mines.
+9,Weapon Platforms,"Ships, Units & Logistics",Applied Science,3,Standard,None,The construction of planet-based weapons platforms.
+10,Satellites,"Ships, Units & Logistics",Applied Science,3,Standard,None,The construction of satellites to be dropped in space.
+11,Space Yards,"Ships, Units & Logistics",Applied Science,3,Standard,None,"Technology to construct Space Yards, which in turn construct all the structures and vehicles for an empire."
+12,Cargo,"Ships, Units & Logistics",Applied Science,3,Standard,None,The ability to store and transport cargo through space.
+13,Repair,"Ships, Units & Logistics",Applied Science,3,Standard,None,The ability to repair damage to ships and bases in space.
+14,Resupply,"Ships, Units & Logistics",Applied Science,5,Standard,None,Equipment necessary to resupply ship in space.
+15,Propulsion,"Ships, Units & Logistics",Applied Science,12,Standard,None,The use of ions to propel a starship through space.
+16,Armor,"Defense, Detection & Combat Systems",Applied Science,6,Standard,Chemistry 1,Standard alloy based armor used on the exterior of a starship.
+17,Shields,"Defense, Detection & Combat Systems",Applied Science,10,Standard,Physics 1,Protective energy barrier which surrounds a starship or base.
+18,Cloaking,"Defense, Detection & Combat Systems",Applied Science,3,Standard,Physics 3,Stealth technology which defeats EM Passive sensors.
+19,Sensors,"Defense, Detection & Combat Systems",Applied Science,6,Standard,Physics 1,Sensors which detect objects in space by analyzing incoming electro-magnetic waves.
+20,Scanners,"Defense, Detection & Combat Systems",Applied Science,3,Standard,Physics 2,Scanners which can analyze details of other starships.
+21,Combat Support,"Defense, Detection & Combat Systems",Applied Science,4,Standard,Military Science 1,Technology used to aid ships during combat.
+22,Computers,"Ships, Units & Logistics",Applied Science,6,Standard,Industry 1,Advanced computer technology used for storage and processing.
+23,Resource Manipulation,Economy & Industry,Applied Science,3,Standard,Chemistry 2,Technology to convert resources from one type to another.
+24,Minerals Extraction,Economy & Industry,Applied Science,9,Standard,None,The ability to extract minerals from a planet.
+25,Organics Extraction,Economy & Industry,Applied Science,9,Standard,None,The ability to grow and cultivate organic materials on a planet.
+26,Radioactives Extraction,Economy & Industry,Applied Science,9,Standard,None,The ability to locate and refine radioactive materials within a planet.
+27,Stellar Manipulation,Stellar Engineering,Applied Science,8,Standard,Astrophysics 1,Technology to manipulate spatial bodies.
+28,Applied Research,Science & Special Research,Applied Science,3,Standard,None,The capability of an empire to research new technologies.
+29,Applied Intelligence,Intelligence & Diplomacy,Applied Science,4,Standard,None,The capability of an empire to gather and perform intelligence actions.
+30,Medical Technology,Expansion & Colonies,Applied Science,5,Standard,Biology 1,Medical science to manipulate organic materials.
+31,Organic Technology,Science & Special Research,Applied Science,6,Racial: Organic,Organic Engineering 1,Advanced utilization of organic forms to create structures.
+32,Psychic Technology,Science & Special Research,Applied Science,6,Racial: Psychic,Psychic Studies 1,Psychic ability to detect other beings and read their thoughts.
+33,Religious Technology,Science & Special Research,Applied Science,4,Racial: Religious,Religious Studies 1,The specific utilization of religion to achieve goals.
+34,Temporal Technology,Science & Special Research,Applied Science,6,Racial: Temporal,Temporal Studies 1,Science of altering time streams to produce specific results.
+35,Crystalline Technology,Science & Special Research,Applied Science,6,Racial: Crystalline,Crystallurgy 1,Science of using crystalline materials for construction of devices.
+36,Planet Utilization,Expansion & Colonies,Applied Science,9,Standard,Planetary Engineering 1,Science governing understanding and utilization of a planets resources.
+37,Advanced Military Science,"Defense, Detection & Combat Systems",Applied Science,6,Standard,Military Science 2,"The training, study, and improvement of martial practices."
+38,Applied Political Science,Intelligence & Diplomacy,Applied Science,3,Standard,Psychology 1,The process of government and its execution.
+39,Astrophysics,Science & Special Research,Theoretical Science,2,Standard,None,The science of astronomy dealing with the physical properties of the universe.
+40,Biology,Science & Special Research,Theoretical Science,1,Standard,None,Science which deals with the processes and physical characteristics of all life forms.
+41,Chemistry,Science & Special Research,Theoretical Science,2,Standard,None,The science dealing with the composition and properties of substances.
+42,Construction,Economy & Industry,Theoretical Science,1,Standard,None,The science of constructing vehicles and buildings.
+43,Crystallurgy,Science & Special Research,Theoretical Science,1,Racial: Crystalline,None,The science of manipulating crystals and their resonance waves.
+44,Industry,Economy & Industry,Theoretical Science,1,Standard,None,The science of creating and utilizing large scale manufacturing machinery.
+45,Military Science,"Defense, Detection & Combat Systems",Theoretical Science,2,Standard,None,"The science of military practices and the strategic, tactical, and logistic theories that determine them."
+46,Organic Engineering,Science & Special Research,Theoretical Science,1,Racial: Organic,None,The technology of designing and creating organic forms to serve specific needs.
+47,Physics,Science & Special Research,Theoretical Science,4,Standard,None,The science dealing with the properties and interactions of matter and energy.
+48,Planetary Engineering,Expansion & Colonies,Theoretical Science,1,Standard,None,The science of designing and manipulating a planetary habitat.
+49,Psychic Studies,Science & Special Research,Theoretical Science,2,Racial: Psychic,None,The science of mental abilities and interaction.
+50,Psychology,Science & Special Research,Theoretical Science,1,Standard,None,The science dealing with the mind and with mental and emotional processes.
+51,Religious Studies,Science & Special Research,Theoretical Science,1,Racial: Religious,None,The study of religions and belief systems.
+52,Temporal Studies,Science & Special Research,Theoretical Science,2,Racial: Temporal,None,The study of temporal phenomenon and manipulation.
+53,Energy Stream Weapons,Weapons & Ship Capture,Weapon Technology,12,Standard,Physics 1,Weapons employing a continuous stream of energy.
+54,Energy Pulse Weapons,Weapons & Ship Capture,Weapon Technology,6,Standard,Physics 1,Weapons which fire bursts of intense energy at enemy ships.
+55,Missile Weapons,Weapons & Ship Capture,Weapon Technology,7,Standard,None,Guided missile weapons which seek after and hit enemy ships.
+56,Projectile Weapons,Weapons & Ship Capture,Weapon Technology,5,Standard,None,Weapons which fire projectiles at other ships.
+57,Torpedo Weapons,Weapons & Ship Capture,Weapon Technology,10,Standard,Military Science 1,Seeking torpedo which homes in and detonates against enemy vessels.
+58,High-Energy Discharge Weapons,Weapons & Ship Capture,Weapon Technology,10,Standard,Propulsion 7,Weapons which employ massive energy releases to damage enemy ships.
+59,Phased-Energy Weapons,Weapons & Ship Capture,Weapon Technology,5,Standard,Physics 2,Weapons using phased-energy to bypass normal shields.
+60,Point-Defense Weapons,"Defense, Detection & Combat Systems",Weapon Technology,5,Standard,Military Science 1,Weapons which specifically target and destroy incoming seekers.
+61,Shield Damaging Weapons,Weapons & Ship Capture,Weapon Technology,10,Standard,Shields 4,Weapons designed to damage shields and their generators.
+62,Tractor\Repulser Weapons,Weapons & Ship Capture,Weapon Technology,9,Standard,Astrophysics 1,Weapons which move enemy vessels through space.
+63,Weapon Overloading Weapons,Weapons & Ship Capture,Weapon Technology,5,Standard,Military Science 2,Weapons designed to damage weapons on enemy ships.
+64,Engine Overloading Weapons,Weapons & Ship Capture,Weapon Technology,10,Standard,Propulsion 4,Weapons which overload and destroy the engines on enemy ships.
+65,Gravitational Weapons,Weapons & Ship Capture,Weapon Technology,5,Standard,Astrophysics 2,Weapons which use gravitational forces to rip enemy ships apart.
+66,Warp Weapons,Weapons & Ship Capture,Weapon Technology,3,Standard,Physics 4,Weapons which create small warp points at the location of their targets.
+67,Biological Weapons,Weapons & Ship Capture,Weapon Technology,5,Standard,Biology 1,Biological weapons which attack by means of viruses and plagues.
+68,Planetary Weapons,Weapons & Ship Capture,Weapon Technology,10,Standard,None,Weapons designed to damage planets and their inhabitants.
+69,Ship Capture,Weapons & Ship Capture,Weapon Technology,5,Standard,Military Science 2,Technology used to board and conquer other ships.
+70,Temporal Weapons,Weapons & Ship Capture,Weapon Technology,7,Racial: Temporal,Temporal Studies 2,Weapons which use temporal manipulation to cause ill effects.
+71,Psychic Weapons,Weapons & Ship Capture,Weapon Technology,6,Racial: Psychic,Psychic Studies 2,Weapons which use psychic energy to manipulate people and ships.
+72,Computer Combat,"Defense, Detection & Combat Systems",Weapon Technology,3,Standard,Computers 4,The ability to attack the computer components of another ship.
+73,Null-Space Weapons,Weapons & Ship Capture,Weapon Technology,3,Standard,Astrophysics 2,Weapons which cause rifts of null-space where they hit.
+74,Organic Weapons,Weapons & Ship Capture,Weapon Technology,10,Racial: Organic,Organic Engineering 1,Weapons using organic materials and delivery methods.
+75,Crystalline Weapons,Weapons & Ship Capture,Weapon Technology,10,Racial: Crystalline,Crystallurgy 1,Weapons using the directed resonance waves of crystals.
+76,Troop Weapons,Weapons & Ship Capture,Weapon Technology,3,Standard,Troops 1,Weapons employed by troops on a planet's surface.
+77,Explosive Warheads,Weapons & Ship Capture,Weapon Technology,3,Standard,None,Warheads which cause damage to enemy ships upon exploding.
+78,Smaller Weapons,Weapons & Ship Capture,Weapon Technology,3,Standard,None,Normal ship based weapons miniaturized to fit on smaller vehicles.
+79,Massive Shield Depleting Weapons,Weapons & Ship Capture,Weapon Technology,1,Special unlock: 1,None,Weapons designed to deplete all of a target's shields.
+80,Massive Engine Destroying Weapons,Weapons & Ship Capture,Weapon Technology,1,Special unlock: 2,None,Weapons which destroy all of the engines on enemy ships.
+81,Neural Computer Interface,"Ships, Units & Logistics",Applied Science,1,Special unlock: 3,None,Advanced computer interface which connects ships during combat.
+82,Massive Planetary Shielding,"Defense, Detection & Combat Systems",Applied Science,1,Special unlock: 4,None,Massive shield generators which can protect an entire planet.
+83,Gravitational Technology,Stellar Engineering,Applied Science,3,Standard,Astrophysics 2,Science of manipulating gravity fields.
+84,Stellar Harnessing,Economy & Industry,Applied Science,6,Standard,Astrophysics 1,Science of utilizing the energy of stars.
+85,Drones,"Ships, Units & Logistics",Applied Science,3,Standard,None,The construction of small self-directed space vehicles.

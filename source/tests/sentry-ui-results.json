@@ -1,0 +1,8 @@
+{
+  "passed": true,
+  "evidence": [
+    "Sentry works from Ships card and map action bar through actual WASM",
+    "Status label visible while waiting; Explore replaces order and removes label",
+    "Colony ship manifest lists all owned vehicles, expands parts/cargo, retains open state and navigates to exact ship/system"
+  ]
+}

@@ -1,0 +1,32 @@
+# Browser adaptation of OpenSE4 learning topics; original sources retained upstream.
+title = "Exploring and colonizing"
+summary = "Explore warp points and settle another world."
+minutes = 15
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+starting_ships = ["Attack Ship", "Colony"]
+[[step]]
+title = "Find your ships"
+text = "Open Maps and tap a sector with your ships. Select one of the attack ships."
+done = { selected = "ship" }
+[[step]]
+title = "Explore"
+text = "Choose Explore in its action bar. This finds a route to an unexplored warp point."
+done = { order = "explore" }
+[[step]]
+title = "Reach new systems"
+text = "End turns until you have explored a second system. Keep giving Explore orders when a ship becomes idle."
+done = { systems_explored = 2 }
+[[step]]
+title = "Choose a world"
+text = "Green symbols mark breathable worlds; red symbols mark worlds that need domes. Both require the appropriate colony technology. Tap a world to inspect it."
+[[step]]
+title = "Settle"
+text = "Select the colony ship, choose Colonize and tap a suitable world. End turns until your empire owns two colonies. The engine handles population loading when it can."
+done = { colonies = 2 }
+[[step]]
+title = "Start production"
+text = "Select the new colony on the map. Its planetary queue builds facilities and units; a working shipyard adds a separate ship queue."

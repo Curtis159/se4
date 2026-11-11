@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "runtime": "actual packaged WASM worker + DOM events",
+  "evidence": [
+    "Built ship supplies real portrait, movement, intact/total component state and blue supply progress",
+    "Components and cargo disclosures work in Ships and map selection",
+    "Planet Labor Focus selected through real construction UI and appears in colony summary"
+  ]
+}

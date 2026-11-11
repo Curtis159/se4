@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "runtime": "mock Supabase REST + actual packaged WASM; no live deployment or push sent",
+  "evidence": [
+    "notification deep link automatically retrieves and loads authenticated save",
+    "ending turn automatically uploads save with revision guard",
+    "no manual file download or file selection"
+  ]
+}

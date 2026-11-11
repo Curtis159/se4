@@ -1,0 +1,1534 @@
+#include "game/ai.hpp"
+
+#include "datafile/datafile.hpp"
+#include "game/ai_planner.hpp"
+#include "game/economy.hpp"
+#include "game/generate.hpp"
+#include "game/query.hpp"
+#include "game/score.hpp"
+#include "game/setup.hpp"
+#include "game/xmath.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <deque>
+#include <format>
+#include <tuple>
+
+namespace opense4::game::ai {
+
+namespace detail {
+
+using datafile::keysEqual;
+
+namespace {
+
+uint64_t mix(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+bool designHas(const Rules& r, const Design& d, AbilityKind k) {
+    for (const auto& en : d.entries)
+        if (hasAbility(r.componentAbilities(en.component), k)) return true;
+    return false;
+}
+
+// Which empires own any object in each system, seen or not (spec 05 §7.5
+// colonization danger, confirmed: binary). Index: empire × systems + system.
+std::vector<uint8_t> presence(const GameState& s) {
+    const size_t nSys = s.galaxy.systems.size();
+    std::vector<uint8_t> present(s.empires.size() * nSys, 0);
+    for (const auto& c : s.colonies)
+        if (c && c->owner.valid() && c->owner.index() < s.empires.size()) present[c->owner.index() * nSys + s.galaxy.object(c->planet).system.index()] = 1;
+    for (const Vehicle& v : s.vehicles)
+        if (v.count > 0 && v.owner.valid() && v.owner.index() < s.empires.size() && v.location.system.index() < nSys)
+            present[v.owner.index() * nSys + v.location.system.index()] = 1;
+    return present;
+}
+
+// "Larger" in the colonization order (spec 05 §7.5, confirmed: binary): the
+// planet size's `Stellar Size`, so Ringworlds and Sphereworlds, Huge in the
+// stock data, tie with Huge planets. A size the five names do not hold ranks
+// below Tiny (inferred).
+int sizeRank(const Rules& r, const SpaceObject& planet) {
+    static constexpr std::array<std::string_view, 5> kSizes{"Tiny", "Small", "Medium", "Large", "Huge"};
+    std::string_view name = planet.size;
+    if (const ruleset::PlanetSize* ps = planetSize(r, planet)) name = ps->stellarSize;
+    for (size_t i = 0; i < kSizes.size(); ++i)
+        if (keysEqual(name, kSizes[i])) return static_cast<int>(i);
+    return -1;
+}
+
+
+bool hasRuins(const SpaceObject& planet) {
+    for (const auto& a : planet.abilities)
+        if (auto k = parseAbilityKind(a.type); k == AbilityKind::AncientRuins || k == AbilityKind::AncientRuinsUnique) return true;
+    return false;
+}
+
+int64_t bestDamage(const Rules& r, const DesignEntry& en) {
+    int best = 0;
+    for (int range = 1; range <= std::max(1, weaponMaxRange(r, en)); ++range) best = std::max(best, weaponDamageAtRange(r, en, range));
+    return best;
+}
+
+// The ratings (without the + 1) of every object in a sector that is not ours, whoever owns it.
+int64_t foreignRatingsAt(const Rules& r, const GameState& s, EmpireId us, Location where) {
+    int64_t sum = 0;
+    for (const Vehicle& v : s.vehicles)
+        if (v.count > 0 && v.owner != us && v.location == where) sum += vehicleRating(r, s, v);
+    return sum;
+}
+
+} // namespace
+
+// ---- Situation ---------------------------------------------------------------------------------
+
+// A colonization target's planet value (spec 05 §7.5 *Order* 6, confirmed:
+// binary): the three resource values, each × 1000 unless the game uses
+// finite resources; for a hostile colony without population also 100 per
+// population unit, 1,000,000 per facility, 10,000 per cargo unit and
+// 1,000,000,000 for a capital (the flag's meaning was not traced; taken as
+// the trade value's capital, inferred). The sum is taken in single precision,
+// each addition stored as a 32-bit float, and compared as a whole number.
+int64_t colonyTargetValue(const GameState& s, const SpaceObject& planet, const Colony* taken) {
+    xmath::Ext sum;
+    auto add = [&](int64_t v) { sum = (sum + xmath::Ext(v)).roundedTo(xmath::kSingleBits); };
+    const int64_t scale = s.options.finiteResources ? 1 : 1000;
+    for (size_t k = 0; k < 3; ++k) add(int64_t{planet.value[k]} * scale);
+    if (taken) {
+        add(100 * taken->totalPopulation());
+        add(1'000'000 * static_cast<int64_t>(taken->facilities.size()));
+        int64_t cargo = taken->cargo.totalPopulation();
+        for (const UnitStack& u : taken->cargo.units) cargo += std::max(0, u.count);
+        add(10'000 * cargo);
+        if (taken->homeworld) add(1'000'000'000);
+    }
+    return sum.trunc();
+}
+
+// The planet's defence in an attack candidate's value (spec 05 §7.2,
+// confirmed: binary), in tenths: its colony's Planet - Shield Generation
+// total / 5, its population in millions div 100, and for every unit stack in
+// its cargo count × that design's summed best weapon damage.
+int64_t planetDefence(const Rules& r, const GameState& s, const Colony& c) {
+    int64_t tenths = sumValue1(colonyAbilities(r, s, c), AbilityKind::PlanetShieldGeneration) * kStrengthScale / 5;
+    tenths += c.totalPopulation() / 100 * kStrengthScale;
+    for (const UnitStack& u : c.cargo.units)
+        if (u.count > 0 && u.design.index() < s.designs.size()) tenths += int64_t{u.count} * designWeaponDamage(r, s.design(u.design)) * kStrengthScale;
+    return tenths;
+}
+
+std::vector<const Vehicle*> ministersFleet(const GameState& s, const Fleet& f) {
+    std::vector<const Vehicle*> out;
+    for (VehicleId id : fleetMembersAt(s, f))
+        if (const Vehicle* v = s.vehicle(id)) out.push_back(v);
+    std::sort(out.begin(), out.end(), [](const Vehicle* a, const Vehicle* b) { return std::pair(a->arrival, a->id) < std::pair(b->arrival, b->id); });
+    return out;
+}
+
+const Vehicle* ministersLeader(const GameState& s, const Fleet& f) {
+    const std::vector<const Vehicle*> members = ministersFleet(s, f);
+    return members.empty() ? nullptr : members.front();
+}
+
+bool hostileTo(const Empire& e, EmpireId other) {
+    if (!other.valid() || other == e.id || other.index() >= e.relations.size()) return false;
+    const Relation& rel = e.relation(other);
+    return !rel.contact || treatyIsHostile(rel.treaty);
+}
+
+SystemId homeSystem(const GameState& s, EmpireId e) {
+    if (e.valid() && e.index() < s.empires.size() && s.empire(e).homeSystem.index() < s.galaxy.systems.size()) return s.empire(e).homeSystem;  // recorded at creation
+    SystemId first;
+    for (const auto& c : s.colonies) {
+        if (!c || c->owner != e) continue;
+        if (c->homeworld) return s.galaxy.object(c->planet).system;
+        if (!first.valid()) first = s.galaxy.object(c->planet).system;
+    }
+    return first;
+}
+
+bool notices(const GameState& s, EmpireId e, uint64_t object) {
+    if (difficultyOf(s, e) != kDifficultyLow) return true;
+    const uint64_t h = mix(mix(mix(s.seed ^ 0x4E6F74696365ull) ^ s.turn) ^ (uint64_t{e.value} << 32) ^ object);
+    return h % 100 < 90;
+}
+
+int64_t designWeaponDamage(const Rules& r, const Design& d) {
+    int64_t n = 0;
+    for (const DesignEntry& en : d.entries)
+        if (en.component < r.data().components.size() && r.component(en.component).isWeapon()) n += bestDamage(r, en);
+    return n;
+}
+
+// Spec 05 §7.2 (confirmed: binary): W is the best damage at any range summed
+// over the undamaged weapon parts, B the Boarding Attack ability; when W + B
+// > 0 the rating is W + B + (Shield Generation + Phased Shield Generation +
+// Planet - Shield Generation) / 2, the half kept; then every fighter stack in
+// the cargo adds count × the fighter design's summed best weapon damage, even
+// when W + B is 0. The abilities are the vehicle's ability list (undamaged
+// parts, mounts applied; none while mothballed).
+int64_t vehicleRating(const Rules& r, const GameState& s, const Vehicle& v) {
+    if (isUnitType(vehicleType(r, s, v))) return kStrengthScale * std::max(0, v.count);  // a unit group: its number of units
+    const Design& d = s.design(v.design);
+    int64_t weapons = 0;
+    for (size_t i = 0; i < d.entries.size(); ++i)
+        if (entryIntact(r, s, v, i) && r.component(d.entries[i].component).isWeapon()) weapons += bestDamage(r, d.entries[i]);
+    const std::vector<ParsedAbility> ab = vehicleAbilities(r, s, v);
+    const int64_t boarding = sumValue1(ab, AbilityKind::BoardingAttack);
+    const int64_t shields = sumValue1(ab, AbilityKind::ShieldGeneration) + sumValue1(ab, AbilityKind::PhasedShieldGeneration) +
+                            sumValue1(ab, AbilityKind::PlanetShieldGeneration);
+    int64_t rating = 0;
+    if (weapons + boarding > 0) rating = (weapons + boarding) * kStrengthScale + shields * kStrengthScale / 2;
+    for (const UnitStack& u : v.cargo.units)
+        if (u.count > 0 && u.design.index() < s.designs.size() && r.hull(s.design(u.design).hull).type == ruleset::VehicleType::Fighter)
+            rating += int64_t{u.count} * designWeaponDamage(r, s.design(u.design)) * kStrengthScale;
+    return rating;
+}
+
+std::vector<int> jumpsOver(const GameState& s, SystemId from) {
+    std::vector<int> dist(s.galaxy.systems.size(), kUnreachable);
+    if (!from.valid() || from.index() >= dist.size()) return dist;
+    std::deque<SystemId> queue{from};
+    dist[from.index()] = 0;
+    while (!queue.empty()) {
+        const SystemId at = queue.front();
+        queue.pop_front();
+        for (SystemId to : s.galaxy.neighbors(at)) {
+            if (to.index() >= dist.size() || dist[to.index()] != kUnreachable) continue;
+            dist[to.index()] = dist[at.index()] + 1;
+            queue.push_back(to);
+        }
+    }
+    return dist;
+}
+
+std::vector<SystemId> computeTerritory(const GameState& s, EmpireId id) {
+    const Empire& e = s.empire(id);
+    const size_t nSys = s.galaxy.systems.size();
+    // 0: not claimed, 1: a neighbour system, 2: a system holding one of our colonies.
+    std::vector<uint8_t> mine(nSys, 0);
+    for (const auto& c : s.colonies)
+        if (c && c->owner == id) mine[s.galaxy.object(c->planet).system.index()] = 2;
+    if (!isNeutral(e)) {
+        // One warp jump over every link of the map, known or not (spec 05 §7.2).
+        for (size_t i = 0; i < nSys; ++i) {
+            if (mine[i] != 2) continue;
+            for (SystemId nb : s.galaxy.neighbors(SystemId{i}))
+                if (nb.index() < nSys && mine[nb.index()] == 0) mine[nb.index()] = 1;
+        }
+        // Only the neighbour systems leave out the home system of a computer
+        // player and the systems we agreed to leave: a system holding one of
+        // our colonies is always claimed (confirmed: binary).
+        auto leaveOut = [&](SystemId sys) {
+            if (sys.index() < nSys && mine[sys.index()] == 1) mine[sys.index()] = 0;
+        };
+        for (const Empire& other : s.empires)
+            if (other.alive && other.kind != PlayerKind::Human) leaveOut(homeSystem(s, other.id));
+        for (SystemId sys : e.aiMemory.avoid) leaveOut(sys);
+    }
+    std::vector<SystemId> out;
+    for (size_t i = 0; i < nSys; ++i)
+        if (mine[i]) out.push_back(SystemId{i});
+    return out;
+}
+
+std::vector<SystemId> territoryOf(const GameState& s, EmpireId id) {
+    std::vector<SystemId> out;
+    for (SystemId sys : s.empire(id).claimedSystems)
+        if (sys.index() < s.galaxy.systems.size()) out.push_back(sys);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+// The defend-list order (spec 05 §7.2, confirmed: binary): the threats are
+// compared as whole numbers; "a sector holding a planet first, the weaker
+// threat first" is the key 10,100 − threat for such a sector against 0 for
+// the others, the higher first, so a planet sector whose threat is 10,100 or
+// more loses its place before the others. The ministers' sort is not stable.
+void sortDefendEntries(std::vector<DefendEntry>& entries, bool weakestFirst) {
+    ministersSort(entries, [&](const DefendEntry& a, const DefendEntry& b) {
+        const int64_t ta = a.threat / kStrengthScale, tb = b.threat / kStrengthScale;
+        if (const int k = threeWay(a.jumps, b.jumps)) return k;
+        if (const int k = threeWay(b.ourMaxPopulation, a.ourMaxPopulation)) return k;
+        const int64_t pa = a.planetSector ? 10'100 - ta : 0, pb = b.planetSector ? 10'100 - tb : 0;
+        if (const int k = threeWay(pb, pa)) return k;
+        return weakestFirst ? threeWay(ta, tb) : threeWay(tb, ta);
+    });
+}
+
+// Fewest jumps, the highest anger, the highest value compared as a whole
+// number; the ministers' sort is not stable (confirmed: binary).
+void sortCandidates(std::vector<Candidate>& candidates) {
+    ministersSort(candidates, [](const Candidate& a, const Candidate& b) {
+        if (const int k = threeWay(a.jumps, b.jumps)) return k;
+        if (const int k = threeWay(b.anger, a.anger)) return k;
+        return threeWay(b.value / kStrengthScale, a.value / kStrengthScale);
+    });
+}
+
+void sortCandidatesBy(std::vector<Candidate>& candidates, const std::vector<int>& anger) {
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.built < b.built; });
+    for (Candidate& c : candidates)
+        if (c.owner.index() < anger.size()) c.anger = anger[c.owner.index()];
+    sortCandidates(candidates);
+}
+
+std::vector<const Candidate*> candidatesAsBuilt(const std::vector<Candidate>& candidates) {
+    std::vector<const Candidate*> out;
+    out.reserve(candidates.size());
+    for (const Candidate& c : candidates) out.push_back(&c);
+    std::sort(out.begin(), out.end(), [](const Candidate* a, const Candidate* b) { return a->built < b->built; });
+    return out;
+}
+
+Situation assess(const Rules& r, const GameState& s, EmpireId id, const AiProfile& prof) {
+    const Empire& e = s.empire(id);
+    const size_t nSys = s.galaxy.systems.size();
+    const size_t nEmp = s.empires.size();
+    const bool neutral = isNeutral(e);
+    Situation sit;
+    sit.home = homeSystem(s, id);
+    if (!sit.home.valid())
+        for (const Vehicle& v : s.vehicles)
+            if (v.owner == id) {
+                sit.home = v.location.system;
+                break;
+            }
+    auto considered = [&](SystemId sys) { return !neutral || sys == sit.home; };
+
+    // The territory is the set of systems the empire claims (spec 05 §7.2).
+    // A computer player's Politics minister claims after this assessment
+    // (ai::claimTerritory), so it is the set claimed during the previous turn.
+    sit.territory.assign(nSys, 0);
+    for (SystemId sys : territoryOf(s, id)) sit.territory[sys.index()] = 1;
+
+    // Strength of every empire per system, counting everything it owns, in
+    // tenths: each object its rating + 1, planets rating 0 (spec 05 §7.2).
+    std::vector<int64_t> strength(nEmp * nSys, 0);
+    for (const Vehicle& v : s.vehicles) {
+        if (!v.owner.valid() || v.owner.index() >= nEmp || v.location.system.index() >= nSys || v.count <= 0) continue;
+        strength[v.owner.index() * nSys + v.location.system.index()] += vehicleRating(r, s, v) + kStrengthScale;
+    }
+    for (const auto& c : s.colonies)
+        if (c && c->owner.valid() && c->owner.index() < nEmp)
+            strength[c->owner.index() * nSys + s.galaxy.object(c->planet).system.index()] += kStrengthScale;
+    sit.ours.assign(nSys, 0);
+    sit.hostile.assign(nSys, 0);
+    for (size_t i = 0; i < nSys; ++i) sit.ours[i] = strength[id.index() * nSys + i];
+    for (const Empire& x : s.empires) {
+        if (x.id == id || !x.alive || !e.relation(x.id).contact || !treatyIsHostile(e.relation(x.id).treaty)) continue;
+        for (size_t i = 0; i < nSys; ++i) sit.hostile[i] += strength[x.id.index() * nSys + i];
+    }
+
+    // Jumps from home over every link, known or not (spec 05 §7.2).
+    sit.homeJumps = jumpsOver(s, sit.home);
+    auto jumps = [&](SystemId sys) { return sit.homeJumps[sys.index()]; };
+
+    // Enemy in territory and enemy nearby.
+    for (VehicleId vid : e.knowledge.visibleVehicles) {
+        const Vehicle* v = s.vehicle(vid);
+        if (!v || v->count <= 0 || !hostileTo(e, v->owner)) continue;
+        const SystemId sys = v->location.system;
+        if (sys.index() >= nSys || !sit.territory[sys.index()] || !considered(sys) || !notices(s, id, vehicleKey(vid))) continue;
+        Threat t{sys, v->owner, vid, {}};
+        if (vehicleType(r, s, *v) == ruleset::VehicleType::Mine) sit.enemyNearby.push_back(t);
+        else sit.enemyInTerritory.push_back(t);
+    }
+    for (const auto& c : s.colonies) {
+        if (!c || !hostileTo(e, c->owner) || c->totalPopulation() <= 0) continue;
+        const SystemId sys = s.galaxy.object(c->planet).system;
+        if (!sit.territory[sys.index()] || !e.hasExplored(sys) || !considered(sys) || !notices(s, id, planetKey(c->planet))) continue;
+        sit.enemyInTerritory.push_back({sys, c->owner, {}, c->planet});
+    }
+
+    // Attack candidates (spec 05 §7.2, confirmed: binary): other empires'
+    // planets in systems we have explored, each one noticed, kept only when we
+    // could settle a planet of its kind (canSettle: the colony module for its
+    // surface and the game's breathable and home-type options) or its owner
+    // is below None with us (at War or Non-Intercourse, or not met). Each is
+    // valued by the foreign ratings in the planet's sector plus its defence,
+    // and only a kept one adds its rating + 1 (a planet's: 1) a second time
+    // to its owner's strength in that system, so to the hostile strength
+    // there when we have met that hostile owner.
+    for (const auto& c : s.colonies) {
+        if (!c || c->owner == id || !c->owner.valid() || c->owner.index() >= nEmp) continue;
+        const SystemId sys = s.galaxy.object(c->planet).system;
+        if (!e.hasExplored(sys) || !considered(sys)) continue;
+        if (hostileTo(e, c->owner) && !notices(s, id, planetKey(c->planet))) continue;
+        const Relation& rel = e.relation(c->owner);
+        const bool belowNone = !rel.contact || rel.treaty == Treaty::War || rel.treaty == Treaty::NonIntercourse;
+        if (!belowNone && !canSettle(r, s, e, s.galaxy.object(c->planet))) continue;
+        const int64_t value = foreignRatingsAt(r, s, id, locationOf(s.galaxy, c->planet)) + planetDefence(r, s, *c);
+        sit.candidates.push_back({c->planet, sys, c->owner, jumps(sys), rel.anger, value, static_cast<uint32_t>(sit.candidates.size())});
+        if (rel.contact && treatyIsHostile(rel.treaty) && s.empire(c->owner).alive) sit.hostile[sys.index()] += kStrengthScale;
+    }
+    sortCandidates(sit.candidates);
+
+    // The exploration frontier (spec 05 §7.2, confirmed: binary): the warp
+    // points of explored systems whose far system we have not explored,
+    // whether or not we know where the link leads. A point is free when none
+    // of our ships is headed for it.
+    std::set<ObjectId> headed;
+    std::set<Location> headedTo;
+    auto note = [&](const std::vector<Order>& orders) {
+        for (const Order& o : orders) {
+            if ((o.kind == OrderKind::Warp || o.kind == OrderKind::Explore) && o.object.valid()) headed.insert(o.object);
+            if (o.kind == OrderKind::MoveTo || (o.kind == OrderKind::Seek && !o.vehicle.valid() && !o.object.valid())) headedTo.insert(o.location);
+        }
+    };
+    for (const Vehicle& v : s.vehicles)  // fleet members hold copies of their fleets' orders
+        if (v.owner == id) note(v.orders);
+    for (size_t i = 0; i < nSys && !neutral; ++i) {
+        if (!e.hasExplored(SystemId{i})) continue;
+        for (ObjectId wp : s.galaxy.system(SystemId{i}).objects) {
+            const SpaceObject& o = s.galaxy.object(wp);
+            if (o.kind != ObjectKind::WarpPoint || !o.destination.valid()) continue;
+            if (e.hasExplored(s.galaxy.object(o.destination).system)) continue;
+            sit.frontier.push_back(wp);
+            if (sit.territory[i]) sit.bordersUnexplored = true;
+            if (!headed.contains(wp) && !headedTo.contains(locationOf(s.galaxy, wp))) sit.freeFrontier.push_back(wp);
+        }
+    }
+
+    // The defend list (spec 05 §7.2, confirmed: binary): the enemy-in-territory
+    // entries one per (system, sector, owner), each with its threat.
+    for (const Threat& t : sit.enemyInTerritory) {
+        const Vehicle* v = t.vehicle.valid() ? s.vehicle(t.vehicle) : nullptr;
+        const Location where = v ? v->location : locationOf(s.galaxy, t.planet);
+        auto it = std::find_if(sit.defendEntries.begin(), sit.defendEntries.end(),
+                               [&](const DefendEntry& d) { return d.where == where && d.owner == t.owner; });
+        if (it == sit.defendEntries.end()) {
+            DefendEntry d;
+            d.where = where;
+            d.owner = t.owner;
+            d.jumps = jumps(where.system);
+            for (ObjectId o : s.galaxy.system(where.system).objects) {
+                const SpaceObject& obj = s.galaxy.object(o);
+                if (obj.sector != where.sector || obj.kind != ObjectKind::Planet) continue;
+                d.planetSector = true;
+                if (const Colony* c = s.colony(o); c && c->owner == id) d.ourMaxPopulation += maxPopulation(r, s, *c);
+            }
+            sit.defendEntries.push_back(d);
+            it = sit.defendEntries.end() - 1;
+        }
+        // Each noticed vehicle adds its rating + 1; a populated colony adds the
+        // ratings (without the + 1) of every object in its sector that is not
+        // ours, its own planet at rating 0, and nothing for itself.
+        if (v) it->threat += vehicleRating(r, s, *v) + kStrengthScale;
+        else it->threat += foreignRatingsAt(r, s, id, where);
+        it->latest = t;
+    }
+    sortDefendEntries(sit.defendEntries, false);
+    for (size_t i = 0; i < sit.defendEntries.size(); ++i) sit.defendEntries[i].index = i;
+    const size_t maxDefend = static_cast<size_t>(std::max(0, prof.settings.maxSystemsToDefend));
+    for (const DefendEntry& d : sit.defendEntries)
+        if (sit.defend.size() < maxDefend && std::find(sit.defend.begin(), sit.defend.end(), d.where.system) == sit.defend.end())
+            sit.defend.push_back(d.where.system);
+
+    for (const Empire& x : s.empires) sit.contact = sit.contact || (x.id != id && x.alive && e.relation(x.id).contact);
+
+    // Colonization targets (spec 05 §7.5, confirmed: binary): uncolonized
+    // planets in systems we know, plus hostile empires' colonies without
+    // population (a Colonize order at such a planet fails on arrival).
+    const std::vector<uint8_t> present = presence(s);
+    auto nonFriendlyPresent = [&](SystemId sys) {
+        int n = 0;
+        for (const Empire& x : s.empires)
+            if (x.id != id && hostileTo(e, x.id) && present[x.id.index() * nSys + sys.index()]) ++n;
+        return n;
+    };
+    // The friendly-empire exclusion looks at colonies only.
+    std::vector<uint8_t> ourColony(nSys, 0), friendlyColony(nSys, 0);
+    for (const auto& c : s.colonies) {
+        if (!c || !c->owner.valid() || c->owner.index() >= nEmp) continue;
+        const size_t sys = s.galaxy.object(c->planet).system.index();
+        if (c->owner == id) ourColony[sys] = 1;
+        else if (!hostileTo(e, c->owner)) friendlyColony[sys] = 1;
+    }
+    std::set<ObjectId> targeted;
+    for (const Vehicle& v : s.vehicles)  // fleet members hold copies of their fleets' orders
+        if (v.owner == id)
+            for (const Order& o : v.orders)
+                if (o.kind == OrderKind::Colonize) targeted.insert(o.object);
+    // Gathered in the game's object-slot order (objectOrder), then sorted
+    // with the ministers' sort, which is not stable (confirmed: binary).
+    std::vector<int> danger(nSys, -1);
+    for (const ObjectRef& ref : objectOrder(s)) {
+        if (!ref.object.valid()) continue;
+        const ObjectId o = ref.object;
+        const SpaceObject& planet = s.galaxy.object(o);
+        if (planet.kind != ObjectKind::Planet || targeted.contains(o)) continue;
+        const SystemId sys = planet.system;
+        const size_t i = sys.index();
+        if (i >= nSys || !e.hasExplored(sys) || !considered(sys)) continue;
+        if (friendlyColony[i] && !ourColony[i]) continue;
+        const Colony* taken = s.colony(o);
+        if (taken && (taken->owner == id || taken->totalPopulation() > 0 || !hostileTo(e, taken->owner))) continue;
+        if (!notices(s, id, planetKey(o))) continue;
+        if (danger[i] < 0) {
+            // 5 per non-friendly empire present here, plus 1 for each such
+            // empire present in each system a warp point leads to (one
+            // entry per warp point, so two points into one system count twice).
+            danger[i] = 5 * nonFriendlyPresent(sys);
+            for (const SystemId nb : s.galaxy.neighbors(sys)) danger[i] += nonFriendlyPresent(nb);
+        }
+        ColonyTarget t;
+        t.planet = o;
+        t.system = sys;
+        t.danger = danger[i];
+        t.jumps = jumps(sys);
+        t.ruins = hasRuins(planet);
+        t.breathable = keysEqual(planet.atmosphere, e.race.atmosphere);
+        t.size = sizeRank(r, planet);
+        t.value = colonyTargetValue(s, planet, taken);
+        t.settleable = canSettle(r, s, e, planet);
+        t.colonized = taken != nullptr;
+        sit.colonyTargets.push_back(t);
+    }
+    ministersSort(sit.colonyTargets, [](const ColonyTarget& a, const ColonyTarget& b) {
+        if (const int k = threeWay(a.danger, b.danger)) return k;
+        if (const int k = threeWay(a.jumps, b.jumps)) return k;
+        if (const int k = threeWay(b.ruins, a.ruins)) return k;
+        if (const int k = threeWay(b.breathable, a.breathable)) return k;
+        if (const int k = threeWay(b.size, a.size)) return k;
+        return threeWay(b.value, a.value);
+    });
+
+    // The Not Connected test: the reachability counts the systems other than
+    // home that home reaches over every link (spec 05 §7.2).
+    int settleable = 0;  // uncolonized planets we could settle and have not targeted
+    for (const ColonyTarget& t : sit.colonyTargets) settleable += t.settleable && !t.colonized;
+    int64_t reachable = 0;
+    for (size_t i = 0; i < nSys; ++i) reachable += SystemId{i} != sit.home && sit.homeJumps[i] != kUnreachable;
+    const int64_t others = static_cast<int64_t>(nSys) - (sit.home.valid() ? 1 : 0);
+    sit.notConnected = settleable <= 10 && sit.freeFrontier.empty() && reachable * 100 <= int64_t{60} * others;
+    return sit;
+}
+
+// ---- Planner core -----------------------------------------------------------------------------
+
+Planner::Planner(const Rules& rules, const GameState& s, EmpireId e, Mode m, uint64_t salt, const std::vector<SystemId>* territory)
+    : r(rules),
+      st(s),
+      id(e),
+      mode(m),
+      prof(profileFor(rules, s.empire(e))),
+      state(stateOf(s.empire(e))),
+      rng(mix(mix(mix(s.seed) ^ s.turn) ^ (uint64_t{e.value} << 20) ^ salt)) {
+    difficulty = difficultyOf(s, e);
+    date = aiDate(s);
+    neutral = isNeutral(emp());
+
+    const size_t nSys = st.galaxy.systems.size();
+    links.resize(nSys);
+    for (size_t i = 0; i < nSys; ++i)
+        for (ObjectId wp : st.galaxy.system(SystemId{i}).objects) {
+            const SpaceObject& o = st.galaxy.object(wp);
+            if (o.kind != ObjectKind::WarpPoint || !o.destination.valid()) continue;
+            links[i].push_back({wp, st.galaxy.object(o.destination).system});
+        }
+
+    scores = politicalScores(r, st);
+    capUpkeep = capMaintenance(r, st, id);
+    capRevenue = capRevenueOf(r, st, id);   // unless a start-of-turn step hands its own over
+    if (territory) st.empire(id).claimedSystems = *territory;
+    sit = assess(r, st, id, prof);
+    for (const auto& c : st.colonies)
+        if (c && c->owner == id && (c->homeworld || !homeLocation.system.valid())) {
+            homeLocation = locationOf(st.galaxy, c->planet);
+            if (c->homeworld) break;
+        }
+    if (!homeLocation.system.valid())
+        for (const Vehicle& v : st.vehicles)
+            if (v.owner == id) {
+                homeLocation = v.location;
+                break;
+            }
+}
+
+bool Planner::emit(Command c) {
+    const CommandResult res = apply(r, st, id, c);
+    if (!res.ok) {
+        dropped.push_back(std::format("{}: {}", commandName(c), res.error));
+        return false;
+    }
+    out.push_back(std::move(c));
+    return true;
+}
+
+bool Planner::on(Minister m) const { return mode == Mode::Computer || ministerOn(emp(), m); }
+
+bool Planner::controlsColony(const Colony& c, Minister m) const {
+    if (c.owner != id || !on(m)) return false;
+    return mode == Mode::Computer || emp().ministerAll || isGlobalMinister(m) || c.minister;
+}
+
+bool Planner::controlsVehicle(const Vehicle& v, Minister m) const {
+    if (v.owner != id || !on(m)) return false;
+    if (mode == Mode::Computer || emp().ministerAll || isGlobalMinister(m) || v.minister) return true;
+    if (const Fleet* f = st.fleet(v.fleet)) return f->minister;
+    return false;
+}
+
+bool Planner::controlsFleet(const Fleet& f, Minister m) const {
+    if (f.owner != id || !on(m)) return false;
+    if (mode == Mode::Computer || emp().ministerAll || isGlobalMinister(m) || f.minister) return true;
+    for (VehicleId member : f.members)
+        if (const Vehicle* v = st.vehicle(member); !v || !v->minister) return false;
+    return !f.members.empty();
+}
+
+std::vector<int> Planner::jumpsFrom(SystemId from) const {
+    std::vector<int> dist(st.galaxy.systems.size(), kUnreachable);
+    if (!from.valid() || from.index() >= dist.size()) return dist;
+    std::deque<SystemId> queue{from};
+    dist[from.index()] = 0;
+    while (!queue.empty()) {
+        const SystemId sys = queue.front();
+        queue.pop_front();
+        for (const Link& l : links[sys.index()]) {
+            if (dist[l.to.index()] != kUnreachable) continue;
+            dist[l.to.index()] = dist[sys.index()] + 1;
+            queue.push_back(l.to);
+        }
+    }
+    return dist;
+}
+
+const DesignInfo& Planner::info(DesignId d) {
+    if (infos_.size() < st.designs.size()) infos_.resize(st.designs.size());
+    DesignInfo& di = infos_[d.index()];
+    if (!di.ready) {
+        const Design& design = st.design(d);
+        const Empire* owner = design.owner == id ? &emp() : nullptr;
+        di.stats = computeDesignStats(r, owner, design);
+        di.aiType = aiTypeOf(r, design, di.stats);
+        di.role = roleOf(di.aiType, di.stats);
+        di.ready = true;
+    }
+    return di;
+}
+
+namespace {
+
+// The newest of the designs `accept` takes, by creation turn; the first
+// listed on a tie (spec 05 §7.5).
+template <class Accept>
+std::optional<DesignId> newestOf(const GameState& s, const Empire& e, Accept&& accept) {
+    std::optional<DesignId> best;
+    for (DesignId d : e.designs) {
+        if (!accept(d)) continue;
+        if (!best || s.design(d).createdTurn > s.design(*best).createdTurn) best = d;
+    }
+    return best;
+}
+
+} // namespace
+
+std::optional<DesignId> Planner::newestDesign(std::string_view aiType, bool anyMark) {
+    return newestOf(st, emp(), [&](DesignId d) {
+        if (!anyMark && st.design(d).obsolete) return false;
+        const DesignInfo& di = info(d);
+        return di.stats.problems.empty() && keysEqual(di.aiType, aiType);
+    });
+}
+
+std::optional<DesignId> Planner::newestFromTemplate(std::string_view name) {
+    return newestOf(st, emp(), [&](DesignId d) {
+        const Design& design = st.design(d);
+        return !design.templateName.empty() && keysEqual(design.templateName, name) && info(d).stats.problems.empty();
+    });
+}
+
+bool Planner::atWarWith(EmpireId o) const {
+    return o.valid() && o != id && o.index() < st.empires.size() && emp().relation(o).treaty == Treaty::War;
+}
+
+int Planner::colonyCount() const {
+    int n = 0;
+    for (const auto& c : st.colonies) n += c && c->owner == id;
+    return n;
+}
+
+int64_t Planner::strengthOf(const Vehicle& v) { return vehicleRating(r, st, v) + kStrengthScale; }
+
+std::vector<VehicleId> Planner::ownVehicles(Minister m) const {
+    std::vector<VehicleId> ids;
+    for (const Vehicle& v : st.vehicles)
+        if (v.count > 0 && controlsVehicle(v, m)) ids.push_back(v.id);
+    return ids;
+}
+
+bool Planner::idle(const Vehicle& v) const {
+    if (busy.contains(v.id) || v.status == VehicleStatus::Mothballed || !v.orders.empty()) return false;
+    if (const Fleet* f = st.fleet(v.fleet); f && !fleetOrders(st, *f).empty()) return false;
+    return true;
+}
+
+// Spec 05 §7.5 (confirmed: binary): production × the computer-player income
+// factor, plus income from other empires (trade and tariffs received). The
+// tariffs the empire pays are not subtracted.
+Resources revenueFrom(const GameState& s, EmpireId e, const EconomyReport& eco) {
+    // The report's otherIncome holds the bonus on what was left after tariffs:
+    // (production - tariffs) x (factor - 1). Production x factor is the
+    // report's income plus tariffs x (factor - 1).
+    const int64_t extra = incomeBonusFactor(s, e) - 1;
+    const Resources& t = eco.tariffsOut;
+    return eco.colonies + eco.remoteMining + eco.otherIncome + Resources{t.v[0] * extra, t.v[1] * extra, t.v[2] * extra} + eco.trade +
+           eco.tariffsIn;
+}
+
+Resources revenueOf(const GameState& s, EmpireId e) { return revenueFrom(s, e, s.empire(e).economy); }
+
+Resources capRevenueOf(const Rules& r, const GameState& s, EmpireId e) { return revenueFrom(s, e, economy::incomeReport(r, s, e)); }
+
+Resources netIncomeOf(const Rules& r, const GameState& s, EmpireId e) {
+    return revenueOf(s, e) - economy::maintenanceCost(r, s, e) - queueCommitments(r, s, e);
+}
+
+Resources Planner::revenue() const { return revenueOf(st, id); }
+
+Resources Planner::netIncome() const { return netIncomeOf(r, st, id); }
+
+Resources queueCommitments(const Rules& r, const GameState& s, EmpireId e) {
+    Resources sum;
+    for (const auto& c : s.colonies) {
+        if (!c || c->owner != e || c->queue.items.empty()) continue;
+        const cmd::QueueTarget target{c->planet, {}};
+        const QueueItem& first = c->queue.items.front();
+        const Resources left = max(economy::itemCost(r, s, e, target, first) - first.spent, Resources{});
+        sum += min(left, economy::constructionRate(r, s, e, target));
+    }
+    return sum;
+}
+
+// Over the soft cap (extraPercent 0) or the hard cap (20) when, for any one
+// resource, the maintenance of the empire's vehicles other than colony ships
+// exceeds that resource's revenue × (Maximum Maintenance Percent of Revenue +
+// extraPercent) / 100 (spec 05 §7.5, confirmed: binary), in single precision.
+bool Planner::overCap(int extraPercent) const {
+    const int64_t m = prof.settings.maxMaintenancePercent + extraPercent;
+    for (Resource k : kResources)
+        if (aboveSingleShare(capUpkeep[k], capRevenue[k], m)) return true;
+    return false;
+}
+
+namespace {
+
+using xmath::detail::U128;
+
+bool lessU128(U128 a, U128 b) { return a.hi != b.hi ? a.hi < b.hi : a.lo < b.lo; }
+
+uint64_t magnitude(int64_t v) { return v < 0 ? uint64_t{0} - static_cast<uint64_t>(v) : static_cast<uint64_t>(v); }
+
+// A non-negative integer rounded to 24 significant bits, to nearest with ties
+// to even, as the store to a 32-bit float rounds: the result is q × 2^shift
+// with q at most 2^24.
+struct Rounded24 {
+    uint64_t q = 0;
+    int shift = 0;
+};
+Rounded24 roundTo24(U128 v) {
+    if (v.isZero()) return {};
+    const int length = 128 - xmath::detail::leadingZeros(v);
+    if (length <= xmath::kSingleBits) return {v.lo, 0};
+    const int shift = length - xmath::kSingleBits;
+    bool lost = false;
+    uint64_t q = xmath::detail::shiftRight(v, shift, lost).lo;
+    const U128 rest = xmath::detail::sub(v, xmath::detail::shiftLeft(U128{0, q}, shift));
+    const U128 half = xmath::detail::shiftLeft(U128{0, 1}, shift - 1);
+    if (lessU128(half, rest) || (!lessU128(rest, half) && (q & 1) != 0)) ++q;
+    return {q, shift};
+}
+
+} // namespace
+
+// The caps' single-precision test without floating point (spec 05 §7.5,
+// confirmed: binary). The original forms f = percent / 100 as a 32-bit
+// float, multiplies base by it and keeps the product as a float, then
+// compares value with it. Here:
+//  1. f is percent / 100 rounded to 24 significant bits, ties to even, and
+//     that is F × 2^-k exactly for an integer F in [2^23, 2^24]: F is the
+//     quotient of |percent| × 2^k by 100 (or of |percent| by 100 × 2^-k),
+//     rounded by its remainder, with k chosen so that F has 24 bits.
+//  2. base × f = |base| × F × 2^-k exactly, |base| × F an integer of at most
+//     88 bits (formed in 128); rounding it to 24 significant bits gives the
+//     float product q × 2^(shift - k) exactly, q and shift integers.
+//  3. value > ±q × 2^(shift - k) is decided on integers by shifting the
+//     smaller side's exponent away, in 128 bits.
+// Every step is the exact real result rounded once, as a float operation
+// rounds. The original's x87 forms the quotient and the product in its
+// 64-bit format before the store to a float, so each is rounded twice; that
+// agrees with one rounding unless the 64-bit result lies exactly on a
+// midpoint between two floats. It never does here: percent / 100 is either
+// exact in 24 bits or has a periodic binary expansion whose period divides 20
+// (the order of 2 modulo 25), which cannot hold the 39 equal bits a midpoint
+// needs, and the
+// product |base| × F has at most 64 bits, so is exact, while |base| is below
+// 2^40 (a turn's revenue is far smaller). The test in tests/test_ai.cpp
+// checks this against xmath::Ext's emulation of the x87 for every percent
+// from 0 to 300 and a range of bases. The value itself is compared exactly;
+// were it stored as a float first, the two would differ only from 2^24
+// (16.7 million) up, which no maintenance reaches.
+bool aboveSingleShare(int64_t value, int64_t base, int64_t percent) {
+    const bool negative = (base < 0) != (percent < 0);
+    const uint64_t a = magnitude(percent), b = magnitude(base);
+    // 1. f = F × 2^-k.
+    uint64_t F = 0;
+    int k = 0;
+    if (a != 0) {
+        uint64_t num = a, den = 100;
+        while (num / den < (uint64_t{1} << 23)) {
+            num <<= 1;
+            ++k;
+        }
+        while (num / den >= (uint64_t{1} << 24)) {
+            den <<= 1;
+            --k;
+        }
+        F = num / den;
+        const uint64_t rem = num % den;
+        if (2 * rem > den || (2 * rem == den && (F & 1) != 0)) ++F;
+    }
+    // 2. The product q × 2^e.
+    const Rounded24 p = roundTo24(xmath::detail::mul(b, F));
+    const int e = p.shift - k;
+    if (p.q == 0) return value > 0;
+    // 3. value > (negative ? -1 : 1) × q × 2^e.
+    if (negative && value >= 0) return true;
+    if (!negative && value <= 0) return false;
+    // Compare |value| with q × 2^e: above for a positive threshold, below for a negative one.
+    const uint64_t v = magnitude(value);
+    U128 lhs{0, v}, rhs{0, p.q};
+    if (e >= 0) {
+        if (e >= 100) return negative;   // q × 2^e is beyond any int64
+        rhs = xmath::detail::shiftLeft(rhs, e);
+    } else {
+        if (-e >= 64) return !negative;  // q × 2^e is below 1, |value| at least 1
+        lhs = xmath::detail::shiftLeft(lhs, -e);
+    }
+    return negative ? lessU128(lhs, rhs) : lessU128(rhs, lhs);
+}
+
+Resources capMaintenance(const Rules& r, const GameState& s, EmpireId e) {
+    Resources sum;
+    for (const Vehicle& v : s.vehicles) {
+        if (v.owner != e || v.count <= 0 || !v.design.valid() || v.design.index() >= s.designs.size()) continue;
+        const Design& d = s.design(v.design);
+        if (d.hull < r.data().vehicleSizes.size() && r.hull(d.hull).minPercentColonyModules > 0) continue;
+        sum += economy::vehicleMaintenance(r, s, v);
+    }
+    return sum;
+}
+
+bool Planner::setOrders(VehicleId vid, std::vector<Order> orders, bool repeat) {
+    const Vehicle* v = st.vehicle(vid);
+    if (!v) return false;
+    busy.insert(vid);
+    if (v->orders == orders && v->repeatOrders == repeat) return true;
+    return emit(cmd::SetOrders{vid, {}, std::move(orders), repeat});
+}
+
+bool Planner::setFleetOrders(FleetId fid, std::vector<Order> orders) {
+    const Fleet* f = st.fleet(fid);
+    if (!f) return false;
+    busyFleets.insert(fid);
+    for (VehicleId m : f->members) busy.insert(m);
+    if (fleetOrders(st, *f) == orders && !fleetRepeats(st, *f)) return true;
+    return emit(cmd::SetOrders{{}, fid, std::move(orders), false});
+}
+
+void Planner::runOrders(bool politics, bool others) {
+    if (!emp().alive) return;
+    capUpkeep = capMaintenance(r, st, id);   // the vehicles as the start-of-turn ministers find them
+    if (politics && on(Minister::Politics) && runs(Minister::Politics)) planPolitics(*this);
+    if (!others) return;
+    if (runs(Minister::Troops)) planTroops(*this);
+    if (runs(Minister::Transports)) planTransports(*this);
+    if (runs(Minister::Colonization)) planColonization(*this);
+    if (runs(Minister::SpaceYardShips)) planSpaceYardShips(*this);
+    if (runs(Minister::Carriers)) planCarriers(*this);
+    if (runs(Minister::MinesSatellitesDrones)) planMinesSatellitesDrones(*this);
+    if (runs(Minister::Fleets)) planFleets(*this);
+    if (runs(Minister::Defense)) planDefense(*this);
+    if (runs(Minister::Attack)) planAttack(*this);
+    if (runs(Minister::Exploration)) planExploration(*this);
+    if (runs(Minister::Patrol)) planPatrol(*this);
+    if (on(Minister::Resupply) && runs(Minister::Resupply)) planRepairAndResupply(*this, false);
+    if (on(Minister::Repair) && runs(Minister::Repair)) planRepairAndResupply(*this, true);
+    if (on(Minister::Scrap) && runs(Minister::Scrap)) planScrap(*this);
+    if (on(Minister::Retrofit) && runs(Minister::Retrofit)) planRetrofit(*this);
+    if (runs(Minister::StellarManipulation)) planStellarManipulation(*this);
+}
+
+void Planner::runEconomy() {
+    if (!emp().alive) return;
+    capUpkeep = capMaintenance(r, st, id);   // and as the economy-step ministers find them
+    if (!startOfTurnNet) startOfTurnNet = netIncome();
+    // New colonies already have their type: colonization calls
+    // colonyTypeAtColonization for every empire (spec 05 §7.5).
+    if (mode == Mode::Computer && runs(Minister::Design)) planStrategies(*this);
+    if (on(Minister::Design) && runs(Minister::Design)) planDesigns(*this);
+    if (on(Minister::Research) && runs(Minister::Research)) planResearch(*this);
+    if (on(Minister::Intelligence) && runs(Minister::Intelligence)) planIntel(*this);
+    const bool facilities = runs(Minister::FacilityConstruction);
+    if (facilities && date % 5 != 0) planFacilities(*this, true);  // skipped on every fifth turn (spec 05 §7.1)
+    if (on(Minister::ShipConstruction) && runs(Minister::ShipConstruction)) planShips(*this);
+    if (facilities) planFacilities(*this, false);
+}
+
+// ---- Strategies ------------------------------------------------------------------------------
+
+void planStrategies(Planner& p) {
+    // A computer player starts with its AI strategies table's strategies
+    // (setup, spec 05 §7.7, confirmed: binary), so this adds nothing in a game
+    // it began. An empire handed to the computer later, or one whose saved list
+    // lacks them, gets the missing ones once, at the end of its list, so design
+    // templates and fleets can refer to them by name (OpenSE4's, inferred).
+    for (const auto& s : p.prof.strategies) {
+        bool have = false;
+        for (const auto& mine : p.emp().strategies) have = have || keysEqual(mine.name, s.name);
+        if (!have) p.emit(cmd::SetStrategy{-1, s, false});
+    }
+}
+
+// ---- Shared helpers ----------------------------------------------------------------------------
+
+Order moveOrder(Location where) {
+    Order o;
+    o.kind = OrderKind::MoveTo;
+    o.location = where;
+    return o;
+}
+
+Order simpleOrder(OrderKind k) {
+    Order o;
+    o.kind = k;
+    return o;
+}
+
+Order seekOrder(Location where) {
+    Order o;
+    o.kind = OrderKind::Seek;
+    o.location = where;
+    return o;
+}
+
+Order seekAfter(const Vehicle& target) {
+    Order o;
+    o.kind = OrderKind::Seek;
+    o.vehicle = target.id;
+    o.location = target.location;  // where it was when the order was given
+    return o;
+}
+
+Order seekPlanet(const GameState& s, ObjectId planet) {
+    Order o;
+    o.kind = OrderKind::Seek;
+    o.object = planet;
+    o.location = locationOf(s.galaxy, planet);
+    return o;
+}
+
+Order attackHere() { return simpleOrder(OrderKind::Attack); }
+
+bool appendOrders(Planner& p, VehicleId v, std::vector<Order> orders) {
+    const Vehicle* vehicle = p.st.vehicle(v);
+    if (!vehicle) return false;
+    std::vector<Order> list = vehicle->orders;
+    list.insert(list.end(), std::make_move_iterator(orders.begin()), std::make_move_iterator(orders.end()));
+    return p.setOrders(v, std::move(list), vehicle->repeatOrders);
+}
+
+Order joinFleetOrder(FleetId fleet) {
+    Order o;
+    o.kind = OrderKind::JoinFleet;
+    o.amount = static_cast<int>(fleet.value);
+    return o;
+}
+
+std::string_view surfaceKey(std::string_view surface) {
+    if (keysEqual(surface, "Ice")) return "Ice";
+    if (keysEqual(surface, "Rock")) return "Rock";
+    return "Gas";
+}
+
+std::string colonyTypeName(std::string_view surface) { return std::format("Colony ({})", surfaceKey(surface)); }
+
+// Spec 05 §7.5 "Design types of other designs" (confirmed: binary): a design
+// whose type label is one of the 39 names has that type; any other is typed
+// by what it carries, the first test that matches.
+std::string aiTypeOf(const Rules& r, const Design& d, const DesignStats& st) {
+    for (std::string_view t : aiDesignTypes())
+        if (t == d.designType) return std::string(t);  // matched exactly
+    using ruleset::VehicleType;
+    auto has = [&](AbilityKind k) { return designHas(r, d, k); };
+    // 1. Colony modules.
+    if (has(AbilityKind::ColonizeRock)) return "Colony (Rock)";
+    if (has(AbilityKind::ColonizeIce)) return "Colony (Ice)";
+    if (has(AbilityKind::ColonizeGas)) return "Colony (Gas)";
+    // 2. A base hull.
+    if (st.vehicleType == VehicleType::Base) return has(AbilityKind::SpaceYard) ? "Base Space Yard" : "Defense Base";
+    // 3. Launchers.
+    if (has(AbilityKind::LaunchRecoverFighters)) return "Carrier";
+    if (has(AbilityKind::LaunchRecoverSatellites)) return "Satellite Layer";
+    if (has(AbilityKind::LaunchDrones)) return "Drone Carrier";
+    // 4. Mines, boarding, yards.
+    if (has(AbilityKind::LayMines)) return "Mine Layer";
+    if (has(AbilityKind::MineSweeping)) return "Mine Sweeper";
+    if (has(AbilityKind::BoardingAttack)) return "Boarding Ship";
+    if (has(AbilityKind::SpaceYard)) return "Space Yard Ship";
+    // 5. Stellar manipulation, each ability its own type.
+    static constexpr std::array<std::pair<AbilityKind, std::string_view>, 12> kStellar{{
+        {AbilityKind::OpenWarpPointDistance, "Open Warp Point"},
+        {AbilityKind::CloseWarpPoint, "Close Warp Point"},
+        {AbilityKind::CreatePlanetSize, "Create Planet"},
+        {AbilityKind::DestroyPlanetSize, "Destroy Planet"},
+        {AbilityKind::CreateStar, "Create Star"},
+        {AbilityKind::DestroyStar, "Destroy Star"},
+        {AbilityKind::CreateStorm, "Create Storm"},
+        {AbilityKind::DestroyStorm, "Destroy Storm"},
+        {AbilityKind::CreateBlackHole, "Create Black Hole"},
+        {AbilityKind::DestroyBlackHole, "Destroy Black Hole"},
+        {AbilityKind::CreateNebulae, "Create Nebulae"},
+        {AbilityKind::DestroyNebulae, "Destroy Nebulae"},
+    }};
+    for (const auto& [k, name] : kStellar)
+        if (has(k)) return std::string(name);
+    // 6. By hull type.
+    switch (st.vehicleType) {
+        case VehicleType::Satellite: return has(AbilityKind::SensorLevel) ? "Recon Satellite" : "Satellite";
+        case VehicleType::Drone: {
+            for (const DesignEntry& en : d.entries) {
+                if (en.component >= r.data().components.size()) continue;
+                const auto& w = r.component(en.component).weapon;
+                if (w.kind != ruleset::WeaponKind::Warhead) continue;
+                for (const std::string& target : w.targets)
+                    if (keysEqual(target, "Planets")) return "Anti-Planet Drone";
+            }
+            return "Anti-Ship Drone";
+        }
+        case VehicleType::Fighter: return "Fighter";
+        case VehicleType::Mine: return "Mine";
+        case VehicleType::Troop: return "Troop";
+        case VehicleType::WeaponPlatform: return "Weapon Platform";
+        default: break;
+    }
+    // 7. Cargo space makes a Population Transport; anything else, armed or
+    // not, is an Attack Ship (so a hand-made scout is one).
+    return st.cargoCapacity > 0 ? "Population Transport" : "Attack Ship";
+}
+
+Role roleOf(std::string_view t, const DesignStats& st) {
+    if (t.empty()) return Role::Other;
+    if (keysEqual(t, "Attack Ship")) return Role::Attack;
+    if (keysEqual(t, "Defense Ship")) return Role::Defense;
+    if (keysEqual(t, "Attack Base") || keysEqual(t, "Defense Base")) return st.vehicleType == ruleset::VehicleType::Ship ? Role::Defense : Role::Base;
+    if (keysEqual(t, "Base Space Yard")) return Role::YardBase;
+    if (t.starts_with("Colony")) return Role::Colonizer;
+    if (keysEqual(t, "Population Transport") || keysEqual(t, "Cargo Transport")) return Role::Transport;
+    if (keysEqual(t, "Troop Transport")) return Role::TroopTransport;
+    if (keysEqual(t, "Carrier")) return Role::Carrier;
+    if (keysEqual(t, "Drone Carrier")) return Role::DroneCarrier;
+    if (keysEqual(t, "Mine Layer")) return Role::MineLayer;
+    if (keysEqual(t, "Satellite Layer")) return Role::SatelliteLayer;
+    if (keysEqual(t, "Mine Sweeper")) return Role::Sweeper;
+    if (keysEqual(t, "Boarding Ship")) return Role::Boarding;
+    if (keysEqual(t, "Kamikaze Attack Ship")) return Role::Kamikaze;
+    if (keysEqual(t, "Space Yard Ship")) return Role::YardShip;
+    if (keysEqual(t, "Mine") || keysEqual(t, "Satellite") || keysEqual(t, "Weapon Platform") || keysEqual(t, "Troop") ||
+        keysEqual(t, "Fighter") || keysEqual(t, "Recon Satellite") || keysEqual(t, "Anti-Ship Drone") || keysEqual(t, "Anti-Planet Drone"))
+        return Role::Unit;
+    return Role::Stellar;  // the warp, planet, star, storm, nebula and black hole types
+}
+
+bool combatRole(Role r) {
+    return r == Role::Attack || r == Role::Defense || r == Role::Carrier || r == Role::DroneCarrier || r == Role::Boarding ||
+           r == Role::Kamikaze || r == Role::TroopTransport;
+}
+
+bool hasColonyModule(const Rules& r, const Empire& e, std::string_view surface) {
+    const std::string_view key = surfaceKey(surface);
+    const AbilityKind k = key == "Rock" ? AbilityKind::ColonizeRock : key == "Ice" ? AbilityKind::ColonizeIce : AbilityKind::ColonizeGas;
+    for (uint32_t c = 0; c < r.data().components.size(); ++c)
+        if (r.componentAvailable(e, c) && hasAbility(r.componentAbilities(c), k)) return true;
+    return false;
+}
+
+bool canSettle(const Rules& r, const GameState& s, const Empire& e, const SpaceObject& planet) {
+    if (planet.kind != ObjectKind::Planet) return false;
+    if (s.options.onlyBreathable && !keysEqual(planet.atmosphere, e.race.atmosphere)) return false;
+    if (s.options.onlyHomeType && surfaceKey(planet.surface) != surfaceKey(e.race.nativeSurface)) return false;
+    return hasColonyModule(r, e, planet.surface);
+}
+
+bool facilityHas(const Rules& r, uint32_t facility, std::string_view ability) {
+    const auto kind = parseAbilityKind(ability);
+    if (!kind) return false;
+    for (const ParsedAbility& a : r.facilityAbilities(facility)) {
+        if (*kind != AbilityKind::Unknown && *kind != AbilityKind::AITag && a.kind == *kind) return true;
+        if (keysEqual(a.raw, ability)) return true;
+    }
+    return false;
+}
+
+std::optional<uint32_t> bestFacilityFor(const Rules& r, const Empire& e, std::string_view ability) {
+    const AbilityKind kind = parseAbilityKind(ability).value_or(AbilityKind::Unknown);
+    const bool byAmount = amountAbility(kind);
+    std::optional<uint32_t> best;
+    int64_t bestScore = 0;
+    for (uint32_t i = 0; i < r.data().facilities.size(); ++i) {
+        if (!r.facilityAvailable(e, i) || !facilityHas(r, i, ability)) continue;
+        int64_t score = 0;
+        if (byAmount) {
+            score = sumValue1(r.facilityAbilities(i), kind);
+        } else {
+            for (const auto& q : r.facility(i).requirements) score += q.level;
+        }
+        if (!best || score >= bestScore) {  // a tie goes to the later facility
+            best = i;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+} // namespace detail
+
+// ---- Public entry points -------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint64_t kSaltTurn = 1, kSaltOrders = 2, kSaltEconomy = 3, kSaltMinister = 4, kSaltPolitics = 5;
+
+bool planFor(const GameState& s, EmpireId e) { return e.valid() && e.index() < s.empires.size() && s.empire(e).alive; }
+
+} // namespace
+
+PlanReport planTurnReport(const Rules& r, const GameState& s, EmpireId e, bool minimal) {
+    // An absent player who forbade AI changes: bookkeeping only (spec 05 §7.1).
+    if (!planFor(s, e) || minimal) return {};
+    detail::Planner p(r, s, e, detail::Mode::Computer, kSaltTurn);
+    p.runOrders();
+    p.runEconomy();
+    return p.report();
+}
+
+std::vector<Command> planTurn(const Rules& r, const GameState& s, EmpireId e, bool minimal) {
+    return planTurnReport(r, s, e, minimal).commands;
+}
+
+std::vector<Command> planOrders(const Rules& r, const GameState& s, EmpireId e) {
+    if (!planFor(s, e)) return {};
+    const detail::Mode mode = s.empire(e).kind == PlayerKind::Human ? detail::Mode::Minister : detail::Mode::Computer;
+    detail::Planner p(r, s, e, mode, kSaltOrders);
+    p.runOrders();
+    return p.report().commands;
+}
+
+std::vector<Command> planPoliticsOrders(const Rules& r, const GameState& s, EmpireId e, uint32_t ministers) {
+    if (!planFor(s, e)) return {};
+    const detail::Mode mode = s.empire(e).kind == PlayerKind::Human ? detail::Mode::Minister : detail::Mode::Computer;
+    detail::Planner p(r, s, e, mode, kSaltPolitics);
+    p.ministersRun = ministers;
+    p.runOrders(true, false);
+    return p.report().commands;
+}
+
+std::vector<Command> politicsStartCommands(const Rules& r, const GameState& s, EmpireId id) {
+    if (!planFor(s, id)) return {};
+    const Empire& e = s.empire(id);
+    if (e.kind == PlayerKind::Human || !ministerOn(e, Minister::Politics)) return {};
+    std::vector<Command> out;
+    // The four AI_Settings movement flags, as the state update copies them
+    // into the empire's Ship Movement and Ship Orders options (spec 05 §7.5).
+    const SettingsTable& set = profileFor(r, e).settings;
+    const EncounterClear clear = set.clearOrdersOnAll ? EncounterClear::Any : set.clearOrdersOnEnemy ? EncounterClear::Enemy : EncounterClear::Never;
+    cmd::SetEncounterOptions options;
+    if (e.clearOrdersOnEncounter != clear) options.clearOrdersOnEncounter = clear;
+    if (e.avoidTaggedMinefields != set.avoidMinefields) options.avoidTaggedMinefields = set.avoidMinefields;
+    if (e.avoidRestrictedSystems != set.avoidRestrictedSystems) options.avoidRestrictedSystems = set.avoidRestrictedSystems;
+    if (options.clearOrdersOnEncounter || options.avoidTaggedMinefields || options.avoidRestrictedSystems) out.emplace_back(options);
+    // The systems it agreed to leave become its systems to avoid (the state
+    // update), and it claims its territory anew (claimTerritory). The flags
+    // keep each list sorted, so toggling what differs leaves exactly the
+    // lists the classic AI writes; a list that is not sorted is written anew.
+    std::vector<SystemId> avoid = e.aiMemory.avoid;
+    std::sort(avoid.begin(), avoid.end());
+    avoid.erase(std::unique(avoid.begin(), avoid.end()), avoid.end());
+    const std::vector<SystemId> claims = detail::computeTerritory(s, id);
+    auto tidy = [](const std::vector<SystemId>& list) {
+        return std::is_sorted(list.begin(), list.end()) && std::adjacent_find(list.begin(), list.end()) == list.end();
+    };
+    const bool avoidTidy = tidy(e.systemsToAvoid), claimsTidy = tidy(e.claimedSystems);
+    auto has = [](const std::vector<SystemId>& list, SystemId sys) { return std::find(list.begin(), list.end(), sys) != list.end(); };
+    std::vector<SystemId> systems;
+    for (const std::vector<SystemId>* list : std::array<const std::vector<SystemId>*, 4>{&avoid, &claims, &e.systemsToAvoid, &e.claimedSystems})
+        systems.insert(systems.end(), list->begin(), list->end());
+    std::sort(systems.begin(), systems.end());
+    systems.erase(std::unique(systems.begin(), systems.end()), systems.end());
+    // An untidy list: every entry goes first, then the new ones come in order.
+    std::vector<Command> adds;
+    for (SystemId sys : systems) {
+        if (!sys.valid() || sys.index() >= s.galaxy.systems.size()) continue;
+        cmd::SetSystemFlags clearOut{sys, {}, {}}, setIn{sys, {}, {}};
+        const bool avoidNow = has(e.systemsToAvoid, sys), avoidThen = has(avoid, sys);
+        const bool claimNow = has(e.claimedSystems, sys), claimThen = has(claims, sys);
+        if (!avoidTidy) {
+            if (avoidNow) clearOut.avoid = false;
+            if (avoidThen) setIn.avoid = true;
+        } else if (avoidNow != avoidThen) {
+            setIn.avoid = avoidThen;
+        }
+        if (!claimsTidy) {
+            if (claimNow) clearOut.claim = false;
+            if (claimThen) setIn.claim = true;
+        } else if (claimNow != claimThen) {
+            setIn.claim = claimThen;
+        }
+        if (clearOut.avoid || clearOut.claim) out.emplace_back(clearOut);
+        if (setIn.avoid || setIn.claim) adds.emplace_back(setIn);
+    }
+    out.insert(out.end(), std::make_move_iterator(adds.begin()), std::make_move_iterator(adds.end()));
+    return out;
+}
+
+std::vector<Command> planPlayerPolitics(const Rules& r, const GameState& s, EmpireId e, uint32_t ministers) {
+    if (!planFor(s, e)) return {};
+    std::vector<Command> first;
+    if (ministers & ministerBit(Minister::Politics)) first = politicsStartCommands(r, s, e);
+    if (first.empty()) return planPoliticsOrders(r, s, e, ministers);
+    // The Politics minister plans on the empire as those commands leave it,
+    // as it does for a computer empire whose state update and claims wrote
+    // the same directly.
+    GameState after = s;
+    std::vector<Command> out;
+    for (Command& c : first)
+        if (apply(r, after, e, c).ok) out.push_back(std::move(c));
+    std::vector<Command> rest = planPoliticsOrders(r, after, e, ministers);
+    out.insert(out.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
+    return out;
+}
+
+StartOfTurnFigures startOfTurnFigures(const Rules& r, const GameState& s, EmpireId e) {
+    if (!planFor(s, e)) return {};
+    StartOfTurnFigures f{detail::netIncomeOf(r, s, e), detail::capRevenueOf(r, s, e), {}};
+    for (const Relation& rel : s.empire(e).relations) f.anger.push_back(rel.anger);
+    return f;
+}
+
+std::vector<Command> planOrdersAfterPolitics(const Rules& r, const GameState& s, EmpireId e, const std::vector<SystemId>* territory,
+                                             std::vector<ObjectId>* colonyTargets, const StartOfTurnFigures* figures, uint32_t ministers) {
+    if (!planFor(s, e)) return {};
+    const detail::Mode mode = s.empire(e).kind == PlayerKind::Human ? detail::Mode::Minister : detail::Mode::Computer;
+    detail::Planner p(r, s, e, mode, kSaltOrders, territory);
+    p.ministersRun = ministers;
+    if (figures) {
+        p.startOfTurnNet = figures->net;
+        p.capRevenue = figures->revenue;
+        // The attack candidates in the order of the start of the step, by the
+        // anger before the political step (spec 05 §7.2, question 88).
+        if (!figures->anger.empty()) detail::sortCandidatesBy(p.sit.candidates, figures->anger);
+    }
+    if (colonyTargets) {
+        colonyTargets->clear();
+        for (const detail::ColonyTarget& t : p.sit.colonyTargets) colonyTargets->push_back(t.planet);
+    }
+    p.runOrders(false, true);
+    return p.report().commands;
+}
+
+std::vector<ObjectId> colonyTargetsNow(const Rules& r, const GameState& s, EmpireId e, const std::vector<SystemId>* territory) {
+    if (!planFor(s, e)) return {};
+    const detail::Mode mode = s.empire(e).kind == PlayerKind::Human ? detail::Mode::Minister : detail::Mode::Computer;
+    const detail::Planner p(r, s, e, mode, kSaltOrders, territory);
+    std::vector<ObjectId> out;
+    out.reserve(p.sit.colonyTargets.size());
+    for (const detail::ColonyTarget& t : p.sit.colonyTargets) out.push_back(t.planet);
+    return out;
+}
+
+std::vector<Command> planEconomyStep(const Rules& r, const GameState& s, EmpireId e, int64_t unitReserve,
+                                     const std::vector<ObjectId>* colonyTargets, const StartOfTurnFigures* figures, uint32_t ministers) {
+    if (!planFor(s, e)) return {};
+    const detail::Mode mode = s.empire(e).kind == PlayerKind::Human ? detail::Mode::Minister : detail::Mode::Computer;
+    detail::Planner p(r, s, e, mode, kSaltEconomy);
+    p.ministersRun = ministers;
+    p.unitReserve = unitReserve;
+    if (figures) {
+        p.startOfTurnNet = figures->net;
+        p.capRevenue = figures->revenue;
+    }
+    // The lists another step left (spec 05 §7.2 "Whose lists the economy step
+    // reads"): of them the economy step reads only the colonization targets.
+    if (colonyTargets) {
+        p.sit.colonyTargets.clear();
+        for (ObjectId planet : *colonyTargets) {
+            if (!planet.valid() || planet.index() >= p.st.galaxy.objects.size()) continue;
+            detail::ColonyTarget t;
+            t.planet = planet;
+            t.system = p.st.galaxy.object(planet).system;
+            t.settleable = detail::canSettle(r, p.st, p.emp(), p.st.galaxy.object(planet));
+            t.colonized = p.st.colony(planet) != nullptr;
+            p.sit.colonyTargets.push_back(t);
+        }
+    }
+    p.runEconomy();
+    return p.report().commands;
+}
+
+int64_t unitReserveLeft(const Rules& r, const Empire& e) {
+    const AiProfile& prof = profileFor(r, e);
+    return prof.unitsFile ? prof.unitReservePercent : 0;
+}
+
+void designMinisterRun(const Rules& r, GameState& s, EmpireId e) {
+    if (!planFor(s, e)) return;
+    // The Design minister alone, as a computer player's would run (it plans
+    // on a private copy); its designs then join the game itself.
+    detail::Planner p(r, s, e, detail::Mode::Computer, kSaltEconomy);
+    detail::planDesigns(p);
+    for (const Command& c : p.report().commands) apply(r, s, e, c);
+}
+
+bool ministersActive(const GameState& s, EmpireId e) {
+    if (!planFor(s, e)) return false;
+    const Empire& emp = s.empire(e);
+    if (emp.kind != PlayerKind::Human) return false;
+    bool any = emp.ministerAll;
+    for (size_t m = 0; m < kMinisters && !any; ++m)
+        if (isGlobalMinister(static_cast<Minister>(m)) && (emp.ministers & ministerBit(static_cast<Minister>(m)))) any = true;
+    for (const auto& c : s.colonies) any = any || (c && c->owner == e && c->minister);
+    for (const Vehicle& v : s.vehicles) any = any || (v.owner == e && v.minister);
+    for (const Fleet& f : s.fleets) any = any || (f.owner == e && f.minister);
+    return any;
+}
+
+std::vector<Command> ministerCommands(const Rules& r, const GameState& s, EmpireId e) {
+    if (!ministersActive(s, e)) return {};
+    detail::Planner p(r, s, e, detail::Mode::Minister, kSaltMinister);
+    p.runOrders();
+    p.runEconomy();
+    return p.report().commands;
+}
+
+void forgetUnsavedLists(GameState& s) {
+    for (Empire& e : s.empires) {
+        for (Relation& rel : e.relations) rel.promises = rel.queuedWar = rel.queuedBreak = rel.queuedPeace = 0;
+        e.aiMemory.avoid.clear();
+        e.aiMemory.attackSystems.clear();
+    }
+}
+
+uint32_t aiDate(const GameState& s) { return s.options.simultaneous ? s.turn + 1 : s.turn; }
+
+bool ministerOn(const Empire& e, Minister m) {
+    if (e.kind != PlayerKind::Human || e.ministerAll) return true;
+    return (e.ministers & ministerBit(m)) != 0;
+}
+
+std::string_view ministerStyleOf(const Empire& e) { return e.useRaceMinisterStyle ? std::string_view{} : std::string_view{e.ministerStyle}; }
+
+MinisterSettings standIn(Empire& e) {
+    const MinisterSettings saved{e.ministerAll, e.ministers};
+    e.ministerAll = true;
+    e.ministers = kAllMinisters;
+    return saved;
+}
+
+void restoreMinisters(Empire& e, const MinisterSettings& saved) {
+    e.ministerAll = saved.all;
+    e.ministers = saved.areas;
+}
+
+std::string_view moodLabel(int anger) {
+    // Spec 05 §7.3 (confirmed: binary).
+    if (anger < 10) return "Brotherly";
+    if (anger < 20) return "Amiable";
+    if (anger < 30) return "Receptive";
+    if (anger < 40) return "Warm";
+    if (anger < 60) return "Moderate";
+    if (anger < 70) return "Cool";
+    if (anger < 80) return "Displeased";
+    if (anger < 90) return "Angry";
+    return "Murderous";
+}
+
+bool setComputerMark(GameState& s, EmpireId e, bool computer) {
+    if (!e.valid() || e.index() >= s.empires.size()) return false;
+    Empire& emp = s.empire(e);
+    // The stored difficulty a human's ministers play at; a computer player keeps its own.
+    if (computer && emp.aiDifficulty < 0) emp.aiDifficulty = kDifficultyMedium;
+    // Only the mark changes: neutrality is a mark of its own, so a neutral
+    // empire handed to a human stays neutral (spec 06 §7 Q84, confirmed: binary).
+    const bool neutral = isNeutral(emp);
+    emp.kind = computer ? (neutral ? PlayerKind::Neutral : PlayerKind::Computer) : PlayerKind::Human;
+    emp.neutral = neutral && !computer;
+    return true;
+}
+
+bool setComputerControl(GameState& s, EmpireId e, bool computer) {
+    if (!setComputerMark(s, e, computer)) return false;
+    Empire& emp = s.empire(e);
+    emp.ministers = computer ? kAllMinisters : 0;
+    emp.ministerAll = computer;
+    for (Vehicle& v : s.vehicles)
+        if (v.owner == e) v.minister = computer;
+    for (Fleet& f : s.fleets)
+        if (f.owner == e) f.minister = computer;
+    for (auto& c : s.colonies)
+        if (c && c->owner == e) c->minister = computer;
+    return true;
+}
+
+bool anyHumanLeft(const GameState& s) {
+    // A human destroyed at the start of its turn plays that turn, its last,
+    // marked dead (spec 06 §7 Q99): it still counts until the turn ends.
+    const bool lastTurn = !s.options.simultaneous && s.playerTurn.started && s.playerTurn.empire.valid() &&
+                          s.playerTurn.empire.index() < s.empires.size() && s.empire(s.playerTurn.empire).kind == PlayerKind::Human;
+    return lastTurn || std::any_of(s.empires.begin(), s.empires.end(), [](const Empire& e) { return e.alive && e.kind == PlayerKind::Human; });
+}
+
+int difficultyOf(const GameState& s, EmpireId e) {
+    if (!e.valid() || e.index() >= s.empires.size()) return kDifficultyMedium;
+    const Empire& emp = s.empire(e);
+    if (emp.kind == PlayerKind::Human) return kDifficultyMedium;  // a human's ministers
+    if (emp.aiDifficulty >= 0) return std::clamp(emp.aiDifficulty, kDifficultyLow, kDifficultyHigh);
+    const auto& random = s.options.randomAiPlayers;
+    if (e.index() < random.size() && random[e.index()]) return std::clamp(s.options.aiDifficulty, kDifficultyLow, kDifficultyHigh);
+    return kDifficultyMedium;
+}
+
+int rebelDifficulty(const GameState& s) {
+    int best = -1;
+    for (const Empire& e : s.empires)
+        if (e.kind != PlayerKind::Human && e.aiDifficulty >= 0) best = std::max(best, std::min(e.aiDifficulty, kDifficultyHigh));
+    return best < 0 ? kDifficultyMedium : best;
+}
+
+// ---- Random players ------------------------------------------------------------------------------
+
+const ruleset::RacePreset* pickRandomRace(const Rules& r, Rng& rng, bool neutral, const std::vector<std::string>& used) {
+    const auto& presets = r.racePresets();
+    auto isUsed = [&](const ruleset::RacePreset& p) {
+        return std::any_of(used.begin(), used.end(), [&](const std::string& u) { return datafile::keysEqual(u, p.folder); });
+    };
+    auto draw = [&](auto&& accept) -> const ruleset::RacePreset* {
+        std::vector<const ruleset::RacePreset*> pool;
+        for (const auto& p : presets)
+            if (p.neutral == neutral && !isUsed(p) && accept(p)) pool.push_back(&p);
+        return pool.empty() ? nullptr : pool[static_cast<size_t>(rng.below(pool.size()))];
+    };
+    if (!neutral) {
+        // The personality group furthest below its target share (spec 05 §7.1).
+        const int64_t groups = std::min<int64_t>(10, r.setting("Random Player Personality Groups", 0));
+        const int64_t total = static_cast<int64_t>(used.size()) + 1;
+        int64_t pick = 0, pickShare = 0;
+        for (int64_t g = 1; g <= groups; ++g) {
+            int64_t inGroup = 0;
+            for (const std::string& u : used)
+                if (const ruleset::RacePreset* p = findPreset(r, u); p && p->personalityGroup == g) ++inGroup;
+            const int64_t share = xmath::divRoundHalfEven(100 * inGroup, total);
+            if (share >= r.setting(std::format("Random Player Personality Group {} Percent", g), 0)) continue;
+            if (pick == 0 || share < pickShare) {
+                pick = g;
+                pickShare = share;
+            }
+        }
+        if (pick > 0)
+            if (const auto* p = draw([&](const ruleset::RacePreset& x) { return x.personalityGroup == pick; })) return p;
+    }
+    return draw([](const ruleset::RacePreset&) { return true; });
+}
+
+namespace {
+
+// Spec 05 §7.1 (confirmed: binary): every planet type and atmosphere pair
+// is allowed except a Gas Giant with no atmosphere; the data set is not
+// consulted. While the pair is not allowed, the atmosphere is redrawn
+// uniformly among the five and the type among the three, with no limit.
+void settleEnvironment(Race& race, Rng& rng) {
+    static constexpr std::array<std::string_view, 5> kAtmospheres{"None", "Methane", "Oxygen", "Hydrogen", "Carbon Dioxide"};
+    static constexpr std::array<std::string_view, 3> kSurfaces{"Rock", "Ice", "Gas Giant"};
+    while (datafile::keysEqual(race.nativeSurface, "Gas Giant") && datafile::keysEqual(race.atmosphere, "None")) {
+        race.atmosphere = kAtmospheres[static_cast<size_t>(rng.below(kAtmospheres.size()))];
+        race.nativeSurface = kSurfaces[static_cast<size_t>(rng.below(kSurfaces.size()))];
+    }
+}
+
+} // namespace
+
+Race randomPlayerRace(const Rules& r, const ruleset::RacePreset& preset, int racialPoints, Rng& rng) {
+    Race race = raceFromPreset(r, preset, 0);
+    settleEnvironment(race, rng);
+    race.characteristics.fill(100);
+    race.traits.clear();
+    // Race Opt 1, 2 and 3 for 2000, 3000 and 5000 points; none for 0 (spec 05 §7.1).
+    const int level = racialPoints >= 5000 ? 3 : racialPoints >= 3000 ? 2 : racialPoints > 0 ? 1 : 0;
+    if (level == 0 || preset.tiers.empty()) return race;
+    const ruleset::RaceTier& tier = preset.tiers[std::min(static_cast<size_t>(level - 1), preset.tiers.size() - 1)];
+    // Characteristics in the listed order, each only while the points spent
+    // so far are below the budget; one that pushes the total over goes back
+    // to 100 (confirmed: binary).
+    for (const auto& [name, pct] : tier.characteristics) {
+        Characteristic c;
+        if (!parseCharacteristic(name, c)) continue;
+        if (racialPointCost(r, race) >= racialPoints) continue;
+        race.characteristics[static_cast<size_t>(c)] = pct;
+        if (racialPointCost(r, race) > racialPoints) race.characteristics[static_cast<size_t>(c)] = 100;
+    }
+    // Then each trait whose cost fits the remaining points; one that does not
+    // fit is skipped and the later ones are still tried (confirmed: binary).
+    for (const std::string& name : tier.traits) {
+        std::optional<uint32_t> trait;
+        for (uint32_t i = 0; i < r.data().racialTraits.size() && !trait; ++i)
+            if (datafile::keysEqual(r.data().racialTraits[i].name, name)) trait = i;
+        if (!trait || std::find(race.traits.begin(), race.traits.end(), *trait) != race.traits.end()) continue;
+        race.traits.push_back(*trait);
+        if (racialPointCost(r, race) > racialPoints) race.traits.pop_back();
+    }
+    return race;
+}
+
+std::vector<std::string> randomRacePresets(const Rules& r, int count, bool neutral, std::vector<std::string> used, Rng& rng) {
+    std::vector<std::string> out;
+    for (int n = 0; n < count; ++n) {
+        const ruleset::RacePreset* p = pickRandomRace(r, rng, neutral, used);
+        if (!p) break;
+        used.push_back(p->folder);
+        out.push_back(p->folder);
+    }
+    return out;
+}
+
+namespace {
+
+// The "Computer Player Bonus" setting as 0 (None) .. 3 (High) for a computer
+// empire, -1 for a human one. Settings above High count as High (inferred).
+int bonusLevel(const GameState& s, EmpireId e) {
+    if (!e.valid() || e.index() >= s.empires.size() || s.empire(e).kind == PlayerKind::Human) return -1;
+    return std::clamp(s.options.aiBonus, 0, 3);
+}
+
+} // namespace
+
+int incomeBonusFactor(const GameState& s, EmpireId e) {
+    static constexpr std::array<int, 4> kFactor{1, 2, 3, 5};  // (confirmed: binary)
+    const int level = bonusLevel(s, e);
+    return level < 0 ? 1 : kFactor[static_cast<size_t>(level)];
+}
+
+int constructionBonusPercent(const GameState& s, EmpireId e) {
+    static constexpr std::array<int, 4> kPercent{100, 150, 200, 300};  // (confirmed: binary)
+    const int level = bonusLevel(s, e);
+    return level < 0 ? 100 : kPercent[static_cast<size_t>(level)];
+}
+
+} // namespace opense4::game::ai

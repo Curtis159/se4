@@ -1,0 +1,326 @@
+#include "game/orders.hpp"
+
+#include "game/abilities.hpp"
+#include "game/design.hpp"
+#include "game/movement.hpp"
+#include "game/movement_internal.hpp"
+#include "game/query.hpp"
+#include "game/sight.hpp"
+
+#include <algorithm>
+
+namespace opense4::game {
+
+namespace {
+
+using ruleset::VehicleType;
+
+bool validLocation(const GameState& s, Location l) {
+    return l.system.valid() && l.system.index() < s.galaxy.systems.size() && l.sector.valid();
+}
+
+bool validObject(const GameState& s, ObjectId o) { return o.valid() && o.index() < s.galaxy.objects.size() && movement::detail::inSystem(s.galaxy, o); }
+
+bool carriesPopulation(const GameState& s, std::span<const VehicleId> members) {
+    return std::any_of(members.begin(), members.end(), [&](VehicleId id) {
+        const Vehicle* v = s.vehicle(id);
+        return v && v->cargo.totalPopulation() > 0;
+    });
+}
+
+// Fighters and neutral empires never use warp points (spec 03 §6.2, spec 01
+// §8); a group led by a mine sweeper ignores tagged minefields.
+movement::RouteOptions routeOptions(const Rules& r, const GameState& s, const OrderContext& ctx) {
+    movement::RouteOptions options;
+    const bool fighters = std::any_of(ctx.members.begin(), ctx.members.end(), [&](VehicleId id) {
+        const Vehicle* v = s.vehicle(id);
+        return v && vehicleType(r, s, *v) == VehicleType::Fighter;
+    });
+    const bool neutral = ctx.owner.valid() && ctx.owner.index() < s.empires.size() && isNeutral(s.empire(ctx.owner));
+    options.allowWarp = !fighters && !neutral;
+    const VehicleId leadId = ctx.lead.valid() ? ctx.lead : ctx.members.empty() ? VehicleId{} : ctx.members.front();
+    if (const Vehicle* lead = leadId.valid() ? s.vehicle(leadId) : nullptr) options.sweeper = movement::leadsSweeperGroup(s, *lead);
+    return options;
+}
+
+// Where Explore, Resupply and Repair search from: the selected object's
+// sector now, whatever orders come before them (spec 03 §8, confirmed: binary).
+Location searchStart(const GameState& s, const OrderContext& ctx) { return validLocation(s, ctx.here) ? ctx.here : ctx.at; }
+
+// The nearest of `goals` by travel from where the search starts, if any is reachable.
+std::optional<size_t> nearest(const Rules& r, const GameState& s, const OrderContext& ctx, std::span<const Location> goals) {
+    const Location from = searchStart(s, ctx);
+    if (goals.empty() || !validLocation(s, from)) return std::nullopt;
+    const auto p = movement::findPathToNearest(r, s, ctx.owner, from, goals, routeOptions(r, s, ctx));
+    if (!p) return std::nullopt;
+    return p->goal;
+}
+
+void sortUnique(std::vector<Location>& list) {
+    std::sort(list.begin(), list.end());
+    list.erase(std::unique(list.begin(), list.end()), list.end());
+}
+
+bool member(const OrderContext& ctx, VehicleId id) { return std::find(ctx.members.begin(), ctx.members.end(), id) != ctx.members.end(); }
+
+// Move To `where` when the group is not there yet, then `o`.
+void travelThen(const GameState& s, OrderContext& ctx, Location where, const Order& o, std::vector<Order>& out) {
+    if (validLocation(s, where) && where != ctx.at) {
+        Order move;
+        move.kind = OrderKind::MoveTo;
+        move.location = where;
+        out.push_back(move);
+        advanceOrderContext(s, ctx, move);
+    }
+    out.push_back(o);
+    advanceOrderContext(s, ctx, o);
+}
+
+// The Move To of Explore, Resupply and Repair: added even when it leads where
+// the object already is, where it completes at once (spec 03 §8, confirmed: binary).
+void moveTo(const GameState& s, OrderContext& ctx, Location where, std::vector<Order>& out) {
+    if (!validLocation(s, where)) return;
+    Order move;
+    move.kind = OrderKind::MoveTo;
+    move.location = where;
+    out.push_back(move);
+    advanceOrderContext(s, ctx, move);
+}
+
+// ---- Explore (spec 03 §8, confirmed: binary) ----------------------------------------------------------
+
+// The warp points other own ships are bound for (a Warp order anywhere in
+// their lists, fleet members' copies included), and those already in this list.
+std::vector<ObjectId> boundFor(const GameState& s, const OrderContext& ctx, std::span<const Order> sofar) {
+    std::vector<ObjectId> out;
+    auto note = [&](std::span<const Order> list) {
+        for (const Order& o : list)
+            if (o.kind == OrderKind::Warp && o.object.valid()) out.push_back(o.object);
+    };
+    for (const Vehicle& v : s.vehicles)
+        if (v.count > 0 && v.owner == ctx.owner && !member(ctx, v.id)) note(v.orders);
+    note(sofar);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// A warp point in a system the empire has explored, leading to one it has not.
+bool explorable(const GameState& s, EmpireId e, ObjectId w) {
+    if (!validObject(s, w)) return false;
+    const SpaceObject& wp = s.galaxy.object(w);
+    if (wp.kind != ObjectKind::WarpPoint || !validObject(s, wp.destination)) return false;
+    const Empire& emp = s.empire(e);
+    if (!s.options.omnipresent && !emp.hasExplored(wp.system)) return false;
+    return !emp.hasExplored(s.galaxy.object(wp.destination).system);
+}
+
+void explore(const Rules& r, const GameState& s, OrderContext& ctx, std::vector<Order>& out) {
+    if (!routeOptions(r, s, ctx).allowWarp) return;
+    const std::vector<ObjectId> bound = boundFor(s, ctx, out);
+    std::vector<ObjectId> candidates;
+    std::vector<Location> goals;
+    for (const StarSystem& sys : s.galaxy.systems)
+        for (ObjectId w : sys.objects) {
+            if (!explorable(s, ctx.owner, w) || std::binary_search(bound.begin(), bound.end(), w)) continue;
+            candidates.push_back(w);
+            goals.push_back(locationOf(s.galaxy, w));
+        }
+    const auto pick = nearest(r, s, ctx, goals);
+    if (!pick) return;  // nothing left: nothing is added
+    Order warp;
+    warp.kind = OrderKind::Warp;
+    warp.object = candidates[*pick];
+    warp.location = goals[*pick];
+    moveTo(s, ctx, goals[*pick], out);
+    out.push_back(warp);
+    advanceOrderContext(s, ctx, warp);
+}
+
+// ---- Resupply and Repair (spec 03 §8, confirmed: binary) -----------------------------------------------------
+
+// A visible, armed, non-mothballed hostile vehicle in the sector.
+bool armedHostileAt(const Rules& r, const GameState& s, EmpireId e, Location l) {
+    for (const Vehicle& v : s.vehicles) {
+        if (v.count <= 0 || v.location != l || v.owner == e || !hostile(s, e, v.owner) || v.status == VehicleStatus::Mothballed) continue;
+        if (!computeDesignStats(r, nullptr, s.design(v.design)).armed()) continue;
+        if (sight::canSeeVehicle(r, s, e, v)) return true;
+    }
+    return false;
+}
+
+void resupply(const Rules& r, const GameState& s, OrderContext& ctx, std::vector<Order>& out) {
+    std::vector<Location> depots;
+    const Empire& e = s.empire(ctx.owner);
+    for (const auto& c : s.colonies) {
+        if (!c || !movement::detail::inSystem(s.galaxy, c->planet)) continue;
+        const Location l = locationOf(s.galaxy, c->planet);
+        if (!s.options.omnipresent && !e.hasExplored(l.system)) continue;
+        if (movement::resupplyDepotAt(r, s, ctx.owner, l) && !armedHostileAt(r, s, ctx.owner, l)) depots.push_back(l);
+    }
+    sortUnique(depots);
+    if (const auto pick = nearest(r, s, ctx, depots)) moveTo(s, ctx, depots[*pick], out);
+}
+
+// Own sources only: colonies with Component Repair (no population needed,
+// spec 03 §13) and bases first; repair ships only when no such source can be reached.
+void repair(const Rules& r, const GameState& s, OrderContext& ctx, std::vector<Order>& out) {
+    std::vector<Location> fixed, ships;
+    for (const auto& c : s.colonies)
+        if (c && c->owner == ctx.owner && movement::detail::inSystem(s.galaxy, c->planet) &&
+            abilitySum(colonyAbilities(r, s, *c), AbilityKind::ComponentRepair) > 0)
+            fixed.push_back(locationOf(s.galaxy, c->planet));
+    for (const Vehicle& v : s.vehicles) {
+        if (v.count <= 0 || v.owner != ctx.owner || member(ctx, v.id)) continue;
+        const VehicleType t = vehicleType(r, s, v);
+        if ((t != VehicleType::Ship && t != VehicleType::Base) || abilitySum(vehicleAbilities(r, s, v), AbilityKind::ComponentRepair) <= 0) continue;
+        (t == VehicleType::Base ? fixed : ships).push_back(v.location);
+    }
+    sortUnique(fixed);
+    sortUnique(ships);
+    if (const auto pick = nearest(r, s, ctx, fixed)) moveTo(s, ctx, fixed[*pick], out);
+    else if (const auto ship = nearest(r, s, ctx, ships)) moveTo(s, ctx, ships[*ship], out);
+}
+
+} // namespace
+
+OrderContext orderContextOf(const GameState&, const Vehicle& v) {
+    OrderContext ctx;
+    ctx.owner = v.owner;
+    ctx.members = {v.id};
+    ctx.lead = v.id;
+    ctx.at = v.location;
+    ctx.carriesPopulation = v.cargo.totalPopulation() > 0;
+    ctx.here = v.location;
+    ctx.selfCarriesPopulation = ctx.carriesPopulation;
+    return ctx;
+}
+
+OrderContext orderContextOf(const GameState& s, const Fleet& f, const Vehicle* addressed) {
+    OrderContext ctx;
+    ctx.owner = f.owner;
+    ctx.members = fleetGroup(s, f);
+    if (ctx.members.empty()) return ctx;
+    const Vehicle* lead = fleetLeader(s, f);
+    ctx.lead = lead && lead->location == f.location ? lead->id : ctx.members.front();
+    ctx.at = f.location;
+    ctx.carriesPopulation = carriesPopulation(s, ctx.members);
+    const Vehicle* self = addressed ? addressed : s.vehicle(ctx.lead);
+    ctx.here = self ? self->location : f.location;
+    ctx.selfCarriesPopulation = self && self->cargo.totalPopulation() > 0;
+    return ctx;
+}
+
+void advanceOrderContext(const GameState& s, OrderContext& ctx, const Order& o) {
+    switch (o.kind) {
+        case OrderKind::MoveTo:
+            if (validLocation(s, o.location)) ctx.at = o.location;
+            break;
+        case OrderKind::MoveToWaypoint: {
+            const Empire& e = s.empire(ctx.owner);
+            if (o.amount >= 0 && static_cast<size_t>(o.amount) < e.waypoints.size() && e.waypoints[static_cast<size_t>(o.amount)].set)
+                ctx.at = e.waypoints[static_cast<size_t>(o.amount)].location;
+            break;
+        }
+        case OrderKind::Warp:
+            if (validObject(s, o.object) && validObject(s, s.galaxy.object(o.object).destination))
+                ctx.at = locationOf(s.galaxy, s.galaxy.object(o.object).destination);
+            break;
+        case OrderKind::Colonize:
+            if (validObject(s, o.object)) ctx.at = locationOf(s.galaxy, o.object);
+            ctx.carriesPopulation = false;  // the ship is consumed
+            break;
+        case OrderKind::Attack:
+        case OrderKind::Seek:
+            if (const Vehicle* t = s.vehicle(o.vehicle)) ctx.at = t->location;
+            else if (validObject(s, o.object)) ctx.at = locationOf(s.galaxy, o.object);
+            else if (o.kind == OrderKind::Seek && validLocation(s, o.location)) ctx.at = o.location;
+            break;
+        case OrderKind::JoinFleet:
+            if (const Fleet* f = o.amount >= 0 ? s.fleet(FleetId{o.amount}) : nullptr) ctx.at = f->location;
+            break;
+        case OrderKind::LoadCargo:
+        case OrderKind::DropCargo:
+        case OrderKind::LaunchUnits:
+        case OrderKind::RecoverUnits:
+            if (validLocation(s, o.location)) ctx.at = o.location;
+            // Population: the kind, or (an order by design) no design.
+            if (o.cargo == CargoKind::Population || (o.cargo == CargoKind::None && !o.design.valid())) {
+                if (o.kind == OrderKind::LoadCargo) ctx.carriesPopulation = true;
+                if (o.kind == OrderKind::DropCargo) ctx.carriesPopulation = false;
+            }
+            break;
+        case OrderKind::StellarManipulation:
+            if (const auto t = movement::detail::stellarTarget(s, o, ctx.at)) ctx.at = *t;
+            break;
+        default: break;
+    }
+}
+
+void expandOrder(const Rules& r, const GameState& s, OrderContext& ctx, const Order& o, std::vector<Order>& out) {
+    if (!ctx.owner.valid() || ctx.owner.index() >= s.empires.size()) {
+        out.push_back(o);
+        return;
+    }
+    switch (o.kind) {
+        case OrderKind::Explore: explore(r, s, ctx, out); return;
+        case OrderKind::Resupply: resupply(r, s, ctx, out); return;
+        case OrderKind::Repair: repair(r, s, ctx, out); return;
+        case OrderKind::Warp:
+            travelThen(s, ctx, validObject(s, o.object) ? locationOf(s.galaxy, o.object) : Location{}, o, out);
+            return;
+        case OrderKind::Attack:
+            // A drone given a warp point as target gets Move To plus Warp instead (spec 03 §8, confirmed: binary).
+            if (validObject(s, o.object) && s.galaxy.object(o.object).kind == ObjectKind::WarpPoint) {
+                Order warp;
+                warp.kind = OrderKind::Warp;
+                warp.object = o.object;
+                warp.location = locationOf(s.galaxy, o.object);
+                travelThen(s, ctx, warp.location, warp, out);
+                return;
+            }
+            out.push_back(o);
+            advanceOrderContext(s, ctx, o);
+            return;
+        case OrderKind::Colonize: {
+            // Colonists come aboard where the list then leaves the ship, when the
+            // selected object's own cargo holds no population now, whatever the
+            // orders before do (spec 03 §8, confirmed: binary); a Colonize
+            // expanded before already had its Load Cargo.
+            if (!ctx.selfCarriesPopulation && o.amount != kColonizeExpanded) {
+                Order load;
+                load.kind = OrderKind::LoadCargo;
+                load.location = ctx.at;
+                load.amount = -1;
+                out.push_back(load);
+                advanceOrderContext(s, ctx, load);
+            }
+            Order colonize = o;
+            colonize.amount = kColonizeExpanded;
+            travelThen(s, ctx, validObject(s, o.object) ? locationOf(s.galaxy, o.object) : Location{}, colonize, out);
+            return;
+        }
+        case OrderKind::LoadCargo:
+        case OrderKind::DropCargo:
+        case OrderKind::LaunchUnits:
+        case OrderKind::RecoverUnits: travelThen(s, ctx, o.location, o, out); return;
+        default:
+            out.push_back(o);
+            advanceOrderContext(s, ctx, o);
+            return;
+    }
+}
+
+std::vector<Order> expandGivenOrders(const Rules& r, const GameState& s, OrderContext ctx, std::span<const Order> current,
+                                     std::span<const Order> given) {
+    std::vector<Order> out;
+    size_t kept = 0;
+    while (kept < given.size() && kept < current.size() && given[kept] == current[kept]) ++kept;
+    for (size_t i = 0; i < kept; ++i) {
+        out.push_back(given[i]);
+        advanceOrderContext(s, ctx, given[i]);
+    }
+    for (size_t i = kept; i < given.size(); ++i) expandOrder(r, s, ctx, given[i], out);
+    return out;
+}
+
+} // namespace opense4::game

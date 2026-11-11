@@ -1,0 +1,480 @@
+#include "client/app.hpp"
+#include "client/classic/command_line.hpp"
+#include "client/classic/computer_players.hpp"
+#include "client/crash_report.hpp"
+#include "client/script/script.hpp"
+#include "core/environment.hpp"
+#include "core/log.hpp"
+#include "game/players.hpp"
+#include "sdk/bots.hpp"
+#include "sdk/players.hpp"
+
+#include <charconv>
+#include <ctime>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <chrono>
+#include <filesystem>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+// SDL's entry point: on Windows it provides WinMain for the windowed build and
+// calls main() below; elsewhere it changes nothing.
+#include <SDL3/SDL_main.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+namespace {
+
+#ifdef _WIN32
+// The windowed build has no console of its own. Started from a terminal, write
+// --help, logs and errors there.
+void attachParentConsole() {
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
+    FILE* f = nullptr;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+}
+#endif
+
+constexpr const char* kUsage = R"(OpenSE4 - an open-source engine reimplementation for Space Empires IV Deluxe
+(requires your own copy of the game; not affiliated with its publishers)
+
+Usage: opense4 [options] [GAMEFILE PASSWORD [PLAYER [MODFOLDER]]] [-nd]
+
+Plays Space Empires IV Deluxe on your own installed copy of the game. The game is
+found in your Steam libraries, or given with --classic-dir (see docs/SETUP.md).
+
+Rendering:
+  --renderer=auto|vulkan|opengl   Graphics backend (default: auto = Vulkan, fall back to OpenGL)
+  --validation                    Enable Vulkan validation layers / GL debug output
+  --no-vsync                      Disable vertical sync
+  --fullscreen                    Start in fullscreen (Alt+Enter toggles)
+  --size=WxH                      Window size (default 1600x900)
+  --layout=auto|800x600|1024x768  The classic screen layout (default: auto, 800x600 on a desktop
+                                  800 px wide or less, as the original; forcing one is OpenSE4's)
+  --text-size=N                   Settings' Text size for this run, 0.75 to 1.5
+  --no-audio                      No sound or music
+  --audio                         Sound and music even in a script or screenshot run (to check
+                                  the audio, e.g. with SDL_AUDIO_DRIVER=disk: docs/SETUP.md)
+
+Game:
+  --classic-dir=DIR               Game directory of your installed copy (default: auto-detect)
+  --mod=MOD                       Play with this mod (a folder or .zip, or the id of one in the mods folder);
+                                  repeat for several, in load order. In place of the mods the settings enable
+  --no-mods                       Play without the mods the settings enable
+  --mods-dir=DIR                  Where mods are looked up by id (default: Mods in OpenSE4's user folder);
+                                  then among the mods that come with OpenSE4 (mods/ beside the program)
+  --no-bundled-mods               Leave out the mods that come with OpenSE4
+  --quick-start[=RACE]            Skip the intro: start a quick game as RACE (a Pictures/Races folder name)
+  --load=GAME.gam                 Open a saved game at once: OpenSE4's, or the original's (imported,
+                                  see docs/SETUP.md "Games of the original")
+  --ai=MOD:PLAYER                 Every computer empire of the quick game (--quick-start) is played by
+                                  this script player of a mod (its [[ai.players]], docs/sdk/ai-protocol.md);
+                                  "builtin" for the built-in AI (the default); "external:N" for the
+                                  external bot of slot N (docs/sdk/bots-and-arena.md). Other games
+                                  choose their players in Game Setup's Computer Players
+  --bot-port=N                    Let external bots connect to the games played or hosted here (default
+                                  6722 with --ai=external:N; 0 = any free port). The token they present
+                                  is --bot-token, else OPENSE4_BOT_TOKEN, else a random one in the log
+  --bot-token=TOKEN               The token external bots present (instead of OPENSE4_BOT_TOKEN)
+  --bot-bind=ADDRESS              Where bots may connect from (default 127.0.0.1: this computer only)
+  --bot-timeout=SEC               A bot's time for one request (default 60)
+  --seed=N                        Seed for new games (default: random)
+  --systems=N                     Number of star systems in a quick game
+  --empires=N                     Number of empires in a quick game, including yours: N - 1 computer
+                                  players and no neutral empire (default: as Quick Start, random
+                                  computer and neutral players rolled from the seed)
+  --quadrant=NAME                 Quadrant type from the data set (default: the first one)
+  --turn-style=simultaneous|turn-based
+                                  Turn style of a quick game (default: turn-based)
+  --open=WINDOW[:ARG]             With a quick start, open a window at once (e.g. --open=designs,
+                                  --open=help:hotkeys for a Help tab; none: no window, not even the Log)
+                                  or start on a front-end screen: intro, quickstart, setup[:PAGE],
+                                  empiresetup[:PAGE], multiplayer, pbem[:GAME.gam], settings, mods,
+                                  learn[:tutorials|training|manual|scenarios], credits
+                                  (e.g. --open=setup:players).
+                                  tactical: a sample tactical battle (your warships against copies);
+                                  simulator: the Combat Simulator with that battle set up;
+                                  ground-combat: your troop transports land on your homeworld in a
+                                  sample strategic battle (needs a troop design: add --turns=70)
+
+Learning to play (see docs/LEARNING.md):
+  --tutorial=SLUG                 Start a tutorial (a guided lesson) at once
+  --training=SLUG                 Start a training game at once
+  --manual[=SLUG[#SECTION]]       Open the manual (at a page)
+  --learn-dir=DIR                 Read tutorials, training games and the manual from DIR only
+  --lesson-check                  With --tutorial=SLUG:N: open the windows step N works in, report
+                                  whether everything it highlights or allows is on screen, and
+                                  exit with 1 if not (tools/check_lessons.py runs every step)
+  --lesson-audit                  The same, and print what the input lock lets through and whether
+                                  what the step's text names can be seen (check_lessons.py --audit)
+
+Play by e-mail (see docs/MULTIPLAYER.md):
+  --pbem=GAME.gam                 Open the game file the host sent and play your turn; End Turn
+                                  saves your orders file (.plr) to send back
+  --pbem-empire=N                 Your empire's number (default: the only one that can play now)
+  --pbem-password=PW              Your empire's password
+  --pbem-orders=DIR               Where to save the orders file (default: the game file's folder); where
+                                  the host's command line reads them (see below)
+  --pbem-end-turn                 End the turn at once, write the orders file and quit
+                                  (with --screenshot: quit after the screenshot)
+
+The original's command line (see docs/MULTIPLAYER.md "From the command line"):
+  GAMEFILE PASSWORD [0]           As the host (no player number, or 0): process the turn of a play-by-e-mail
+                                  game file (.gam) whose host (master) password this is, from the orders
+                                  files (.plr) beside it (or in --pbem-orders=DIR), save it, write the next
+                                  turn files and quit, with no window; a wrong password quits with exit code 1
+  GAMEFILE PASSWORD PLAYER        Sign in as empire number PLAYER (1 or more) with its password and play its
+                                  turn: a turn file (.turn, as --pbem plays it), an OpenSE4 saved game or a
+                                  saved game of the original, even a destroyed empire or one the computer
+                                  plays. A wrong password, or a game made with other data files ("Invalid
+                                  Data Files"), quits with exit code 2
+  GAMEFILE PASSWORD PLAYER MODFOLDER
+                                  The fourth names a mod folder (in the game folder, or a path) to play as
+                                  a classic mod, in place of the one Path.txt names
+                                  Passwords count without the spaces around them and, as far as OpenSE4's
+                                  password hashes allow, without regard to letter case. GAMEFILE is looked
+                                  for as given, then in the mod folder, the saves folder and the pbem
+                                  folder; one that is not found quits at once with exit code 0
+  -nd, /nd                        No message box for the whole run, and a question counts as No (the log
+                                  says what was skipped); it also counts as one of the four arguments
+
+Paths:
+  --assets=DIR                    OpenSE4's own assets directory (default: auto-detect, else built in)
+
+Input scripts (see docs/BUILDING.md "Input scripts"):
+  --input-script=FILE             Play FILE's clicks, keys and checks through the game's own input (FILE's
+                                  options line adds options); exits with 1 when a step fails, with a picture
+  --script-output=DIR             Where a script's screenshots and failure picture go (default: the system's
+                                  temporary folder, opense4-scripts)
+  --record-input=FILE             Record what you do as an input script, to start one from
+
+Automation:
+  --screenshot=FILE.png           Render a few frames, save a screenshot and exit (with a script: the last frame)
+  --frames=N                      Frame to capture (default 10)
+  --turns=N                       Let the AI play N turns for every empire (yours too) first
+  --select=moving|fleet|ID        Then select one of your vehicles in the main window: the first with a
+                                  move order, your first fleet with orders, or the vehicle with that id
+
+  --verbose                       Debug logging
+  -h, --help                      Show this help
+)";
+
+bool parseInt(std::string_view s, auto& out) {
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+    return ec == std::errc{} && ptr == s.data() + s.size();
+}
+
+// OPENSE4_CRASH_TEST: crash on purpose, with an exception nothing catches or a
+// fault. A function of its own, as MSVC does not let main, which SDL makes
+// extern "C", throw itself (C4297).
+[[noreturn]] void crashOnPurpose(std::string_view kind) {
+    if (kind == "exception") throw std::runtime_error("a test of the crash report");
+    volatile int* nowhere = nullptr;
+    *nowhere = 1;
+    std::abort();
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+#ifdef _WIN32
+    attachParentConsole();
+#endif
+    using namespace opense4;
+    // The message box of a crash report, started by the crashed program
+    // (client/crash_report.hpp): it shows the box and nothing else.
+    if (argc == 2 && std::string_view(argv[1]).starts_with("--crash-message=")) {
+        log::info("The crash report is in {}", std::string_view(argv[1]).substr(16));
+        client::showCrashMessage(std::filesystem::path(std::string_view(argv[1]).substr(16)));
+        return 0;
+    }
+    client::AppOptions options;
+    // External bots (--bot-port...): the host they connect to lives as long as the program.
+    int botPort = sdk::kDefaultBotPort;
+    int botTimeout = 60;
+    bool botsWanted = false;
+    std::string botToken;
+    std::string botBind = "127.0.0.1";
+    // Start from the saved settings; command-line options override them for this run.
+    client::GraphicsSettings& saved = client::appSettings().graphics;
+    options.renderer = saved.renderer == client::RendererChoice::Vulkan   ? client::AppOptions::Renderer::Vulkan
+                       : saved.renderer == client::RendererChoice::OpenGL ? client::AppOptions::Renderer::OpenGL
+                                                                          : client::AppOptions::Renderer::Auto;
+    options.vsync = saved.vsync;
+    options.width = saved.windowWidth;
+    options.height = saved.windowHeight;
+
+    // An input script's options line comes first; the command line can override it.
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (!arg.starts_with("--input-script=")) continue;
+        std::vector<std::string> errors;
+        auto script = client::script::loadScript(std::string(arg.substr(15)), errors);
+        if (!script) {
+            for (const std::string& e : errors) std::fprintf(stderr, "%s\n", e.c_str());
+            return 2;
+        }
+        args = script->options;
+        options.recordOptions = script->options;
+        options.inputScript = std::move(*script);
+    }
+    for (int i = 1; i < argc; ++i) {
+        args.emplace_back(argv[i]);
+        const std::string_view a = argv[i];
+        // What a recording's options line repeats: the game's own options.
+        if (!a.starts_with("--record-input") && !a.starts_with("--screenshot") && !a.starts_with("--frames") && !a.starts_with("--input-script") &&
+            !a.starts_with("--script-output"))
+            options.recordOptions.emplace_back(a);
+    }
+
+    for (const std::string& argument : args) {
+        const std::string_view arg = argument;
+        // The original's switch that suppresses message boxes, and the
+        // arguments that are not options, as the original reads them: game
+        // file, password, player number, mod folder (docs/spec/05 §9.2). The
+        // switch also takes its place among those arguments, as in the
+        // original (confirmed: binary).
+        if (client::classic::isNoDialogsSwitch(arg)) {
+            options.noDialogs = true;
+            options.positional.push_back(argument);
+            continue;
+        }
+        if (arg.empty() || arg.front() != '-') {
+            options.positional.push_back(argument);
+            continue;
+        }
+        const auto eq = arg.find('=');
+        const std::string_view key = arg.substr(0, eq);
+        const std::string_view value = eq == std::string_view::npos ? std::string_view{} : arg.substr(eq + 1);
+        bool ok = true;
+
+        if (key == "--help" || key == "-h") {
+            std::fputs(kUsage, stdout);
+            // Where the player's files are, and why there (core/user_folder.hpp).
+            const core::UserFolder folder = client::userFolderInUse();
+            const char* why = folder.source == core::UserFolderSource::Portable      ? "a portable copy: portable.txt lies beside the program"
+                              : folder.source == core::UserFolderSource::Environment ? "named by OPENSE4_USER_DIR"
+                                                                                     : "your user folder";
+            std::printf("\nSaved games, settings and logs: %s\n  (%s; see Settings, Files)\n", folder.path.string().c_str(), why);
+            return 0;
+        } else if (key == "--renderer") {
+            if (value == "auto") options.renderer = client::AppOptions::Renderer::Auto;
+            else if (value == "vulkan" || value == "vk") options.renderer = client::AppOptions::Renderer::Vulkan;
+            else if (value == "opengl" || value == "gl") options.renderer = client::AppOptions::Renderer::OpenGL;
+            else ok = false;
+        } else if (key == "--validation") {
+            options.validation = true;
+        } else if (key == "--no-vsync") {
+            options.vsync = false;
+            saved.vsync = false;
+        } else if (key == "--fullscreen") {
+            options.fullscreen = true;
+            saved.displayMode = client::DisplayMode::Borderless;
+        } else if (key == "--size") {
+            const auto x = value.find('x');
+            ok = x != std::string_view::npos && parseInt(value.substr(0, x), options.width) && parseInt(value.substr(x + 1), options.height);
+            saved.displayMode = client::DisplayMode::Windowed;
+            saved.windowWidth = options.width;
+            saved.windowHeight = options.height;
+        } else if (key == "--layout") {
+            // The classic screen layout for this run (an OpenSE4 extension; docs/spec/06 §2.1.1).
+            if (value == "auto") saved.layout = client::LayoutChoice::Auto;
+            else if (value == "800x600") saved.layout = client::LayoutChoice::Small800;
+            else if (value == "1024x768") saved.layout = client::LayoutChoice::Large1024;
+            else ok = false;
+        } else if (key == "--text-size") {
+            // Settings → Graphics → Text size for this run (0.75 to 1.5).
+            const std::string text(value);
+            char* end = nullptr;
+            const float scale = std::strtof(text.c_str(), &end);
+            ok = !text.empty() && end == text.c_str() + text.size() && scale >= 0.75f && scale <= 1.5f;
+            if (ok) saved.textScale = scale;
+        } else if (key == "--ai") {
+            ok = opense4::game::parseController(value).has_value();
+            options.aiPlayer = std::string(value);
+        } else if (key == "--bot-port") {
+            ok = parseInt(value, botPort) && botPort >= 0 && botPort <= 65535;
+            botsWanted = true;
+        } else if (key == "--bot-token") {
+            botToken = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--bot-bind") {
+            botBind = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--bot-timeout") {
+            ok = parseInt(value, botTimeout) && botTimeout > 0;
+        } else if (key == "--seed") {
+            ok = parseInt(value, options.seed);
+        } else if (key == "--systems") {
+            ok = parseInt(value, options.systemCount);
+        } else if (key == "--empires") {
+            ok = parseInt(value, options.empireCount);
+        } else if (key == "--classic") {
+            // Accepted and ignored, so older command lines keep working.
+        } else if (key == "--no-audio") {
+            options.noAudio = true;
+        } else if (key == "--audio") {
+            options.audio = true;
+        } else if (key == "--classic-dir") {
+            options.installDir = std::string(value);
+        } else if (key == "--mod") {
+            options.mods.emplace_back(value);
+            options.modsGiven = true;
+            ok = !value.empty();
+        } else if (key == "--no-mods") {
+            options.mods.clear();
+            options.modsGiven = true;
+        } else if (key == "--mods-dir") {
+            options.modsDir = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--no-bundled-mods") {
+            options.noBundledMods = true;
+        } else if (key == "--quick-start") {
+            options.quickStart = true;
+            if (!value.empty()) options.race = std::string(value);
+        } else if (key == "--open") {
+            options.openWindow = std::string(value);
+            options.quickStart = true;
+        } else if (key == "--load") {
+            options.loadFile = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--pbem") {
+            options.pbemFile = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--pbem-empire") {
+            ok = parseInt(value, options.pbemEmpire) && options.pbemEmpire > 0;
+        } else if (key == "--pbem-password") {
+            options.pbemPassword = std::string(value);
+        } else if (key == "--pbem-orders") {
+            options.pbemOrdersDir = std::string(value);
+        } else if (key == "--pbem-end-turn") {
+            options.pbemEndTurn = true;
+        } else if (key == "--tutorial") {
+            options.tutorial = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--training") {
+            options.training = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--manual") {
+            options.manual = std::string(value);
+        } else if (key == "--learn-dir") {
+            options.learnDir = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--lesson-check") {
+            options.lessonCheck = true;
+        } else if (key == "--lesson-audit") {
+            options.lessonCheck = true;
+            options.lessonAudit = true;
+        } else if (key == "--quadrant") {
+            options.quadrantType = std::string(value);
+        } else if (key == "--turn-style") {
+            ok = value == "simultaneous" || value == "turn-based";
+            options.turnBased = value == "turn-based";
+        } else if (key == "--assets") {
+            options.assetsDir = std::string(value);
+        } else if (key == "--screenshot") {
+            options.screenshotPath = std::string(value);
+        } else if (key == "--frames") {
+            ok = parseInt(value, options.screenshotFrames);
+        } else if (key == "--turns") {
+            ok = parseInt(value, options.autoTurns);
+        } else if (key == "--select") {
+            options.select = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--input-script") {
+            ok = options.inputScript.has_value();
+        } else if (key == "--script-output") {
+            options.scriptOutput = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--record-input") {
+            options.recordInput = std::string(value);
+            ok = !value.empty();
+        } else if (key == "--verbose") {
+            log::setMinLevel(log::Level::Debug);
+        } else {
+            ok = false;
+        }
+        if (!ok) {
+            std::fprintf(stderr, "Invalid argument: %s\n\n%s", argument.c_str(), kUsage);
+            return 2;
+        }
+    }
+
+    // A game file on the command line starts that game: no other start goes with it.
+    if (!options.positional.empty() && (!options.loadFile.empty() || !options.pbemFile.empty() || !options.tutorial.empty() || !options.training.empty())) {
+        std::fprintf(stderr, "A game file on the command line (%s) cannot go with --load, --pbem, --tutorial or --training.\n\n%s",
+                     options.positional.front().c_str(), kUsage);
+        return 2;
+    }
+
+    // A script run is the same every time: a fixed seed unless one is given.
+    // Otherwise the clock's, for local games only: a network game hosted here
+    // draws its seed from the cryptographic random source unless one was
+    // given (multiplayer.cpp), since its players must not guess it.
+    options.seedGiven = options.seed != 0 || options.inputScript;
+    if (options.seed == 0) options.seed = options.inputScript ? 1 : static_cast<uint64_t>(std::time(nullptr));
+    // The log also goes to opense4.log in the user data folder: on Windows the
+    // game has no console, so that file is where a player finds it. The last
+    // run's log, a crash report perhaps, stays beside it as opense4.previous.log.
+    const std::filesystem::path logFile = client::userDataDirectory() / "opense4.log";
+    client::keepPreviousLog(logFile);
+    log::setFile(logFile);
+    // A crash or an exception nothing caught leaves a report there; a message
+    // box says where, except in automated runs, which must never wait on one.
+    const auto video = core::environment("SDL_VIDEO_DRIVER");
+    const bool headless = video && (*video == "offscreen" || *video == "dummy");
+    client::installCrashHandler({logFile, !options.inputScript && options.screenshotPath.empty() && !options.lessonCheck && !headless});
+    // Checking the crash report (docs/BUILDING.md "Crash reports"): crash on purpose now.
+    if (const auto test = core::environment("OPENSE4_CRASH_TEST")) {
+        log::info("OPENSE4_CRASH_TEST={}: crashing on purpose", *test);
+        crashOnPurpose(*test);
+    }
+    // Script computer players play in the games this program plays (docs/sdk/ai-protocol.md),
+    // and external bots when asked for (docs/sdk/bots-and-arena.md); their failures make
+    // the main window's notice.
+    const auto failures = [](const sdk::PlayerFailure& f) { client::classic::notePlayerFailure(f); };
+    if (const auto c = opense4::game::parseController(options.aiPlayer); c && c->kind == opense4::game::Controller::Kind::External) botsWanted = true;
+    std::unique_ptr<sdk::BotHost> bots;
+    if (botsWanted) {
+        sdk::BotHostOptions bo;
+        bo.bind = botBind;
+        bo.port = static_cast<uint16_t>(botPort);
+        bo.token = !botToken.empty() ? botToken : core::environment("OPENSE4_BOT_TOKEN").value_or("");
+        bo.gameName = "OpenSE4";
+        bo.requestTimeout = std::chrono::seconds(botTimeout);
+        auto opened = sdk::BotHost::open(std::move(bo));
+        if (!opened) {
+            std::fprintf(stderr, "%s\n", opened.error().c_str());
+            return 2;
+        }
+        bots = std::move(*opened);
+        log::info("Bots: external bots connect to {} with the token {} (python -m opense4.bot MODULE:CLASS --port {} --slot N)", bots->address(),
+                  bots->token(), bots->port());
+        sdk::PlayerSetup players = bots->playerSetup();
+        players.failures = failures;
+        sdk::installPlayers(std::move(players));
+    } else {
+        sdk::PlayerSetup players;
+        players.failures = failures;
+        sdk::installPlayers(std::move(players));
+    }
+    const int code = client::App().run(options);
+    sdk::installPlayers();   // the bots go before the sessions that point to them
+    return code;
+}

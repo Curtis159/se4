@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "runtime": "jsdom, actual packaged WASM, real PostgreSQL/RLS via REST shim; no production deployment or visual QA",
+  "evidence": [
+    "loaded v15 local save creates fresh lobby",
+    "invite joins empire slot and resumes saved turn",
+    "host transfer on leave; departed game hidden",
+    "vacant empire returns to AI without restarting campaign",
+    "host end retains save; download before typed-name deletion",
+    "deleted game restored from retained local copy into new ID"
+  ]
+}

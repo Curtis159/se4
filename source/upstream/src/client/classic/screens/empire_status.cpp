@@ -1,0 +1,1088 @@
+// Empire Status (F11) and the windows opened from it: Empire Options,
+// Ministers, Systems To Avoid, Waypoints, Strategies and Repair Priorities
+// (docs/spec/06 §1.2, docs/spec/02 §5-§7 and §10, docs/spec/04 §16).
+
+#include "client/classic/quadrant_map.hpp"
+#include "client/classic/reports.hpp"
+#include "client/classic/screens/colony_widgets.hpp"
+#include "client/classic/screens/list_widgets.hpp"
+#include "client/classic/screens/reorder_popup.hpp"
+#include "client/classic/screens/screens.hpp"
+#include "client/classic/screens/ships_common.hpp"
+#include "client/script/items.hpp"
+#include "client/classic/widgets.hpp"
+#include "game/ai_data.hpp"
+#include "game/combat.hpp"
+#include "game/setup.hpp"
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <format>
+#include <span>
+#include <utility>
+
+namespace opense4::client::classic {
+
+namespace {
+
+namespace cmd = game::cmd;
+
+const ImVec4 kErrorText{1.0f, 0.5f, 0.45f, 1.0f};
+
+// Shows a failed command's reason until the next command.
+struct CommandStatus {
+    std::string error;
+    void issue(UiContext& ui, game::Command c) {
+        const game::CommandResult r = ui.session.issue(std::move(c));
+        error = r.ok ? std::string{} : r.error;
+    }
+    void draw() const {
+        if (!error.empty()) ImGui::TextColored(kErrorText, "%s", error.c_str());
+    }
+};
+
+// Frame on which a window of this group handed the input to the main window
+// (Waypoints -> Set); Empire Status closes too so the main window is not blocked.
+int gPickFrame = -10;
+
+bool pickRequestedRecently() { return gPickFrame >= ImGui::GetFrameCount() - 1; }
+
+// ---- Empire Status -------------------------------------------------------------------------
+
+// The original's layout (spec 06 §7 Q95, confirmed: binary), in window
+// coordinates: block headings in the large font, silver, at x 20; row labels
+// in label blue at x 30; the three amounts right-aligned at x 380, 460 and
+// 540 in the resource colours, written in full; the resource icons only after
+// the amounts of From Our Colonies; a label-blue rule from x 330 to 570 over
+// each Total; Net Resources Per Turn a labelled row of its own, a positive
+// amount with "+".
+
+constexpr std::array<Icon, 3> kResourceIcons{Icon::Minerals, Icon::Organics, Icon::Radioactives};
+constexpr std::array<uint32_t, 3> kResourceColors{palette::kMinerals, palette::kOrganics, palette::kRadioactives};
+constexpr std::array<float, 3> kAmountX{380, 460, 540};
+
+void statusText(UiContext& ui, ImVec2 origin, ImFont* font, float size, float lead, Vec2 at, ImU32 color, std::string_view text) {
+    ImGui::GetWindowDrawList()->AddText(font, ui.fontPx(size), ImVec2(std::floor(origin.x + ui.px(at.x)), std::floor(origin.y + ui.px(at.y + lead))), color,
+                                        text.data(), text.data() + text.size());
+}
+
+// One row at `y`: the label, then the three amounts; `icons` puts each
+// resource's icon after its amount, `sign` writes "+" before a positive one.
+void amountRow(UiContext& ui, ImVec2 origin, float y, const char* label, const game::Resources& r, bool icons = false, bool sign = false) {
+    statusText(ui, origin, ui.fonts.regular, kTextSize, kTextLead, {30, y}, imColor(palette::kLabel), label);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    for (size_t i = 0; i < 3; ++i) {
+        const std::string text = (sign && r.v[i] > 0 ? "+" : "") + formatNumber(r.v[i]);
+        const float w = ImGui::CalcTextSize(text.c_str()).x / ui.k();
+        statusText(ui, origin, ui.fonts.regular, kTextSize, kTextLead, {kAmountX[i] - w, y}, imColor(kResourceColors[i]), text);
+        if (icons)
+            if (const Sprite icon = ui.art.icon16(kResourceIcons[i]))
+                dl->AddImage(ImTextureRef(static_cast<ImTextureID>(icon.tex.value)), ImVec2(origin.x + ui.px(kAmountX[i] + 2), origin.y + ui.px(y)),
+                             ImVec2(origin.x + ui.px(kAmountX[i] + 18), origin.y + ui.px(y + 16)), {icon.uv.min.x, icon.uv.min.y},
+                             {icon.uv.max.x, icon.uv.max.y});
+    }
+}
+
+class EmpireStatusScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        if (pickRequestedRecently()) return false;
+        Dialog d(ui, "Empire Status", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::Empire& me = ui.me();
+        const game::EconomyReport& eco = me.economy;
+        d.beginContent(576);
+        const ImVec2 origin = d.at({0, 0});
+        // From Our Colonies is the colonies' production total, which in the
+        // original holds the income of abilities and the minimum-income floor
+        // (spec 02 counts them in production) and, for a computer player, its
+        // bonus (spec 06 §7 Q95): our engine keeps those apart (otherIncome)
+        // and adds them here.
+        const game::Resources colonies = eco.colonies + eco.otherIncome;
+        const game::Resources income = colonies + eco.trade + eco.tariffsIn + eco.remoteMining;
+        const game::Resources expenses = eco.tariffsOut + eco.maintenance + eco.construction;
+        const ImU32 silver = imColor(palette::kHeading);
+        statusText(ui, origin, ui.fonts.bold, kTitleSize, kTitleLead, {20, 40}, silver, "Resource Production Per Turn");
+        amountRow(ui, origin, 60, "From Our Colonies", colonies, true);
+        amountRow(ui, origin, 80, "From Trade", eco.trade);
+        amountRow(ui, origin, 100, "From Tariffs", eco.tariffsIn);
+        amountRow(ui, origin, 120, "From Remote Mining", eco.remoteMining);
+        amountRow(ui, origin, 150, "Total", income);
+        statusText(ui, origin, ui.fonts.bold, kTitleSize, kTitleLead, {20, 180}, silver, "Resource Expenses Per Turn");
+        amountRow(ui, origin, 200, "Tariffs", eco.tariffsOut);
+        amountRow(ui, origin, 220, "Maintenance Cost", eco.maintenance);
+        amountRow(ui, origin, 240, "Construction Queue Usage", eco.construction);
+        amountRow(ui, origin, 270, "Total", expenses);
+        amountRow(ui, origin, 310, "Net Resources Per Turn", income - expenses, false, true);
+        // For lessons: the production and expenses, and the net row.
+        ui.tag("empire-status:budget", d.at({15, 38}), d.at({575, 290}));
+        ui.tag("empire-status:net", d.at({15, 306}), d.at({575, 330}));
+        statusText(ui, origin, ui.fonts.bold, kTitleSize, kTitleLead, {20, 350}, silver, "Resources in Treasury");
+        amountRow(ui, origin, 370, "Current Total", me.stockpile);
+        amountRow(ui, origin, 390, "Maximum Resource Storage", eco.storageCap);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        for (const float y : {145.0f, 265.0f})
+            dl->AddRectFilled(ImVec2(origin.x + ui.px(330), origin.y + ui.px(y)), ImVec2(origin.x + ui.px(570), origin.y + ui.px(y + 1)),
+                              imColor(palette::kLabel));
+        ImGui::SetCursorScreenPos(d.at({30, 420}));
+        status_.draw();
+        ImGui::Dummy(ImVec2(0, 0));
+
+        // The original's column: the six windows, Change Email in the 12th slot
+        // and Change Password in the 13th (observed, spec 07 session 3).
+        d.beginButtons();
+        if (d.button("Empire Options")) ui.open(ScreenId::EmpireOptions);
+        if (d.button("Ministers")) ui.open(ScreenId::Ministers);
+        if (d.button("Systems To Avoid")) ui.open(ScreenId::SystemsToAvoid);
+        if (d.button("Waypoints")) ui.open(ScreenId::Waypoints);
+        if (d.button("Strategies")) ui.open(ScreenId::Strategies);
+        if (d.button("Repair Priorities")) ui.open(ScreenId::RepairPriorities);
+        for (int gap = 0; gap < 5; ++gap) d.spacer();
+        // Change Email asks for the empire's address, holding the current one;
+        // OK stores it, the password is kept (spec 06 §7 Q95, confirmed: binary).
+        if (d.button("Change Email")) {
+            email_ = me.email;
+            ImGui::OpenPopup("Change Email");
+        }
+        emailPopup(ui);
+        if (d.button("Change Password")) {
+            password_.clear();
+            repeat_.clear();
+            passwordError_.clear();
+            ImGui::OpenPopup("Change Password");
+        }
+        passwordPopup(ui);
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    // The original's input box (spec 06 §7 Q95): "Please Enter Email Address",
+    // the current address in the field, OK and Cancel. Ours is drawn as our
+    // other input boxes are.
+    void emailPopup(UiContext& ui) {
+        ImGui::SetNextWindowSize(ui.size({360, 0}));
+        if (!ImGui::BeginPopupModal("Change Email", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize)) return;
+        ImGui::TextColored(kLabelBlue, "Please Enter Email Address");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        const bool enter = inputString("##email", email_, game::kMaxEmailBytes, ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::Spacing();
+        const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (ImGui::Button("OK", ImVec2(w, ui.px(26))) || enter) {
+            status_.issue(ui, game::cmd::SetEmail{email_});
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(w, ui.px(26))) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    void passwordPopup(UiContext& ui) {
+        ImGui::SetNextWindowSize(ui.size({360, 0}));
+        if (!ImGui::BeginPopupModal("Change Password", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize)) return;
+        ImGui::TextWrapped("Players must enter this password before playing a turn for %s. Leave both fields empty to remove it.",
+                           ui.me().name.c_str());
+        ImGui::Spacing();
+        ImGui::TextColored(kLabelBlue, "New password");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        inputString("##pw", password_, 64, ImGuiInputTextFlags_Password);
+        ImGui::TextColored(kLabelBlue, "Repeat it");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        inputString("##pw2", repeat_, 64, ImGuiInputTextFlags_Password);
+        if (!passwordError_.empty()) ImGui::TextColored(kErrorText, "%s", passwordError_.c_str());
+        ImGui::Spacing();
+        const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (ImGui::Button("OK", ImVec2(w, ui.px(26))) || (!ImGui::IsWindowAppearing() && ImGui::IsKeyPressed(ImGuiKey_Enter, false))) {
+            if (password_ != repeat_) {
+                passwordError_ = "The two entries differ.";
+            } else if (auto value = ui.session.empirePasswordValue(password_); !value) {
+                passwordError_ = value.error();
+            } else {
+                status_.issue(ui, cmd::SetEmpireOptions{.passwordHash = std::move(*value)});
+                password_.clear();
+                repeat_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(w, ui.px(26))) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    CommandStatus status_;
+    std::string password_, repeat_, passwordError_;
+    std::string email_;
+};
+
+// ---- Empire Options --------------------------------------------------------------------------
+
+// The facility marker rows of System Display (spec 06 §1.9), our wording.
+constexpr std::array<const char*, game::kFacilityMarkerGroups> kMarkerRows{{
+    "Markers R / S / Y: resupply depots, spaceports, space yards",
+    "Markers Ca / Cc / Cv: atmosphere, conditions and value changers",
+    "Markers St / Ft: ship and fleet training",
+    "Markers Rc / Rr: component repair, resource reclamation",
+    "Markers Sst / Sft: system-wide ship and fleet training",
+    "Markers Spv / Spc: system-wide value and conditions changes",
+    "Markers Sph / Spa: system-wide happiness and population changes",
+    "Markers Scm / Sdm: system-wide combat and damage modifiers",
+    "Markers Srm / Ssm: system-wide reproduction and shield modifiers",
+    "Markers Spp / Src: system-wide plague prevention, reduced maintenance",
+    "Markers Sbe / Sbi: system-wide bad event and bad intelligence chances",
+    "Marker Slr: system-wide long range scanners",
+}};
+
+// Every row belongs to the empire and is saved with the game (spec 06 §1.9,
+// confirmed: binary): the InterfaceOptions through cmd::SetInterfaceOptions,
+// the colony type picker through cmd::SetEmpireOptions, Ship Movement and
+// Ship Orders through cmd::SetEncounterOptions.
+class EmpireOptionsScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Empire Options", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::Empire& me = ui.me();
+        game::InterfaceOptions o = ui.options();
+        d.beginContent();
+        ImGui::TextColored(kLabelBlue, "Options In Use");
+        beginList(ui, "##options", ImVec2(0, 0), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        heading(ui, "General Options");
+        lampToggle(ui, "Show the log at the start of each turn", &o.showLogAtTurnStart);
+        lampToggle(ui, "Confirm ending the turn", &o.confirmEndTurn);
+        lampToggle(ui, "Confirm scrapping", &o.confirmScrap);
+        lampToggle(ui, "Confirm stellar manipulation", &o.confirmStellarManipulation);
+        lampToggle(ui, "Confirm deleting a research project", &o.confirmDeleteResearch);
+        lampToggle(ui, "Confirm deleting an intelligence project", &o.confirmDeleteIntel);
+        lampToggle(ui, "Confirm deleting the first item of a construction queue", &o.confirmDeleteFirstQueueItem);
+        bool choose = me.chooseColonyType;
+        if (lampToggle(ui, "Pick the colony type when a colony is founded", &choose))
+            status_.issue(ui, cmd::SetEmpireOptions{.chooseColonyType = choose});
+        lampToggle(ui, "Note when a similar system-wide ability already exists", &o.noteSimilarAbilities);
+        ImGui::Spacing();
+        heading(ui, "Next / Previous");
+        lampToggle(ui, "Skip ships under construction", &o.skipUnderConstruction);
+        lampToggle(ui, "Skip damaged ships", &o.skipDamaged);
+        lampToggle(ui, "Stop only once per location", &o.stopOncePerLocation);
+        lampToggle(ui, "Skip ships in fleets", &o.skipInFleets);
+        ImGui::Spacing();
+        heading(ui, "Ship Movement");
+        bool minefields = me.avoidTaggedMinefields;
+        if (lampToggle(ui, "Avoid minefields", &minefields)) status_.issue(ui, cmd::SetEncounterOptions{.avoidTaggedMinefields = minefields});
+        bool restricted = me.avoidRestrictedSystems;
+        if (lampToggle(ui, "Avoid restricted systems", &restricted))
+            status_.issue(ui, cmd::SetEncounterOptions{.avoidRestrictedSystems = restricted});
+        ImGui::Spacing();
+        heading(ui, "Ship Orders");
+        const game::EncounterClear clear = me.clearOrdersOnEncounter;
+        bool onEnemy = clear != game::EncounterClear::Never;
+        bool onAny = clear == game::EncounterClear::Any;
+        if (lampToggle(ui, "Clear orders on entering a system with an enemy", &onEnemy))
+            status_.issue(ui, cmd::SetEncounterOptions{onEnemy ? game::EncounterClear::Enemy : game::EncounterClear::Never});
+        if (lampToggle(ui, "Clear orders on entering a system with any other empire", &onAny))
+            status_.issue(ui, cmd::SetEncounterOptions{onAny ? game::EncounterClear::Any : game::EncounterClear::Enemy});
+        ImGui::Spacing();
+        heading(ui, "System Display");
+        lampToggle(ui, "Warp point names", &o.warpPointNames);
+        lampToggle(ui, "Planet names", &o.planetNames);
+        lampToggle(ui, "Colonizable planets", &o.colonizableMarkers);
+        lampToggle(ui, "System grid", &o.systemGrid);
+        lampToggle(ui, "Coordinate location", &o.coordinateLocation);
+        for (int i = 0; i < game::kFacilityMarkerGroups; ++i) {
+            const uint16_t bit = uint16_t(1u << i);
+            bool on = (o.facilityMarkers & bit) != 0;
+            if (lampToggle(ui, kMarkerRows[size_t(i)], &on)) o.facilityMarkers = uint16_t(on ? o.facilityMarkers | bit : o.facilityMarkers & ~bit);
+        }
+        ImGui::Spacing();
+        heading(ui, "Galaxy Display");
+        lampToggle(ui, "Show grid lines", &o.galaxyGridLines);
+        lampToggle(ui, "Show warp lines", &o.galaxyWarpLines);
+        ImGui::Spacing();
+        heading(ui, "Latest Items");
+        lampToggle(ui, "Only the latest items for construction", &o.latestConstructionOnly);
+        lampToggle(ui, "Only the latest components for designs", &o.latestComponentsOnly);
+        ImGui::Spacing();
+        heading(ui, "Politics");
+        lampToggle(ui, "Claim every system we colonize", &o.autoClaimColonized);
+        status_.draw();
+        endList(ui);
+        if (!ui.setOptions(o)) status_.error = "The options cannot be changed now.";
+        d.beginButtons();
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    CommandStatus status_;
+};
+
+// ---- Ministers -------------------------------------------------------------------------------
+
+// The minister switches and style are part of the empire (spec 02 §10, spec
+// 05 §7.1): every change is a cmd::SetMinisters, so the host and the AI see it.
+class MinistersScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Ministers", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::Empire& me = ui.me();
+        d.beginContent();
+        const float col = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        // Room below the lists for the new-vehicle switch, the style switch and picker, and a status line.
+        const float below = ImGui::GetFrameHeightWithSpacing() * 5 + ImGui::GetStyle().ItemSpacing.y * 2;
+        const float listHeight = std::max(ui.px(200), ImGui::GetContentRegionAvail().y - below);
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass == 1) ImGui::SameLine();
+            beginList(ui, pass == 0 ? "##global" : "##individual", ImVec2(col, listHeight), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+            heading(ui, pass == 0 ? "Empire-wide ministers" : "Individual ministers");
+            wrappedDim(pass == 0 ? "Each takes over its whole area." : "Each acts on ships and planets with the minister flag set.");
+            ImGui::Spacing();
+            for (size_t i = 0; i < game::kMinisters; ++i) {
+                const auto m = static_cast<game::Minister>(i);
+                if (game::isGlobalMinister(m) != (pass == 0)) continue;
+                const uint32_t bit = game::ministerBit(m);
+                bool on = (me.ministers & bit) != 0;
+                if (lampToggle(ui, std::string(game::displayName(m)).c_str(), &on))
+                    status_.issue(ui, cmd::SetMinisters{.areas = on ? (me.ministers | bit) : (me.ministers & ~bit)});
+            }
+            endList(ui);
+        }
+        ImGui::Spacing();
+        bool newVehicles = me.ministersForNewVehicles;
+        if (lampToggle(ui, "Put newly built vehicles and launched units under their individual ministers", &newVehicles))
+            status_.issue(ui, cmd::SetMinisters{.newVehicles = newVehicles});
+        // A Ministers option in the original (spec 06 §1.2.1); it used to sit in Empire Status.
+        bool minimal = me.aiMinimalChanges;
+        if (lampToggle(ui, "In a simultaneous game, the computer changes nothing when it plays a missed turn for us", &minimal))
+            status_.issue(ui, cmd::SetEmpireOptions{.aiMinimalChanges = minimal});
+        styleChoice(ui, me);
+        status_.draw();
+
+        d.beginButtons();
+        if (d.button("Select All")) status_.issue(ui, cmd::SetMinisters{.areas = game::kAllMinisters});
+        if (d.button("Select None")) status_.issue(ui, cmd::SetMinisters{.areas = 0u});
+        // Indiv. On and Off ask first; Complete AI does not (spec 02 §10, confirmed: binary).
+        if (d.button("Indiv. On")) {
+            individualOn_ = true;
+            confirm_.open("Turn individual ministers ON for all ships and planets?", "Confirm");
+        }
+        if (d.button("Indiv. Off")) {
+            individualOn_ = false;
+            confirm_.open("Turn individual ministers OFF for all ships and planets?", "Confirm");
+        }
+        d.spacer();
+        // Plain buttons: Complete AI is a bulk change, not a state the window
+        // shows (spec 02 §10, confirmed: binary).
+        if (d.button("Complete AI On")) status_.issue(ui, cmd::SetMinisters{.completeAi = true});
+        if (d.button("Complete AI Off")) status_.issue(ui, cmd::SetMinisters{.completeAi = false});
+        d.close();
+        if (confirm_.draw(ui)) status_.issue(ui, cmd::SetMinisters{.individual = individualOn_});
+        return d.keepOpen();
+    }
+
+private:
+    CommandStatus status_;
+    ConfirmPopup confirm_;
+    bool individualOn_ = true;
+
+    // The personality set the ministers' AI files come from (spec 05 §7.2).
+    // OpenSE4 lets the player change it during the game.
+    void styleChoice(UiContext& ui, const game::Empire& me) {
+        bool raceStyle = me.useRaceMinisterStyle;
+        if (lampToggle(ui, "Ministers follow our race's own style", &raceStyle)) status_.issue(ui, cmd::SetMinisters{.useRaceStyle = raceStyle});
+        const std::vector<std::string> styles = game::ai::ministerStyles(ui.rules());
+        ImGui::BeginDisabled(me.useRaceMinisterStyle);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Minister style");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ui.px(220));
+        const std::string current = me.ministerStyle.empty() ? std::string("Race") : me.ministerStyle;
+        if (ImGui::BeginCombo("##ministerStyle", current.c_str())) {
+            if (ImGui::Selectable("Race", me.ministerStyle.empty())) status_.issue(ui, cmd::SetMinisters{.style = std::string{}});
+            for (const std::string& st : styles)
+                if (ImGui::Selectable(st.c_str(), st == me.ministerStyle)) status_.issue(ui, cmd::SetMinisters{.style = st});
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+    }
+};
+
+// ---- Systems To Avoid ------------------------------------------------------------------------
+
+class SystemsToAvoidScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Systems To Avoid", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const game::Empire& me = ui.me();
+        const bool claimTab = overlay_ == MapOverlay::AllyClaimed;
+        d.beginContent();
+        // A click toggles the avoid mark on every tab (spec 06 §1.2, confirmed: binary).
+        dimText(me.avoidRestrictedSystems ? "Click a system to mark it as one our ships avoid, or to clear the mark."
+                                          : "Click a system to mark it as one to avoid, or to clear the mark. Routes ignore the marks while the "
+                                            "Empire Options switch to avoid them is off.");
+        QuadrantMapOptions opt;
+        opt.overlay = overlay_;
+        opt.names = true;
+        opt.avoidRings = overlay_ != MapOverlay::Avoid;
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const QuadrantMapResult r = quadrantMap(ui, "##map", {avail.x / ui.k(), avail.y / ui.k() - 48}, opt);
+        if (r.clicked) {
+            const bool avoided = std::binary_search(me.systemsToAvoid.begin(), me.systemsToAvoid.end(), *r.clicked);
+            status_.issue(ui, cmd::SetSystemFlags{.system = *r.clicked, .avoid = !avoided});
+        }
+        // Status line: the hovered system, else the totals.
+        if (r.hovered) {
+            const game::SystemId sys = *r.hovered;
+            std::string line = s.galaxy.system(sys).name;
+            if (std::binary_search(me.systemsToAvoid.begin(), me.systemsToAvoid.end(), sys)) line += "  -  avoided";
+            for (const game::Empire& e : s.empires)
+                if (e.alive && std::binary_search(e.claimedSystems.begin(), e.claimedSystems.end(), sys) &&
+                    (e.id == me.id || me.relation(e.id).contact))
+                    line += std::format("  -  claimed by {}", e.id == me.id ? std::string("us") : e.name);
+            ImGui::TextUnformatted(line.c_str());
+        } else {
+            ImGui::TextUnformatted(std::format("{} systems avoided, {} claimed by us", me.systemsToAvoid.size(), me.claimedSystems.size()).c_str());
+        }
+        status_.draw();
+
+        d.beginButtons();
+        if (d.tab("Avoid", overlay_ == MapOverlay::Avoid)) overlay_ = MapOverlay::Avoid;
+        if (d.tab("Presence", overlay_ == MapOverlay::Presence)) overlay_ = MapOverlay::Presence;
+        if (d.tab("Ally Claimed", overlay_ == MapOverlay::AllyClaimed)) overlay_ = MapOverlay::AllyClaimed;
+        if (d.tab("Enemy Claimed", overlay_ == MapOverlay::EnemyClaimed)) overlay_ = MapOverlay::EnemyClaimed;
+        d.spacer();
+        if (d.button("Clear All", !me.systemsToAvoid.empty())) {
+            const std::vector<game::SystemId> list = me.systemsToAvoid;
+            for (game::SystemId sys : list) status_.issue(ui, cmd::SetSystemFlags{.system = sys, .avoid = false});
+        }
+        // OpenSE4's own: claims are made in the Borders window; this gives them all up.
+        if (claimTab && d.button("Release All Claims", !me.claimedSystems.empty())) {
+            const std::vector<game::SystemId> list = me.claimedSystems;
+            for (game::SystemId sys : list) status_.issue(ui, cmd::SetSystemFlags{.system = sys, .claim = false});
+        }
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    MapOverlay overlay_ = MapOverlay::Avoid;
+    CommandStatus status_;
+};
+
+// ---- Waypoints -------------------------------------------------------------------------------
+
+// Slot 0..9 holds waypoint 1..10 (spec 03 §8.1).
+std::string waypointName(const game::Waypoint& w, int slot) { return w.name.empty() ? std::format("Waypoint {}", slot + 1) : w.name; }
+
+class WaypointsScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Waypoints", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const game::Empire& me = ui.me();
+        const auto& wps = me.waypoints;
+        const game::Waypoint& sel = wps[size_t(selected_)];
+        d.beginContent();
+
+        const float left = ui.px(330);
+        ImGui::BeginChild("##left", ImVec2(left, 0), ImGuiChildFlags_None);
+        heading(ui, "Waypoints");
+        if (ImGui::BeginTable("##wps", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn("Waypoint", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn("Location", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableHeadersRow();
+            // Rows "1 - name" to "10 - name" (spec 06 §1.2, confirmed: binary); the location column is ours.
+            for (int i = 0; i < int(wps.size()); ++i) {
+                const game::Waypoint& w = wps[size_t(i)];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::PushID(i);
+                const std::string label = std::format("{} - {}", i + 1, w.set ? waypointName(w, i) : std::string());
+                if (ImGui::Selectable(label.c_str(), selected_ == i, ImGuiSelectableFlags_SpanAllColumns)) selected_ = i;
+                ImGui::PopID();
+                ImGui::TableSetColumnIndex(1);
+                if (w.set) ImGui::TextUnformatted(sectorName(s, w.location, ui.session.player()).c_str());
+                else dimText("(not set)");
+            }
+            ImGui::EndTable();
+        }
+        ImGui::Spacing();
+        // En route: every vehicle with a Move To Waypoint order for it, fleet
+        // members one by one; a right-click opens its report (spec 06 §1.2,
+        // confirmed: binary).
+        heading(ui, "Ships heading there");
+        beginList(ui, "##ships", ImVec2(0, ui.px(130)), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        int shown = 0;
+        if (sel.set) {
+            for (const game::Vehicle& v : s.vehicles) {
+                if (v.owner != me.id || v.count <= 0 ||
+                    std::none_of(v.orders.begin(), v.orders.end(),
+                                 [&](const game::Order& o) { return o.kind == game::OrderKind::MoveToWaypoint && o.amount == selected_; }))
+                    continue;
+                ImGui::PushID(static_cast<int>(v.id.value));
+                image(ui, vehicleMini(ui, v), {18, 18});
+                ImGui::SameLine();
+                ImGui::Selectable(v.name.c_str(), false);
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) report_.vehicle(v.id);
+                ImGui::PopID();
+                ++shown;
+            }
+        }
+        if (shown == 0) dimText("None");
+        endList(ui);
+        heading(ui, "Space yards sending new ships there");
+        beginList(ui, "##yards", ImVec2(0, 0), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        int yards = 0;
+        for (const auto& c : s.colonies)
+            if (c && c->owner == me.id && c->queue.autoWaypoint == selected_) {
+                ImGui::TextUnformatted(s.galaxy.object(c->planet).name.c_str());
+                ++yards;
+            }
+        for (const game::Vehicle& v : s.vehicles)
+            if (v.owner == me.id && v.queue.autoWaypoint == selected_) {
+                ImGui::TextUnformatted(v.name.c_str());
+                ++yards;
+            }
+        if (yards == 0) dimText("None");
+        endList(ui);
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        QuadrantMapOptions opt;
+        opt.names = true;
+        for (int i = 0; i < int(wps.size()); ++i)
+            if (wps[size_t(i)].set) opt.tags.emplace_back(wps[size_t(i)].location.system, std::to_string(i + 1));
+        if (sel.set) opt.highlight.push_back(sel.location.system);
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        quadrantMap(ui, "##map", {avail.x / ui.k(), avail.y / ui.k() - 24}, opt);
+        if (sel.set) ImGui::Text("%s: %s", waypointName(sel, selected_).c_str(), sectorName(s, sel.location, ui.session.player()).c_str());
+        else dimText("Set places a waypoint on a sector you pick in the main window.");
+        status_.draw();
+        ImGui::EndGroup();
+
+        d.beginButtons();
+        bool keep = true;
+        if (d.button("Set")) {
+            const int slot = selected_;
+            std::string name = sel.set ? sel.name : std::format("Waypoint {}", slot + 1);
+            ui.requests.pickLocation = [session = &ui.session, opener = ui.opener, slot, name](game::Location where) {
+                game::Waypoint w;
+                w.name = name;
+                w.location = where;
+                w.set = true;
+                session->issue(cmd::SetWaypoint{slot, w});
+                if (opener) opener(ScreenId::Waypoints, ScreenArgs{.index = slot});
+            };
+            ui.requests.pickPrompt = std::format("Set {}: pick a sector", name);
+            gPickFrame = ImGui::GetFrameCount();
+            keep = false;
+        }
+        if (d.button("Delete", sel.set)) status_.issue(ui, cmd::SetWaypoint{selected_, std::nullopt});
+        if (d.button("Rename", sel.set)) {
+            renameDraft_.clear();   // the prompt starts empty (spec 06 §1.2, confirmed: binary)
+            ImGui::OpenPopup("Rename Waypoint");
+        }
+        renamePopup(ui);
+        d.close();
+        report_.draw(ui);
+        return keep && d.keepOpen();
+    }
+
+    explicit WaypointsScreen(int slot) : selected_(std::clamp(slot, 0, 9)) {}
+
+private:
+    void renamePopup(UiContext& ui) {
+        ImGui::SetNextWindowSize(ui.size({340, 0}));
+        if (!ImGui::BeginPopupModal("Rename Waypoint", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize)) return;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        inputString("##name", renameDraft_, 40);
+        const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if ((ImGui::Button("OK", ImVec2(w, ui.px(26))) || (!ImGui::IsWindowAppearing() && ImGui::IsKeyPressed(ImGuiKey_Enter, false))) && !renameDraft_.empty()) {
+            game::Waypoint wp = ui.me().waypoints[size_t(selected_)];
+            wp.name = renameDraft_;
+            status_.issue(ui, cmd::SetWaypoint{selected_, wp});
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(w, ui.px(26))) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    int selected_ = 0;
+    std::string renameDraft_;
+    CommandStatus status_;
+    shipui::ReportPopup report_;
+};
+
+// ---- Strategies ------------------------------------------------------------------------------
+
+// Value identifiers of the strategy fields (docs/spec/04 §16).
+// Movement identifiers from the closest engagement to the most distant, with our descriptions.
+constexpr std::array<const char*, 8> kMovement{"Point Blank",       "Short Weapons Range", "Optimal Weapons Range",     "Maximum Weapons Range",
+                                               "Board Enemy Ships", "Ram",                 "Drop Troops (if carrying)", "Don't Get Hurt"};
+constexpr std::array<const char*, 8> kMovementHelp{
+    "Get as close as possible.",
+    "Fight from 1 to 3 squares away while taking as little fire as possible.",
+    "Take the square with the best ratio of damage dealt to damage taken.",
+    "Keep at the range of our longest weapon.",
+    "Close to an adjacent square and try to capture the target.",
+    "Ram the target.",
+    "Close on a planet and land troops; otherwise use the secondary strategy.",
+    "Stay where no enemy can fire on us."};
+// Targeting identifiers, grouped in opposite pairs.
+constexpr std::array<const char*, 12> kTargeting{"Has Weapons", "Does Not Have Weapons", "Strongest", "Weakest", "Most Damaged", "Least Damaged",
+                                                 "Nearest",     "Farthest",              "Largest",   "Smallest", "Fastest",      "Slowest"};
+
+bool isTrue(std::string_view v) {
+    std::string l(v);
+    for (char& c : l) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return l == "true" || l == "yes" || l == "1";
+}
+
+int toInt(std::string_view v, int fallback = 0) {
+    int out = fallback;
+    while (!v.empty() && v.front() == ' ') v.remove_prefix(1);
+    std::from_chars(v.data(), v.data() + v.size(), out);
+    return out;
+}
+
+std::string* valueOf(ruleset::CombatStrategy& st, std::string_view key) {
+    for (auto& [k, v] : st.settings)
+        if (k == key) return &v;
+    return nullptr;
+}
+
+std::string& valueRef(ruleset::CombatStrategy& st, std::string_view key, std::string_view fallback) {
+    if (std::string* v = valueOf(st, key)) return *v;
+    st.settings.emplace_back(std::string(key), std::string(fallback));
+    return st.settings.back().second;
+}
+
+// What a key a record leaves out stands for: a new strategy's value, which
+// the engine starts from too (spec 04 §16, combat::newStrategyRecord).
+std::string defaultSetting(std::string_view key) {
+    static const ruleset::CombatStrategy record = game::combat::newStrategyRecord("");
+    for (const auto& [k, v] : record.settings)
+        if (k == key) return v;
+    return {};
+}
+
+// The target types in the data files' order (spec 08 §3.6.13).
+constexpr std::array<game::combat::TargetCategory, game::combat::kTargetCategories> kFileCategoryOrder{
+    game::combat::TargetCategory::Bases,          game::combat::TargetCategory::Ships,
+    game::combat::TargetCategory::Carriers,       game::combat::TargetCategory::ColonyShips,
+    game::combat::TargetCategory::Fighters,       game::combat::TargetCategory::Satellites,
+    game::combat::TargetCategory::Mines,          game::combat::TargetCategory::Planets,
+    game::combat::TargetCategory::Transports,     game::combat::TargetCategory::BasesNoWeapons,
+    game::combat::TargetCategory::ShipsNoWeapons, game::combat::TargetCategory::SeekersOnUs,
+    game::combat::TargetCategory::SeekersOnOthers, game::combat::TargetCategory::Drones,
+};
+
+// A combo over identifiers (keeps an unknown current value selectable).
+template <size_t N>
+bool identifierCombo(const char* id, std::string& value, const std::array<const char*, N>& options) {
+    bool changed = false;
+    if (ImGui::BeginCombo(id, value.c_str())) {
+        bool known = false;
+        for (const char* o : options) {
+            known = known || value == o;
+            if (ImGui::Selectable(o, value == o)) {
+                changed = value != o;
+                value = o;
+            }
+        }
+        if (!known && !value.empty()) ImGui::Selectable(value.c_str(), true);
+        ImGui::EndCombo();
+    }
+    return changed;
+}
+
+// A slider that commits only when released (one command per edit).
+bool intSlider(const char* id, std::string& value, int lo, int hi, const char* format = "%d") {
+    ImGui::PushID(id);
+    ImGuiStorage* storage = ImGui::GetStateStorage();
+    const ImGuiID draftKey = ImGui::GetID("draft"), activeKey = ImGui::GetID("active");
+    const int current = toInt(value);
+    int v = storage->GetBool(activeKey, false) ? storage->GetInt(draftKey, current) : current;
+    ImGui::SliderInt("##v", &v, lo, hi, format, ImGuiSliderFlags_AlwaysClamp);
+    script::reportItem(id);   // input scripts find the slider by its setting
+    storage->SetInt(draftKey, v);
+    storage->SetBool(activeKey, ImGui::IsItemActive());
+    const bool commit = ImGui::IsItemDeactivatedAfterEdit() && v != current;
+    ImGui::PopID();
+    if (commit) value = std::to_string(v);
+    return commit;
+}
+
+bool boolField(UiContext& ui, const char* label, std::string& value) {
+    bool on = isTrue(value);
+    if (!lampToggle(ui, label, &on)) return false;
+    value = on ? "True" : "False";
+    return true;
+}
+
+void fieldLabel(UiContext& ui, const char* label, float width = 200) {
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(kLabelBlue, "%s", label);
+    ImGui::SameLine(ui.px(width));
+}
+
+class StrategiesScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Strategies", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const game::Empire& me = ui.me();
+        const auto& list = me.strategies;
+        selected_ = std::clamp(selected_, 0, std::max(0, int(list.size()) - 1));
+        d.beginContent();
+
+        beginList(ui, "##list", ImVec2(ui.px(220), 0), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        heading(ui, "Strategies");
+        for (int i = 0; i < int(list.size()); ++i) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(list[size_t(i)].name.c_str(), selected_ == i)) selected_ = i;
+            ImGui::PopID();
+        }
+        endList(ui);
+        ui.tagItem("strategies:list");   // for lessons
+        ImGui::SameLine();
+        ImGui::BeginChild("##page", ImVec2(0, 0), ImGuiChildFlags_Borders);
+        if (list.empty()) {
+            dimText("This empire has no strategies. Add one.");
+        } else {
+            ruleset::CombatStrategy st = list[size_t(selected_)];
+            bool changed = false;
+            // Name (committed when the field is left).
+            if (nameFor_ != selected_ || !editingName_) {
+                nameDraft_ = st.name;
+                nameFor_ = selected_;
+            }
+            fieldLabel(ui, "Name", 80);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            inputString("##name", nameDraft_, 60);
+            editingName_ = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit() && !nameDraft_.empty() && nameDraft_ != st.name) {
+                st.name = nameDraft_;
+                changed = true;
+            }
+            int designs = 0, fleets = 0;
+            for (game::DesignId id : me.designs) designs += s.design(id).strategy == uint32_t(selected_) ? 1 : 0;
+            for (const game::Fleet& f : s.fleets) fleets += f.owner == me.id && f.strategy == uint32_t(selected_) ? 1 : 0;
+            dimText(std::format("Default strategy of {} designs, used by {} fleets", designs, fleets).c_str());
+            ImGui::Separator();
+            ImGui::BeginChild("##fields", ImVec2(0, 0), ImGuiChildFlags_None);
+            switch (page_) {
+                case 0: changed |= movementPage(ui, st); break;
+                case 1: changed |= firingPage(ui, st); break;
+                case 2: changed |= damagePage(ui, st); break;
+                case 3: changed |= launchingPage(ui, st); break;
+                default: changed |= formationPage(ui, st); break;
+            }
+            pageEnd_ = ImGui::GetCursorScreenPos().y;
+            ImGui::EndChild();
+            if (changed) status_.issue(ui, cmd::SetStrategy{selected_, st});
+        }
+        ImGui::EndChild();
+        // For lessons: the strategy's settings on the page shown, down to the last of them.
+        ui.tag("strategies:page", ImGui::GetItemRectMin(), ImVec2(ImGui::GetItemRectMax().x, std::min(ImGui::GetItemRectMax().y, pageEnd_ + ui.px(4))));
+
+        d.beginButtons();
+        // The original's five pages (spec 04 §16, confirmed: binary).
+        static constexpr std::array<const char*, 5> kPages{"Movement", "Firing", "Damage", "Launching", "Formation"};
+        ImVec2 pagesMin;
+        for (int i = 0; i < int(kPages.size()); ++i) {
+            if (d.tab(kPages[size_t(i)], page_ == i)) page_ = i;
+            if (i == 0) pagesMin = ImGui::GetItemRectMin();
+        }
+        ui.tag("strategies:pages", pagesMin, ImGui::GetItemRectMax());
+        d.spacer();
+        // Add asks for the name and makes the original's new strategy (spec 04 §16).
+        if (d.button("Add")) namePrompt_.open("Enter Strategy Name", "Enter Strategy Name", "");
+        if (d.button("Copy", !list.empty())) {
+            ruleset::CombatStrategy st = list[size_t(selected_)];
+            st.name = "Copy of " + st.name;
+            status_.issue(ui, cmd::SetStrategy{-1, st});
+            if (status_.error.empty()) selected_ = int(ui.me().strategies.size()) - 1;
+        }
+        if (d.button("Remove", list.size() > 1)) status_.issue(ui, cmd::SetStrategy{selected_, {}, true});
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(0.0f);
+        status_.draw();
+        ImGui::PopTextWrapPos();
+        d.close();
+        if (const std::optional<std::string> name = namePrompt_.draw(ui)) {
+            status_.issue(ui, cmd::SetStrategy{-1, game::combat::newStrategyRecord(*name)});
+            if (status_.error.empty()) selected_ = int(ui.me().strategies.size()) - 1;
+        }
+        return d.keepOpen();
+    }
+
+private:
+    float pageEnd_ = 0;   // where the page's settings end (for lessons)
+    bool movementPage(UiContext& ui, ruleset::CombatStrategy& st) {
+        bool changed = false;
+        for (const char* key : {"Primary Movement Strategy", "Secondary Movement Strategy"}) {
+            std::string& v = valueRef(st, key, defaultSetting(key));
+            fieldLabel(ui, key == std::string_view("Primary Movement Strategy") ? "Primary movement" : "Secondary movement", 170);
+            ImGui::SetNextItemWidth(ui.px(250));
+            changed |= identifierCombo(std::format("##{}", key).c_str(), v, kMovement);
+            for (size_t i = 0; i < kMovement.size(); ++i)
+                if (v == kMovement[i]) {
+                    ImGui::SetCursorPosX(ui.px(170));
+                    wrappedDim(kMovementHelp[i]);
+                }
+            ImGui::Spacing();
+        }
+        wrappedDim("Ships use the secondary strategy when the primary one is impossible, for example when a troop "
+                   "strategy has no troops or no planet to land on.");
+        return changed;
+    }
+
+    bool firingPage(UiContext& ui, ruleset::CombatStrategy& st) {
+        bool changed = false;
+        heading(ui, "Target choice");
+        for (int i = 1; i <= 4; ++i) {
+            const std::string key = std::format("Targeting Priority {}", i);
+            fieldLabel(ui, std::format("Priority {}", i).c_str(), 110);
+            ImGui::SetNextItemWidth(ui.px(200));
+            changed |= identifierCombo(("##" + key).c_str(), valueRef(st, key, defaultSetting(key)), kTargeting);
+        }
+        changed |= boolField(ui, "Rank targets by type before the priorities above", valueRef(st, "Use Type Priority First", defaultSetting("Use Type Priority First")));
+        ImGui::Spacing();
+        // The types as one list in rank order, edited in the Target Type Order
+        // window; afterwards they are ranked 1, 2, 3... in the new order. A type
+        // whose rank is outside 1 to 14 is not listed (spec 04 §16, confirmed:
+        // binary). The ranks of keys a record leaves out are a new strategy's.
+        heading(ui, "Target type order");
+        const std::vector<std::string> order = typeOrder(st);
+        std::string shown;
+        for (const std::string& cat : order) shown += (shown.empty() ? "" : ", ") + cat;
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(shown.empty() ? "(none)" : shown.c_str());
+        ImGui::PopTextWrapPos();
+        if (ImGui::Button("Target Type Order", ImVec2(ui.px(200), ui.px(26))) && !order.empty()) typeOrder_.open(order, "Target Type Order");
+        if (const std::optional<std::vector<size_t>> picked = typeOrder_.draw(ui)) {
+            for (size_t k = 0; k < picked->size() && (*picked)[k] < order.size(); ++k)
+                valueRef(st, "Type Priority " + order[(*picked)[k]], "1") = std::to_string(k + 1);
+            changed = true;
+        }
+        ImGui::Spacing();
+        heading(ui, "Never fire on");
+        for (game::combat::TargetCategory c : kFileCategoryOrder) {
+            const std::string cat(game::combat::identifier(c));
+            ImGui::PushID(cat.c_str());
+            changed |= boolField(ui, cat.c_str(), valueRef(st, "Dont Fire On " + cat, defaultSetting("Dont Fire On " + cat)));
+            ImGui::PopID();
+        }
+        return changed;
+    }
+
+    // The target types with a rank from 1 to 14, in rank order, those of one
+    // rank in the data files' order.
+    static std::vector<std::string> typeOrder(const ruleset::CombatStrategy& st) {
+        const game::combat::Strategy parsed = game::combat::parseStrategy(st);
+        std::vector<std::string> out;
+        for (int rank = 1; rank <= int(game::combat::kTargetCategories); ++rank)
+            for (game::combat::TargetCategory c : kFileCategoryOrder)
+                if (parsed.typePriority[size_t(c)] == rank) out.emplace_back(game::combat::identifier(c));
+        return out;
+    }
+    ReorderPopup typeOrder_;
+
+    // The Damage page: when a target counts as done with (spec 04 §16).
+    bool damagePage(UiContext& ui, ruleset::CombatStrategy& st) {
+        bool changed = false;
+        heading(ui, "Switching targets");
+        wrappedDim("Move on to a fresh target once the current one has taken this share of its structure.");
+        for (const char* what : {"Ship", "Planet", "Fighter Group", "Satellite Group"}) {
+            const std::string key = std::format("Damage Percent Per {}", what);
+            fieldLabel(ui, what, 150);
+            ImGui::SetNextItemWidth(ui.px(220));
+            changed |= intSlider(key.c_str(), valueRef(st, key, defaultSetting(key)), 0, 100, "%d%%");
+        }
+        changed |= boolField(ui, "Keep firing until the target has no working weapons",
+                             valueRef(st, "Damage Until All Weapons Gone", defaultSetting("Damage Until All Weapons Gone")));
+        return changed;
+    }
+
+    // A pick list of the original's counts (spec 04 §16, confirmed: binary);
+    // a count from a data file that is not in it shows as it is.
+    static bool countList(UiContext& ui, const char* id, std::string& value, std::span<const int> counts) {
+        bool changed = false;
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        ImGui::SetNextItemWidth(ui.px(120));
+        // Input scripts find the list by its name (the box itself, open or not).
+        script::reportItem(id, at, ImVec2(at.x + ui.px(120), at.y + ImGui::GetFrameHeight()));
+        if (ImGui::BeginCombo(id, value.c_str())) {
+            for (int n : counts) {
+                const std::string text = std::to_string(n);
+                if (ImGui::Selectable(text.c_str(), text == value) && text != value) {
+                    value = text;
+                    changed = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        return changed;
+    }
+
+    bool launchingPage(UiContext& ui, ruleset::CombatStrategy& st) {
+        static constexpr std::array<int, 8> kFighterGroups{5, 8, 10, 15, 20, 30, 40, 50};
+        static constexpr std::array<int, 8> kDronesPerTarget{1, 2, 3, 5, 8, 10, 15, 20};
+        bool changed = false;
+        heading(ui, "Fighters");
+        fieldLabel(ui, "Fighter Group Size", 170);
+        changed |= countList(ui, "##Fighter Group Size", valueRef(st, "Fighters Launch Group Amount", defaultSetting("Fighters Launch Group Amount")),
+                             kFighterGroups);
+        wrappedDim("How many fighters leave a carrier together as one group.");
+        ImGui::Spacing();
+        heading(ui, "Drones");
+        fieldLabel(ui, "Drones Per Target", 170);
+        changed |= countList(ui, "##Drones Per Target", valueRef(st, "Drones Per Target", defaultSetting("Drones Per Target")), kDronesPerTarget);
+        wrappedDim("How many drones the computer sends at each target.");
+        // Anything the other pages do not cover (e.g. fields added by a mod).
+        bool header = false;
+        for (auto& [k, v] : st.settings) {
+            if (k.starts_with("Primary Movement") || k.starts_with("Secondary Movement") || k.starts_with("Targeting Priority") ||
+                k.starts_with("Use Type Priority") || k.starts_with("Type Priority") || k.starts_with("Dont Fire On") ||
+                k.starts_with("Damage ") || k.starts_with("Break Formation") || k == "Fighters Launch Group Amount" || k == "Drones Per Target")
+                continue;
+            if (!header) {
+                ImGui::Spacing();
+                heading(ui, "Other settings");
+                header = true;
+            }
+            fieldLabel(ui, k.c_str(), 250);
+            ImGui::SetNextItemWidth(ui.px(180));
+            ImGui::PushID(k.c_str());
+            std::string draft = v;
+            inputString("##v", draft, 60, ImGuiInputTextFlags_EnterReturnsTrue);
+            if (ImGui::IsItemDeactivatedAfterEdit() && draft != v) {
+                v = draft;
+                changed = true;
+            }
+            ImGui::PopID();
+        }
+        return changed;
+    }
+
+    bool formationPage(UiContext& ui, ruleset::CombatStrategy& st) {
+        bool changed = false;
+        heading(ui, "Leave the formation in combat");
+        wrappedDim("Pieces of a lit type break away from their fleet's formation during a battle and fight on their own.");
+        ImGui::Spacing();
+        for (auto& [k, v] : st.settings)
+            if (k.starts_with("Break Formation ")) changed |= boolField(ui, k.c_str() + 16, v);
+        return changed;
+    }
+
+    int selected_ = 0;
+    int page_ = 0;
+    shipui::TextPrompt namePrompt_;   // Add's "Enter Strategy Name"
+    std::string nameDraft_;
+    int nameFor_ = -1;
+    bool editingName_ = false;
+    CommandStatus status_;
+};
+
+// ---- Repair Priorities -----------------------------------------------------------------------
+
+class RepairPrioritiesScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Repair Priorities", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::Rules& rules = ui.rules();
+        std::vector<std::string> order = ui.me().repairPriorities;
+        std::vector<std::string> available;
+        auto offer = [&](const std::string& g) {
+            if (!g.empty() && std::find(order.begin(), order.end(), g) == order.end() &&
+                std::find(available.begin(), available.end(), g) == available.end())
+                available.push_back(g);
+        };
+        for (const std::string& g : rules.data().names.repairPriorities) offer(g);
+        for (const ruleset::Component& c : rules.data().components) offer(c.generalGroup);
+        bool changed = false;
+        selected_ = std::min(selected_, int(order.size()) - 1);
+
+        d.beginContent();
+        wrappedDim("Damaged ships get their components fixed group by group in this order. Click a group on the left to add it; "
+                   "groups not in the list are repaired last.");
+        const float col = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        beginList(ui, "##available", ImVec2(col, 0), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        heading(ui, "Component groups");
+        for (const std::string& g : available)
+            if (ImGui::Selectable(g.c_str())) {
+                order.push_back(g);
+                selected_ = int(order.size()) - 1;
+                changed = true;
+            }
+        if (available.empty()) dimText("Every group is in the list.");
+        endList(ui);
+        ImGui::SameLine();
+        beginList(ui, "##order", ImVec2(0, 0), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        heading(ui, "Repair order");
+        for (int i = 0; i < int(order.size()); ++i) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(std::format("{}.  {}", i + 1, order[size_t(i)]).c_str(), selected_ == i)) selected_ = i;
+            ImGui::PopID();
+        }
+        if (order.empty()) dimText("Empty: components are repaired in design order.");
+        status_.draw();
+        endList(ui);
+
+        d.beginButtons();
+        const bool hasSel = selected_ >= 0 && selected_ < int(order.size());
+        if (d.button("Move Up", hasSel && selected_ > 0)) {
+            std::swap(order[size_t(selected_)], order[size_t(selected_ - 1)]);
+            --selected_;
+            changed = true;
+        }
+        if (d.button("Move Down", hasSel && selected_ + 1 < int(order.size()))) {
+            std::swap(order[size_t(selected_)], order[size_t(selected_ + 1)]);
+            ++selected_;
+            changed = true;
+        }
+        if (d.button("Remove", hasSel)) {
+            order.erase(order.begin() + selected_);
+            changed = true;
+        }
+        d.spacer();
+        if (d.button("Remove All", !order.empty())) {
+            order.clear();
+            changed = true;
+        }
+        if (d.button("Default Order")) {
+            order = rules.data().names.repairPriorities;
+            changed = true;
+        }
+        if (changed) status_.issue(ui, cmd::SetRepairPriorities{order});
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    int selected_ = -1;
+    CommandStatus status_;
+};
+
+} // namespace
+
+std::unique_ptr<Screen> makeEmpireStatus(const ScreenArgs&) { return std::make_unique<EmpireStatusScreen>(); }
+std::unique_ptr<Screen> makeEmpireOptions(const ScreenArgs&) { return std::make_unique<EmpireOptionsScreen>(); }
+std::unique_ptr<Screen> makeMinisters(const ScreenArgs&) { return std::make_unique<MinistersScreen>(); }
+std::unique_ptr<Screen> makeSystemsToAvoid(const ScreenArgs&) { return std::make_unique<SystemsToAvoidScreen>(); }
+std::unique_ptr<Screen> makeWaypoints(const ScreenArgs& args) { return std::make_unique<WaypointsScreen>(std::max(0, args.index)); }
+std::unique_ptr<Screen> makeStrategies(const ScreenArgs&) { return std::make_unique<StrategiesScreen>(); }
+std::unique_ptr<Screen> makeRepairPriorities(const ScreenArgs&) { return std::make_unique<RepairPrioritiesScreen>(); }
+
+} // namespace opense4::client::classic

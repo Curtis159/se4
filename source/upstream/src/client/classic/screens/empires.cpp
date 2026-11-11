@@ -1,0 +1,1216 @@
+// Empires (F9) and the comparison windows it opens: Treaty Grid, Scores,
+// Comparisons, History and Victory Conditions (docs/spec/06 §1.2, §1.5;
+// docs/spec/05 §3, §5, §6). Communicate lives in communicate.cpp, the Race
+// Report in race_report.cpp.
+
+#include "client/audio.hpp"
+#include "client/classic/mod_ui.hpp"
+#include "client/classic/quadrant_map.hpp"
+#include "client/classic/reports.hpp"
+#include "client/classic/screens/empire_widgets.hpp"
+#include "client/classic/screens/list_widgets.hpp"
+#include "client/classic/screens/screens.hpp"
+#include "client/classic/widgets.hpp"
+#include "client/script/items.hpp"
+
+#include "game/diplomacy.hpp"
+#include "game/economy.hpp"
+#include "game/turn.hpp"
+#include "game/query.hpp"
+#include "game/score.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <format>
+#include <map>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace opense4::client::classic {
+
+namespace {
+
+using game::EmpireId;
+using game::Treaty;
+
+ImU32 treatyColor(Treaty t) {
+    switch (t) {
+        case Treaty::War: return IM_COL32(255, 90, 80, 255);
+        case Treaty::NonIntercourse: return IM_COL32(255, 160, 60, 255);
+        case Treaty::None: return IM_COL32(150, 160, 175, 255);
+        case Treaty::NonAggression: return IM_COL32(140, 190, 255, 255);
+        case Treaty::Subjugation:
+        case Treaty::Protectorate: return IM_COL32(200, 140, 255, 255);
+        case Treaty::TradeAlliance: return IM_COL32(150, 220, 150, 255);
+        case Treaty::TradeResearchAlliance: return IM_COL32(120, 230, 160, 255);
+        case Treaty::MilitaryAlliance: return IM_COL32(90, 240, 110, 255);
+        case Treaty::Partnership: return IM_COL32(60, 255, 150, 255);
+        case Treaty::Count: break;
+    }
+    return IM_COL32(255, 255, 255, 255);
+}
+
+// "Trade Alliance"; a subjugation or protectorate with its roles in
+// brackets, "Subjugation (We Dominate Them)" (spec 06 §1.5, confirmed: binary).
+std::string treatyText(const game::Relation& rel) {
+    std::string out(game::displayName(rel.treaty));
+    if (const std::string roles = treatyRoles(rel); !roles.empty()) out += " " + roles;
+    return out;
+}
+
+bool validEmpire(const game::GameState& s, EmpireId e) { return e.valid() && e.index() < s.empires.size(); }
+
+// Scores and statistics of other empires follow the Score Display option
+// (spec 05 §5).
+bool statsVisible(const UiContext& ui, EmpireId e) { return game::score::scoreVisible(ui.state(), ui.session.player(), e); }
+
+// Per-page tab buttons over a list: "Empires 1-10", "Empires 11-20", ...
+void pageButtons(Dialog& d, int& page, size_t count, int perPage) {
+    const int pages = std::max(1, int((count + size_t(perPage) - 1) / size_t(perPage)));
+    if (pages <= 1) {
+        page = 0;
+        return;
+    }
+    page = std::min(page, pages - 1);
+    for (int p = 0; p < pages; ++p) {
+        const std::string label = std::format("Empires {}-{}", p * perPage + 1, std::min<int>(int(count), (p + 1) * perPage));
+        if (d.tab(label.c_str(), page == p)) page = p;
+    }
+    d.spacer();
+}
+
+void statLine(UiContext& ui, const char* label, const std::string& value, ImVec4 color = ImVec4(0.9f, 0.92f, 0.97f, 1.0f)) {
+    ImGui::TextColored(kTextBlue, "%s", label);
+    ImGui::SameLine(ui.px(58));
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextColored(color, "%s", value.c_str());
+    ImGui::PopTextWrapPos();
+}
+
+ImVec4 toVec4(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
+
+// An amount followed by its 14x14 icon, one to a line.
+void amountLine(UiContext& ui, int64_t value, Icon icon, ImVec4 color) {
+    ImGui::TextColored(color, "%s", formatNumber(value).c_str());
+    if (Sprite sp = ui.art.icon16(icon)) {
+        ImGui::SameLine(0, ui.px(2));
+        image(ui, sp, {14, 14});
+    }
+}
+
+// The three resources, then research and intelligence when asked for, a line each.
+void amountLines(UiContext& ui, const game::Resources& r, std::optional<std::pair<int64_t, int64_t>> points = std::nullopt) {
+    static constexpr std::array<Icon, 3> kIcons{Icon::Minerals, Icon::Organics, Icon::Radioactives};
+    static constexpr std::array<uint32_t, 3> kColors{palette::kMinerals, palette::kOrganics, palette::kRadioactives};
+    for (size_t i = 0; i < 3; ++i) amountLine(ui, r.v[i], kIcons[i], imColorV(kColors[i]));
+    if (points) {
+        amountLine(ui, points->first, Icon::Research, ImVec4(0.9f, 0.92f, 0.97f, 1.0f));
+        amountLine(ui, points->second, Icon::Intelligence, ImVec4(0.9f, 0.92f, 0.97f, 1.0f));
+    }
+}
+
+// 1, 2 or 5 times a power of ten, so that `ticks` steps cover maxValue.
+int64_t niceStep(int64_t maxValue, int ticks) {
+    const int64_t raw = std::max<int64_t>(1, (maxValue + ticks - 1) / ticks);
+    int64_t mag = 1;
+    while (mag * 10 <= raw) mag *= 10;
+    for (int64_t m : {int64_t{1}, int64_t{2}, int64_t{5}})
+        if (m * mag >= raw) return m * mag;
+    return 10 * mag;
+}
+
+// ---- Empires ------------------------------------------------------------------------------------
+
+class EmpiresScreen final : public Screen {
+public:
+    // "mod-page:<mod id>:<name>" opens on a mod's page (its key, docs/sdk/interface.md).
+    explicit EmpiresScreen(const ScreenArgs& args) {
+        if (args.text.starts_with("mod-page:")) openPage_ = args.text.substr(9);
+    }
+
+    bool draw(UiContext& ui) override {
+        if (!restored_) {
+            // The tab comes back from the empire's options (spec 06 §1.5, spec 08 §3.6.7).
+            tab_ = static_cast<Tab>(std::min<int>(ui.options().empiresTab, 2));
+            restored_ = true;
+        }
+        // The mods' pages (docs/sdk/interface.md "Empires pages"): a tab each.
+        const std::vector<sdk::UiEmpirePage>& pages = modUi(ui.rules()).ext.pages;
+        if (!openPage_.empty()) {
+            for (size_t i = 0; i < pages.size(); ++i)
+                if (pages[i].mod + ":" + pages[i].name == openPage_) modPage_ = i;
+            openPage_.clear();
+        }
+        if (modPage_ && *modPage_ >= pages.size()) modPage_.reset();
+        Dialog d(ui, "Empires", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        d.beginContent();
+        if (modPage_) {
+            std::vector<game::EmpireId> empires{ui.session.player()};
+            for (game::EmpireId e : knownEmpires(ui)) empires.push_back(e);
+            drawModEmpirePage(ui, pages[*modPage_], empires);
+        } else {
+            ImGui::BeginGroup();
+            portraits(ui);
+            ImGui::EndGroup();
+            ui.tagItem("empires:list");
+        }
+
+        d.beginButtons();
+        if (d.tab("Treaty", !modPage_ && tab_ == Tab::Treaty)) select(Tab::Treaty);
+        ui.tagTab("treaty", !modPage_ && tab_ == Tab::Treaty);
+        if (d.tab("Trade", !modPage_ && tab_ == Tab::Trade)) select(Tab::Trade);
+        ui.tagTab("trade", !modPage_ && tab_ == Tab::Trade);
+        if (d.tab("Tariff", !modPage_ && tab_ == Tab::Tariff)) select(Tab::Tariff);
+        ui.tagTab("tariff", !modPage_ && tab_ == Tab::Tariff);
+        // The mods' pages after the classic tabs, the first in the gap below them.
+        for (size_t i = 0; i < pages.size(); ++i) {
+            ImGui::PushID(int(i));
+            if (d.tab(modPageTitle(ui.rules(), pages[i]).c_str(), modPage_ == i)) modPage_ = i;
+            ImGui::PopID();
+        }
+        // The original's order (observed, spec 07 session 3): the tabs, a gap,
+        // History, Treaty Grid, Intelligence (dim before any contact), Borders,
+        // Scores, Victory Conditions, Comparisons, a gap, Our Race in the 13th slot.
+        if (pages.empty()) d.spacer();
+        if (d.button("History")) ui.open(ScreenId::History);
+        if (d.button("Treaty Grid")) ui.open(ScreenId::TreatyGrid);
+        ui.tagItem("empires:treaty-grid");
+        if (d.button("Intelligence", !knownEmpires(ui).empty())) ui.open(ScreenId::Intelligence);
+        ui.tagItem("empires:intelligence");
+        // Borders is a window of its own, over this one (spec 06 §7 Q96).
+        if (d.button("Borders")) ui.open(ScreenId::Borders);
+        if (d.button("Scores")) ui.open(ScreenId::Scores);
+        ui.tagItem("empires:scores");
+        if (d.button("Victory Conditions")) ui.open(ScreenId::VictoryConditions);
+        ui.tagItem("empires:victory-conditions");
+        if (d.button("Comparisons")) ui.open(ScreenId::Comparisons);
+        d.spacer();
+        const bool ourRace = d.button("Our Race");
+        ui.tagItem("empires:our-race");
+        if (ourRace) {
+            ScreenArgs a;
+            a.empire = ui.session.player();
+            ui.open(ScreenId::RaceReport, a);
+        }
+        d.close();
+        if (!d.keepOpen()) {
+            // The tab is stored with the empire's options when the window closes.
+            game::InterfaceOptions o = ui.options();
+            if (o.empiresTab != static_cast<uint8_t>(tab_)) {
+                o.empiresTab = static_cast<uint8_t>(tab_);
+                ui.setOptions(o);
+            }
+        }
+        return d.keepOpen();
+    }
+
+private:
+    enum class Tab { Treaty, Trade, Tariff };
+    static constexpr int kPerPage = 4;
+
+    void select(Tab t) {
+        tab_ = t;
+        modPage_.reset();
+    }
+
+    // Our entry for `them` in the economy report's breakdown (EconomyReport::partners).
+    static const game::PartnerIncome* partner(const UiContext& ui, EmpireId them) {
+        for (const game::PartnerIncome& p : ui.me().economy.partners)
+            if (p.empire == them) return &p;
+        return nullptr;
+    }
+
+    void header(UiContext& ui, size_t known) {
+        const game::Empire& me = ui.me();
+        switch (tab_) {
+            case Tab::Treaty:
+                // No heading here (observed, spec 07 session 3).
+                (void)known;
+                break;
+            case Tab::Trade:
+                heading(ui, "Trade income");
+                ImGui::SameLine();
+                resources(ui, me.economy.trade, true);
+                ImGui::SameLine(0, ui.px(18));
+                ImGui::TextColored(kTextBlue, "Research");
+                ImGui::SameLine();
+                ImGui::TextUnformatted(formatNumber(game::diplomacy::researchTradeIncome(ui.rules(), ui.state(), me.id)).c_str());
+                break;
+            case Tab::Tariff:
+                heading(ui, "Tariffs in");
+                ImGui::SameLine();
+                resources(ui, me.economy.tariffsIn, true);
+                ImGui::SameLine(0, ui.px(18));
+                heading(ui, "out");
+                ImGui::SameLine();
+                resources(ui, me.economy.tariffsOut, true);
+                break;
+        }
+    }
+
+    void portraits(UiContext& ui) {
+        // The original's strip: a framed row of four portraits between the big page
+        // arrows; each empire's details are listed under its portrait.
+        const game::GameState& s = ui.state();
+        const auto known = knownEmpires(ui);
+        ImGui::TextColored(kTextBlue, "%zu Known Empires", known.size());
+        ImGui::SameLine();
+        ImGui::PushFont(ui.fonts.small, ui.fontPx(kSmallSize));
+        const char* hint = "(click on a portrait to communicate with the empire)";
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(hint).x));
+        ImGui::TextColored(kTextBlue, "%s", hint);
+        ImGui::PopFont();
+
+        const int pages = std::max(1, int((known.size() + kPerPage - 1) / kPerPage));
+        page_ = std::clamp(page_, 0, pages - 1);
+        const ImVec2 a = ImGui::GetCursorScreenPos();
+        const float w = ImGui::GetContentRegionAvail().x, h = ui.px(130);
+        const float arrowW = ui.px(16), slotW = (w - 2 * arrowW) / kPerPage;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRect(a, {a.x + w, a.y + h}, imColor(palette::kFrame));
+        for (int c = 0; c <= kPerPage; ++c) {
+            const float x = a.x + arrowW + slotW * float(c);
+            dl->AddLine({x, a.y}, {x, a.y + h}, imColor(palette::kFrame));
+        }
+        auto arrow = [&](bool right, bool enabled) {
+            const ImVec2 at{right ? a.x + w - arrowW : a.x, a.y};
+            ImGui::SetCursorScreenPos(at);
+            ImGui::PushID(right ? "next" : "prev");
+            const bool clicked = ImGui::InvisibleButton("##arrow", ImVec2(arrowW, h)) && enabled;
+            const int state = !enabled ? 3 : ImGui::IsItemHovered() ? 1 : 0;
+            ImGui::PopID();
+            if (Sprite sp = ui.art.region("Pictures/Game/Buttons/BigLeftRightArrows.bmp", right ? 14 : 0, state * 50, 14, 50, false)) {
+                const ImVec2 p0{at.x + ui.px(1), at.y + (h - ui.px(50)) * 0.5f};
+                dl->AddImage(ImTextureRef(static_cast<ImTextureID>(sp.tex.value)), p0, {p0.x + ui.px(14), p0.y + ui.px(50)}, {sp.uv.min.x, sp.uv.min.y},
+                             {sp.uv.max.x, sp.uv.max.y});
+            }
+            return clicked;
+        };
+        if (arrow(false, page_ > 0)) --page_;
+        if (arrow(true, page_ + 1 < pages)) ++page_;
+        for (int c = 0; c < kPerPage; ++c) {
+            const size_t i = size_t(page_ * kPerPage + c);
+            if (i >= known.size()) break;
+            const game::Empire& them = s.empire(known[i]);
+            const ImVec2 p{a.x + arrowW + slotW * float(c) + (slotW - ui.px(128)) * 0.5f, a.y + ui.px(1)};
+            ImGui::SetCursorScreenPos(p);
+            ImGui::PushID(int(i));
+            ImGui::InvisibleButton("##portrait", ui.size({128, 128}));
+            const bool hovered = ImGui::IsItemHovered();
+            ImGui::PopID();
+            if (Sprite portrait = ui.art.racePortrait(them.race.style))
+                dl->AddImage(ImTextureRef(static_cast<ImTextureID>(portrait.tex.value)), p, {p.x + ui.px(128), p.y + ui.px(128)},
+                             {portrait.uv.min.x, portrait.uv.min.y}, {portrait.uv.max.x, portrait.uv.max.y});
+            if (hovered) {
+                dl->AddRect(p, ImVec2(p.x + ui.px(128), p.y + ui.px(128)), IM_COL32(255, 208, 64, 255), 0.0f, 2.0f);
+                ImGui::SetTooltip("%s", ui.me().relation(them.id).messageSentThisTurn ? "Message sent this turn\nRight-click: Race Report"
+                                                                                       : "Left-click: Communicate\nRight-click: Race Report");
+            }
+            ScreenArgs args;
+            args.empire = them.id;
+            // A click does nothing once we have written to that empire this
+            // turn (spec 06 §1.5, confirmed: binary).
+            const bool written = ui.me().relation(them.id).messageSentThisTurn;
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !written) ui.open(ScreenId::Communicate, args);
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) ui.open(ScreenId::RaceReport, args);
+        }
+        ImGui::SetCursorScreenPos({a.x, a.y + h + ui.px(4)});
+        // Before any contact the strip stays empty, with no explanation (observed).
+        if (known.empty()) {
+            ImGui::Dummy(ImVec2(w, 0));
+            return;
+        }
+        header(ui, known.size());
+        const float y0 = ImGui::GetCursorScreenPos().y;
+        for (int c = 0; c < kPerPage; ++c) {
+            const size_t i = size_t(page_ * kPerPage + c);
+            if (i >= known.size()) break;
+            ImGui::SetCursorScreenPos({a.x + arrowW + slotW * float(c) + ui.px(3), y0});
+            ImGui::PushID(int(i));
+            ImGui::BeginChild("##col", ImVec2(slotW - ui.px(6), 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+            column(ui, s.empire(known[i]));
+            ImGui::EndChild();
+            ImGui::PopID();
+        }
+    }
+
+    // The original's lines first (spec 06 §1.5, confirmed: binary), then OpenSE4's.
+    void column(UiContext& ui, const game::Empire& them) {
+        const game::Relation& rel = ui.me().relation(them.id);
+        empireLabel(ui, them.id, true);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(kTextDim, "%s %s", them.leaderTitle.c_str(), them.leaderName.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Separator();
+        statLine(ui, "Treaty", treatyText(rel), toVec4(treatyColor(rel.treaty)));
+        const int tradePct = game::diplomacy::tradePercent(ui.rules(), ui.state(), ui.session.player(), them.id);
+        switch (tab_) {
+            case Tab::Treaty: {
+                // Trade N%: the trade percentage, 0 below Trade Alliance.
+                statLine(ui, "Trade", std::format("{}%", tradePct));
+                // The mood of every empire, a human player's too: the words of its anger toward us.
+                const int anger = them.relation(ui.session.player()).anger;
+                statLine(ui, "Mood", them.kind == game::PlayerKind::Human ? std::string(moodWord(anger))
+                                                                          : std::format("{} ({})", moodWord(anger), anger));
+                // The status line: Message Sent, Offered ..., Proposed Treaty ...
+                if (const std::string status = empireStatusLine(ui.state(), ui.session.player(), them.id); !status.empty()) {
+                    ImGui::PushTextWrapPos(0.0f);
+                    ImGui::TextColored(kTextWarn, "%s", status.c_str());
+                    ImGui::PopTextWrapPos();
+                }
+                statLine(ui, "Race", them.race.name);
+                statLine(ui, "Player", game::isNeutral(them) ? "Neutral" : them.kind == game::PlayerKind::Human ? "Human" : "Computer");
+                if (rel.treaty != Treaty::None) statLine(ui, "Since", formatDate(rel.treatyTurn));
+                statLine(ui, "Last war", rel.lastWarTurn >= 0 ? formatDate(uint32_t(rel.lastWarTurn)) : "Never");
+                // Only while a reply is still possible: the message is in the Log (issue #4).
+                const int waiting = messagesAwaitingReply(ui.state(), ui.session.player(), them.id);
+                if (waiting > 0) statLine(ui, "Inbox", std::format("{} waiting", waiting), kTextWarn);
+                break;
+            }
+            case Tab::Trade: {
+                // Trade Amount: what trade with them brings us this turn.
+                const game::PartnerIncome* in = partner(ui, them.id);
+                ImGui::TextColored(kTextBlue, "Trade Amount");
+                amountLines(ui, in ? in->trade : game::Resources{}, std::pair{in ? in->research : 0, in ? in->intelligence : 0});
+                const int maxPct = int(ui.rules().setting("Maximum Trade Percentage", 20));
+                statLine(ui, "Trade", std::format("{}% of {}%", tradePct, maxPct));
+                std::string what;
+                if (game::treatyTradesResources(rel.treaty)) what = "Resources";
+                if (game::treatyTradesResearch(rel.treaty)) what += ", research";
+                if (rel.treaty == Treaty::Partnership) what += ", intelligence";
+                statLine(ui, "Shares", what.empty() ? "Nothing" : what, what.empty() ? kTextDim : kTextGood);
+                if (game::treatyTradesResources(rel.treaty) && tradePct < maxPct) statLine(ui, "Growth", "+1% per turn", kTextDim);
+                if (game::treatySharesSight(rel.treaty)) statLine(ui, "Sight", "Shared", kTextGood);
+                if (game::treatyAllowsResupply(rel.treaty)) statLine(ui, "Supply", "Our ships may resupply", kTextGood);
+                break;
+            }
+            case Tab::Tariff: {
+                // Tariff Received when they pay us anything, else Tariff Given.
+                const game::PartnerIncome* in = partner(ui, them.id);
+                const game::Resources received = in ? in->tariffReceived : game::Resources{};
+                const bool receiving = received.v[0] > 0 || received.v[1] > 0 || received.v[2] > 0;
+                ImGui::TextColored(kTextBlue, "%s", receiving ? "Tariff Received" : "Tariff Given");
+                amountLines(ui, receiving ? received : in ? in->tariffGiven : game::Resources{});
+                const bool subj = rel.treaty == Treaty::Subjugation, prot = rel.treaty == Treaty::Protectorate;
+                if (!subj && !prot) {
+                    statLine(ui, "Tariff", "None", kTextDim);
+                    break;
+                }
+                const int64_t pct = subj ? ui.rules().setting("Treaty Subjugated Resource Percentage", 0)
+                                         : ui.rules().setting("Treaty Protectorate Resource Percentage", 0);
+                const std::string share = pct > 0 ? std::format("{}%", pct) : std::string("a share");
+                statLine(ui, "Tariff", rel.dominant ? std::format("They pay us {}", share) : std::format("We pay them {}", share),
+                         rel.dominant ? kTextGood : kTextBad);
+                statLine(ui, "Of", "Resources produced", kTextDim);
+                break;
+            }
+        }
+    }
+
+    Tab tab_ = Tab::Treaty;
+    bool restored_ = false;
+    int page_ = 0;
+    std::optional<size_t> modPage_;   // a mod's page shown in place of the portraits
+    std::string openPage_;
+};
+
+// ---- Borders ------------------------------------------------------------------------------------
+
+// A window of its own over Empires (spec 06 §7 Q96, confirmed: binary): the
+// known empires in a narrow list at (18,52), 70 px wide, each with a check box
+// and its flag; the galaxy map at (94,52), 476x329, with the systems the
+// checked empires claim in their colours and those several of them claim in
+// yellow; a click on a system claims it for the player's empire or gives the
+// claim up. Select All, Allies (the player and the empires it holds
+// Non-Aggression or better with), Enemies (the others) and Us (lit at
+// opening: the player alone) check those empires.
+class BordersScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Borders", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const auto shown = usAndKnown(ui);
+        if (!opened_) {
+            apply(ui, Filter::Us);
+            opened_ = true;
+        }
+        d.beginContent(576);
+        const ImU32 blue = imColor(palette::kLabel);
+        textAt(ui, d, ui.fonts.regular, kTextSize, kTextLead, {17, 36}, blue, "Empires");
+        textAt(ui, d, ui.fonts.regular, kTextSize, kTextLead, {94, 36}, blue, "Systems claimed by Empires");
+
+        // The empires: a check box and the flag on each row.
+        ImGui::SetCursorScreenPos(d.at({18, 52}));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+        beginList(ui, "##empires", ui.size({70, 329}), kRowH);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float w = ImGui::GetContentRegionAvail().x;
+        const Sprite lamp = ui.art.region("Pictures/Game/General.bmp", 190, 0, 13, 13);
+        for (EmpireId e : shown) {
+            ImGui::PushID(int(e.index()));
+            const ImVec2 a = ImGui::GetCursorScreenPos();
+            const bool on = std::find(checked_.begin(), checked_.end(), e) != checked_.end();
+            if (ImGui::InvisibleButton(s.empire(e).name.c_str(), ImVec2(w, ui.px(kRowH)))) {
+                if (on) std::erase(checked_, e);
+                else checked_.push_back(e);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s.empire(e).name.c_str());
+            ImGui::PopID();
+            const ImVec2 box{a.x + ui.px(1), a.y + ui.px(1)};
+            dl->AddRect(box, {box.x + ui.px(16), box.y + ui.px(17)}, imColor(palette::kButton));
+            if (on && lamp) drawSprite(dl, lamp, {box.x + ui.px(2), box.y + ui.px(2)}, {box.x + ui.px(15), box.y + ui.px(15)});
+            if (const Sprite flag = ui.art.flag(s.empire(e).race.style, false))
+                drawSprite(dl, flag, {a.x + ui.px(20), a.y + ui.px(3)}, {a.x + ui.px(38), a.y + ui.px(16)});
+            else
+                dl->AddRectFilled({a.x + ui.px(20), a.y + ui.px(3)}, {a.x + ui.px(38), a.y + ui.px(16)}, empireColor(s, e));
+        }
+        endList(ui);
+        ImGui::PopStyleVar(2);
+
+        // The map.
+        ImGui::SetCursorScreenPos(d.at({94, 52}));
+        QuadrantMapOptions opt;
+        opt.claimsOf = checked_;
+        opt.frameColor = palette::kFrameLight;
+        opt.warpLines = false;
+        const QuadrantMapResult r = quadrantMap(ui, "##borders", {476, 329}, opt);
+        if (r.clicked) {
+            const auto& mine = ui.me().claimedSystems;
+            const bool claimed = std::binary_search(mine.begin(), mine.end(), *r.clicked);
+            const game::CommandResult res = ui.session.issue(game::cmd::SetSystemFlags{*r.clicked, std::nullopt, !claimed});
+            error_ = res.ok ? std::string{} : res.error;
+        }
+        textRightAt(ui, d, ui.fonts.small, kSmallSize, kSmallLead, {569, 390}, blue, "(click on a system to claim it for your empire)");
+        textAt(ui, d, ui.fonts.regular, kTextSize, kTextLead, {94, 394}, blue, "Legend");
+        dl = ImGui::GetWindowDrawList();
+        dl->AddCircleFilled(d.at({100, 418}), ui.px(3.5f), imColor(map_style::kYellow));
+        textAt(ui, d, ui.fonts.regular, kTextSize, kTextLead, {108, 410}, IM_COL32_WHITE, "Contested");
+        if (!error_.empty()) textAt(ui, d, ui.fonts.small, kSmallSize, kSmallLead, {200, 410}, imColor(0xff8070), error_);
+        ImGui::SetCursorScreenPos(d.at({17, 52}));
+        ImGui::Dummy(ImVec2(0, 0));
+
+        d.beginButtons();
+        static constexpr std::array<std::pair<Filter, const char*>, 4> kFilters{
+            {{Filter::All, "Select All"}, {Filter::Allies, "Allies"}, {Filter::Enemies, "Enemies"}, {Filter::Us, "Us"}}};
+        for (const auto& [f, label] : kFilters)
+            if (d.tab(label, filter_ == f)) apply(ui, f);
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    enum class Filter { All, Allies, Enemies, Us };
+    static constexpr float kRowH = 20.0f;   // the list's rows (inferred)
+
+    void apply(const UiContext& ui, Filter f) {
+        filter_ = f;
+        const game::GameState& s = ui.state();
+        const EmpireId me = ui.session.player();
+        checked_.clear();
+        for (EmpireId e : usAndKnown(ui)) {
+            bool in = false;
+            switch (f) {
+                case Filter::All: in = true; break;
+                case Filter::Us: in = e == me; break;
+                // Allies: us and every empire we hold Non-Aggression or better
+                // with; Enemies: the others (spec 06 §7 Q96, confirmed: binary).
+                case Filter::Allies: in = e == me || nonAggression(s, me, e); break;
+                case Filter::Enemies: in = e != me && !nonAggression(s, me, e); break;
+            }
+            if (in) checked_.push_back(e);
+        }
+    }
+
+    static bool nonAggression(const game::GameState& s, EmpireId me, EmpireId e) {
+        const game::Relation& rel = s.empire(me).relation(e);
+        return rel.contact && rel.treaty >= Treaty::NonAggression;
+    }
+
+    bool opened_ = false;
+    Filter filter_ = Filter::Us;
+    std::vector<EmpireId> checked_;
+    std::string error_;
+};
+
+// ---- Treaty Grid -----------------------------------------------------------------------------------
+
+// A text in the current table cell, cut short with "…" to the cell (the whole
+// text as a tooltip), placed by `align` (0 left, 0.5 centred), and reported
+// to assert-fits (input scripts).
+void cellFitted(std::string_view text, ImU32 color, float align = 0.0f) {
+    const float w = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const float tw = ImGui::CalcTextSize(text.data(), text.data() + text.size()).x;
+    if (align > 0.0f && tw < w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::floor((w - tw) * align));
+    fittedText(text, std::min(w, std::max(1.0f, ImGui::GetContentRegionAvail().x)), color);
+}
+
+// The first three letters of a name, for a column heading (whole UTF-8 characters).
+std::string firstLetters(const std::string& name) {
+    size_t end = 0;
+    for (int letters = 0; end < name.size() && letters < 3; ++letters) {
+        ++end;
+        while (end < name.size() && (static_cast<unsigned char>(name[end]) & 0xC0) == 0x80) ++end;
+    }
+    return name.substr(0, end);
+}
+
+// An empire's small flag and name in a table cell, the name cut to the cell.
+void empireCell(UiContext& ui, EmpireId e, Vec2 flagSize) {
+    const game::GameState& s = ui.state();
+    const game::Empire& emp = s.empire(e);
+    const float textH = ImGui::GetTextLineHeight();
+    const float y = ImGui::GetCursorPosY();
+    const float flagY = y + std::max(0.0f, (textH - ui.px(flagSize.y)) * 0.5f);
+    ImGui::SetCursorPosY(flagY);
+    if (const Sprite flag = ui.art.flag(emp.race.style, flagSize.x > 20)) {
+        image(ui, flag, flagSize);
+    } else {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + ui.px(flagSize.x), p.y + ui.px(flagSize.y)), empireColor(s, e));
+        ImGui::Dummy(ui.size(flagSize));
+    }
+    ImGui::SameLine(0, ui.px(4));
+    ImGui::SetCursorPosY(y + std::max(0.0f, (ui.px(flagSize.y) - textH) * 0.5f));
+    cellFitted(emp.name, empireColor(s, e));
+}
+
+// The grid of the original's large dialog (780x475, spec 06 §1): ten empires
+// a page, their columns sharing the width the row names leave, so every page
+// keeps the same places. Each column is headed by the empire's flag over the
+// first letters of its name (the whole name on hover); every code is drawn
+// whole, and a name too long for its place ends in "…" with a tooltip. With
+// more empires than fit above the legend, the rows scroll.
+class TreatyGridScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Treaty Grid", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const auto all = usAndKnown(ui);
+        d.beginContent();
+        heading(ui, "Treaties between empires");
+        ImGui::TextColored(kTextDim, "We see our own treaties and those of the empires we hold Non-Aggression or better with.");
+
+        const size_t first = size_t(page_) * kPerPage;
+        const size_t cols = std::min(all.size() - std::min(all.size(), first), size_t(kPerPage));
+        // The legend's room is kept below the grid.
+        const float legendH = ImGui::GetTextLineHeightWithSpacing() * 5.0f + ui.px(16);
+        const float rowH = std::max(ImGui::GetTextLineHeight(), ui.px(13)) + ui.px(4);
+        const float headH = ui.px(13) + ImGui::GetTextLineHeight() + ui.px(6);
+        const float needed = headH + rowH * float(all.size()) + ui.px(8);
+        const float gridH = std::max(headH + rowH * 3.0f, std::min(needed, ImGui::GetContentRegionAvail().y - legendH));
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ui.px(2), ui.px(2)));
+        const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit;
+        if (beginListTable(ui, "##grid", kPerPage + 1, flags, ImVec2(0, gridH), rowH)) {
+            ImGui::TableSetupScrollFreeze(1, 1);
+            ImGui::TableSetupColumn("Empire", ImGuiTableColumnFlags_WidthFixed, ui.px(kNameW));
+            for (int c = 0; c < kPerPage; ++c) ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch);
+            // Header: each empire's flag over the first letters of its name.
+            ImGui::TableNextRow(ImGuiTableRowFlags_Headers, headH);
+            ImGui::TableSetColumnIndex(0);
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ui.px(13));
+            cellFitted("Empire", ImGui::ColorConvertFloat4ToU32(kTextBlue));
+            for (size_t c = 0; c < cols; ++c) {
+                ImGui::TableSetColumnIndex(int(c) + 1);
+                const game::Empire& e = s.empire(all[first + c]);
+                const ImVec2 cellMin = ImGui::GetCursorScreenPos();
+                const float w = ImGui::GetContentRegionAvail().x;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, std::floor((w - ui.px(18)) * 0.5f)));
+                image(ui, ui.art.flag(e.race.style, false), {18, 13});
+                cellFitted(firstLetters(e.name), empireColor(s, e.id), 0.5f);
+                if (ImGui::IsMouseHoveringRect(cellMin, ImVec2(cellMin.x + w, cellMin.y + headH)) && ImGui::IsWindowHovered())
+                    ImGui::SetTooltip("%s", e.name.c_str());
+            }
+            for (EmpireId row : all) {
+                ImGui::TableNextRow(ImGuiTableRowFlags_None, rowH);
+                ImGui::TableSetColumnIndex(0);
+                empireCell(ui, row, {18, 13});
+                for (size_t c = 0; c < cols; ++c) {
+                    ImGui::TableSetColumnIndex(int(c) + 1);
+                    const EmpireId col = all[first + c];
+                    // Blank unless we may see the pair's treaty and they hold a
+                    // real one; a dominance treaty carries the roles in (row,
+                    // column) order (spec 06 §1.5, confirmed: binary).
+                    const std::string cell = treatyGridCell(s, ui.session.player(), row, col);
+                    if (cell.empty()) continue;
+                    const Treaty t = s.empire(row).relation(col).treaty;
+                    cellFitted(cell, treatyColor(t), 0.5f);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s - %s: %s", s.empire(row).name.c_str(), s.empire(col).name.c_str(),
+                                          std::string(game::displayName(t)).c_str());
+                }
+            }
+            endListTable(ui);
+        }
+        ImGui::PopStyleVar();
+        // Legend: three columns, each as wide as its longest name needs.
+        ImGui::Dummy(ui.size({0, 4}));
+        heading(ui, "Legend");
+        struct Entry {
+            std::string_view code;
+            ImU32 color;
+            std::string_view name;
+        };
+        // Every treaty but None, which has no code (confirmed: binary).
+        std::vector<Entry> entries;
+        for (int i = 0; i < int(Treaty::Count); ++i) {
+            const auto t = static_cast<Treaty>(i);
+            if (t != Treaty::None) entries.push_back({treatyCode(t), treatyColor(t), game::displayName(t)});
+        }
+        constexpr int kLegendColumns = 3;
+        std::array<float, kLegendColumns> widths{};
+        for (size_t i = 0; i < entries.size(); ++i)
+            widths[i % kLegendColumns] = std::max(widths[i % kLegendColumns], ImGui::CalcTextSize(entries[i].name.data(), entries[i].name.data() + entries[i].name.size()).x);
+        if (ImGui::BeginTable("##legend", kLegendColumns, ImGuiTableFlags_None)) {
+            for (int c = 0; c < kLegendColumns; ++c)
+                ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, ui.px(28) + widths[size_t(c)] + ui.px(8));
+            for (const Entry& e : entries) {
+                ImGui::TableNextColumn();
+                fittedText(e.code, ui.px(26), e.color);
+                ImGui::SameLine(ui.px(28));   // from the column's start
+                fittedText(e.name);
+            }
+            ImGui::EndTable();
+        }
+        d.beginButtons();
+        pageButtons(d, page_, all.size(), kPerPage);
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    static constexpr int kPerPage = 10;
+    static constexpr float kNameW = 124;   // the row names' column (frame pixels); the ten empire columns share the rest
+    int page_ = 0;
+};
+
+// ---- Scores ------------------------------------------------------------------------------------------
+
+// A figure as wide as `width` (ImGui units) allows: whole as formatNumber
+// writes it, else in thousands, millions or billions ("123k", "4.5M").
+std::string numberFitting(int64_t v, float width) {
+    std::string full = formatNumber(v);
+    auto fits = [&](const std::string& t) { return ImGui::CalcTextSize(t.c_str()).x <= width; };
+    if (fits(full)) return full;
+    const int64_t a = v < 0 ? -v : v;
+    const char* sign = v < 0 ? "-" : "";
+    std::vector<std::string> shorter;
+    for (const auto& [unit, letter] : {std::pair<int64_t, char>{1'000'000'000, 'B'}, {1'000'000, 'M'}, {1'000, 'k'}}) {
+        if (a < unit) continue;
+        const int64_t tenths = a * 10 / unit;
+        if (tenths < 100) shorter.push_back(std::format("{}{}.{}{}", sign, tenths / 10, tenths % 10, letter));
+        shorter.push_back(std::format("{}{}{}", sign, a / unit, letter));
+    }
+    for (const std::string& t : shorter)
+        if (fits(t)) return t;
+    return shorter.empty() ? full : shorter.back();
+}
+
+// The original's Scores window (spec 06 §1.5, confirmed: binary): a column
+// for each empire whose score we may see (scoreVisible), in player order; a
+// row per figure. Score, resources, research and intelligence are given in
+// thousands with one decimal ("12.3K", "4.5M" from 1000K), the population in
+// billions ("2.5B", "1.2T"); the rank is an ordinal ("1st", "21th") among
+// every empire, destroyed ones included, equal scores sharing a rank. Our
+// client keeps the large dialog's layout of v0.10 (since 2026-10-04, GitHub
+// issue #3): ten columns to a page, each headed by the empire's flag over the
+// first letters of its name, the exact value of a shortened figure on hover.
+class ScoresScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Scores", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const game::Rules& r = ui.rules();
+        d.beginContent();
+        heading(ui, "Scores");
+        static constexpr std::array<const char*, 3> kDisplay{"Only our own statistics are shown in this game.",
+                                                             "Statistics are shown for us and empires at Non-Aggression or better.",
+                                                             "Every empire's statistics are public in this game."};
+        ImGui::PushTextWrapPos(0.0f);
+        // Once the game is decided every score shows (score::scoreVisible): over, or marked completed.
+        const bool decided = s.gameOver || s.lastTurn;
+        ImGui::TextColored(kTextDim, "%s", s.gameOver  ? "The game is over: every score is shown."
+                                           : decided ? (game::turnBased(s) ? "This is the game's last turn: every score is shown."
+                                                                           : "The game is complete: every score is shown.")
+                                                     : kDisplay[size_t(std::clamp(s.options.scoreDisplay, 0, 2))]);
+        ImGui::PopTextWrapPos();
+
+        // Dense ranks among every empire, destroyed ones included.
+        std::vector<int64_t> scores;
+        for (const game::Empire& e : s.empires) scores.push_back(game::score::empireScore(r, s, e.id));
+        const std::vector<int> ranks = denseRanks(scores);
+        // The columns: the empires whose score we may see, in player order.
+        std::vector<EmpireId> order;
+        for (const game::Empire& e : s.empires)
+            if (statsVisible(ui, e.id)) order.push_back(e.id);
+        const size_t first = size_t(page_) * kPerPage;
+        const size_t cols = std::min(order.size() - std::min(order.size(), first), size_t(kPerPage));
+
+        static constexpr std::array<Metric, 11> kRows{Metric::Score, Metric::Resources, Metric::Research, Metric::Intelligence,
+                                                      Metric::TechLevels, Metric::Systems, Metric::Planets, Metric::Population,
+                                                      Metric::Units, Metric::Ships, Metric::Bases};
+        const float rowH = ImGui::GetTextLineHeight() + ui.px(4);
+        const float headH = ui.px(13) + ImGui::GetTextLineHeight() + ui.px(6);
+        ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ui.px(2), ui.px(2)));
+        const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingFixedFit;
+        const float tableH = std::min(ImGui::GetContentRegionAvail().y, headH + rowH * float(kRows.size() + 1) + ui.px(8));
+        if (beginListTable(ui, "##scores", kPerPage + 1, flags, ImVec2(0, tableH), rowH)) {
+            ImGui::TableSetupScrollFreeze(1, 1);
+            ImGui::TableSetupColumn("Statistic", ImGuiTableColumnFlags_WidthFixed, ui.px(kNameW));
+            for (int c = 0; c < kPerPage; ++c) ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch);
+            // Header: each empire's flag over the first letters of its name.
+            ImGui::TableNextRow(ImGuiTableRowFlags_Headers, headH);
+            for (size_t c = 0; c < cols; ++c) {
+                ImGui::TableSetColumnIndex(int(c) + 1);
+                const game::Empire& e = s.empire(order[first + c]);
+                const ImVec2 cellMin = ImGui::GetCursorScreenPos();
+                const float w = ImGui::GetContentRegionAvail().x;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, std::floor((w - ui.px(18)) * 0.5f)));
+                image(ui, ui.art.flag(e.race.style, false), {18, 13});
+                cellFitted(firstLetters(e.name), empireColor(s, e.id), 0.5f);
+                if (ImGui::IsMouseHoveringRect(cellMin, ImVec2(cellMin.x + w, cellMin.y + headH)) && ImGui::IsWindowHovered())
+                    ImGui::SetTooltip("%s", e.name.c_str());
+            }
+            auto row = [&](std::string_view label, auto&& value) {
+                ImGui::TableNextRow(ImGuiTableRowFlags_None, rowH);
+                ImGui::TableSetColumnIndex(0);
+                cellFitted(label, ImGui::ColorConvertFloat4ToU32(kTextBlue));
+                for (size_t c = 0; c < cols; ++c) {
+                    ImGui::TableSetColumnIndex(int(c) + 1);
+                    value(order[first + c]);
+                }
+            };
+            for (Metric m : kRows)
+                row(metricName(m), [&](EmpireId e) {
+                    const int64_t v = m == Metric::Score ? game::score::empireScore(r, s, e) : metricValue(game::score::currentStats(r, s, e), m);
+                    std::string shown;
+                    switch (m) {
+                        case Metric::Score:
+                        case Metric::Resources:
+                        case Metric::Research:
+                        case Metric::Intelligence: shown = scoreFigure(v); break;
+                        case Metric::Population: shown = populationFigure(v); break;
+                        default: shown = numberFitting(v, ImGui::GetContentRegionAvail().x); break;
+                    }
+                    cellFitted(shown, ImGui::GetColorU32(ImGuiCol_Text), 1.0f);
+                    if (shown != formatNumber(v) && ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s%s", formatNumber(v).c_str(), m == Metric::Population ? " million" : "");
+                });
+            row("Rank", [&](EmpireId e) { cellFitted(rankText(ranks[e.index()]), ImGui::GetColorU32(ImGuiCol_Text), 1.0f); });
+            endListTable(ui);
+        }
+        ImGui::PopStyleVar();
+        d.beginButtons();
+        pageButtons(d, page_, order.size(), kPerPage);
+        if (d.button("Comparisons")) ui.open(ScreenId::Comparisons);
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    static constexpr int kPerPage = 10;
+    static constexpr float kNameW = 100;   // the figures' names (frame pixels); the ten empire columns share the rest
+    int page_ = 0;
+};
+
+// ---- Comparisons ----------------------------------------------------------------------------------------
+
+// The graph plots only the rows of the player's statistics record (spec 05
+// §5, confirmed: binary): an empire has a row for each turn its score was
+// visible then, so the turns it was not are gaps, and the list holds every
+// empire with a row, destroyed ones and those no longer visible included.
+class ComparisonsScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Comparisons", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const std::vector<EmpireId> candidates = comparisonEmpires(s, ui.session.player());
+        if (!picked_) {
+            selected_ = candidates;
+            picked_ = true;
+        }
+
+        d.beginContent();
+        heading(ui, std::string(metricName(metric_)).c_str());
+        ImGui::SameLine();
+        ImGui::TextColored(kTextDim, "over time. Tick empires on the right to compare them.");
+        const float legendW = ui.px(190);
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        ImGui::BeginChild("##graph", ImVec2(avail.x - legendW - ImGui::GetStyle().ItemSpacing.x, 0));
+        graph(ui);
+        ImGui::EndChild();
+        ImGui::SameLine();
+        beginList(ui, "##legend", ImVec2(0, 0), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        for (EmpireId e : candidates) {
+            ImGui::PushID(int(e.index()));
+            bool on = std::find(selected_.begin(), selected_.end(), e) != selected_.end();
+            if (ImGui::Checkbox("##on", &on)) {
+                if (on) selected_.push_back(e);
+                else std::erase(selected_, e);
+            }
+            ImGui::SameLine();
+            empireLabel(ui, e, false, true);
+            ImGui::PopID();
+        }
+        if (candidates.size() < s.empires.size())
+            wrappedText("An empire's statistics are recorded only for the turns its score was visible to us.", kTextDim);
+        endList(ui);
+
+        d.beginButtons();
+        for (int i = 0; i < int(Metric::Count); ++i) {
+            const auto m = static_cast<Metric>(i);
+            if (d.tab(std::string(metricName(m)).c_str(), metric_ == m)) metric_ = m;
+        }
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    void graph(UiContext& ui) {
+        const game::GameState& s = ui.state();
+        struct Line {
+            EmpireId empire;
+            std::vector<std::pair<uint32_t, int64_t>> points;
+        };
+        std::vector<Line> lines;
+        uint32_t t0 = UINT32_MAX, t1 = 0;
+        int64_t vmax = 0;
+        for (EmpireId e : selected_) {
+            Line l{e, {}};
+            for (const game::TurnStats& st : comparisonRows(s, ui.session.player(), e)) {
+                const int64_t v = metricValue(st, metric_);
+                l.points.push_back({st.turn, v});
+                t0 = std::min(t0, st.turn);
+                t1 = std::max(t1, st.turn);
+                vmax = std::max(vmax, v);
+            }
+            if (!l.points.empty()) lines.push_back(std::move(l));
+        }
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const ImVec2 size = ImGui::GetContentRegionAvail();
+        ImGui::InvisibleButton("##plot", size);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float left = ui.px(64), bottom = ui.px(24), top = ui.px(8), right = ui.px(12);
+        const ImVec2 a{p0.x + left, p0.y + top};
+        const ImVec2 b{p0.x + size.x - right, p0.y + size.y - bottom};
+        dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y), IM_COL32(2, 5, 12, 255));
+        dl->AddRect(a, b, IM_COL32(44, 79, 158, 255));
+        if (lines.empty()) {
+            dl->AddText(ImVec2(a.x + ui.px(12), a.y + ui.px(12)), IM_COL32(140, 158, 184, 255), "No statistics to show.");
+            return;
+        }
+        if (t1 == t0) t1 = t0 + 1;
+        // A rounded vertical scale with about five steps.
+        const int64_t step = niceStep(vmax, 5);
+        const int64_t top_v = std::max<int64_t>(step, step * ((vmax + step - 1) / step));
+        auto px = [&](uint32_t t, int64_t v) {
+            const float fx = float(t - t0) / float(t1 - t0);
+            const float fy = float(double(v) / double(top_v));
+            return ImVec2(a.x + fx * (b.x - a.x), b.y - fy * (b.y - a.y));
+        };
+        const ImU32 gridC = IM_COL32(16, 34, 74, 255), labelC = IM_COL32(140, 158, 184, 255);
+        for (int64_t v = 0; v <= top_v; v += step) {
+            const ImVec2 q = px(t0, v);
+            dl->AddLine(ImVec2(a.x, q.y), ImVec2(b.x, q.y), gridC);
+            const std::string label = formatNumber(v);
+            const ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+            dl->AddText(ImVec2(a.x - ts.x - ui.px(6), q.y - ts.y * 0.5f), labelC, label.c_str());
+        }
+        float lastRight = -1e9f;
+        for (int i = 0; i <= 4; ++i) {
+            const uint32_t t = t0 + uint32_t((t1 - t0) * uint32_t(i) / 4u);
+            const ImVec2 q = px(t, 0);
+            const std::string label = formatDate(t);
+            const ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+            const float x = std::clamp(q.x - ts.x * 0.5f, a.x, b.x - ts.x);
+            if (x < lastRight + ui.px(8)) continue;
+            lastRight = x + ts.x;
+            dl->AddLine(ImVec2(q.x, a.y), ImVec2(q.x, b.y), gridC);
+            dl->AddText(ImVec2(x, b.y + ui.px(4)), labelC, label.c_str());
+        }
+        for (const Line& l : lines) {
+            const ImU32 c = empireColor(s, l.empire);
+            for (size_t i = 1; i < l.points.size(); ++i) {
+                // Gaps: no line across turns with no record.
+                if (l.points[i].first > l.points[i - 1].first + 1) continue;
+                dl->AddLine(px(l.points[i - 1].first, l.points[i - 1].second), px(l.points[i].first, l.points[i].second), c, 2.0f);
+            }
+            // A dot on the last row and on every row with no line to either side.
+            for (size_t i = 0; i < l.points.size(); ++i) {
+                const bool joinedBefore = i > 0 && l.points[i].first <= l.points[i - 1].first + 1;
+                const bool joinedAfter = i + 1 < l.points.size() && l.points[i + 1].first <= l.points[i].first + 1;
+                if (i + 1 == l.points.size() || (!joinedBefore && !joinedAfter))
+                    dl->AddCircleFilled(px(l.points[i].first, l.points[i].second), ui.px(3.5f), c);
+            }
+        }
+    }
+
+    Metric metric_ = Metric::Score;
+    std::vector<EmpireId> selected_;
+    bool picked_ = false;
+};
+
+// ---- History -------------------------------------------------------------------------------------------
+
+// The original's History window (spec 06 §4.3, confirmed: binary): a list of
+// the empires on the left and "Other Events" last; the chosen list's lines
+// oldest first, as the record holds them, under decade headings ("2400 -
+// 2410"). OpenSE4 adds a map of the galaxy under the list that shows the
+// selected line's system and the empire's known colonies, the empire's
+// founding and the changes its statistics show (historyLines).
+class HistoryScreen final : public Screen {
+public:
+    explicit HistoryScreen(const ScreenArgs& a) : empire_(a.empire) {}
+
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "History", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const EmpireId me = ui.session.player();
+        // One list per empire plus Other Events (spec 05 §3.4); the lines come
+        // from our long record, which outlives the log.
+        const auto all = historyEmpires(s, me);
+        if (!general_ && (!validEmpire(s, empire_) || std::find(all.begin(), all.end(), empire_) == all.end())) empire_ = me;
+        const EmpireId list = general_ ? EmpireId{} : empire_;
+        const auto events = historyLines(ui.rules(), s, me, list, !general_ && statsVisible(ui, empire_));
+
+        d.beginContent();
+        // On the left the empires, then Other Events, and under them our map;
+        // the lines fill the rest.
+        constexpr float kSide = 170;
+        const float listW = ui.px(kSide);
+        const float captionH = 2 * ImGui::GetTextLineHeightWithSpacing();
+        const float listH = ImGui::GetContentRegionAvail().y - ui.px(kSide) - captionH - ImGui::GetStyle().ItemSpacing.y;
+        ImGui::BeginGroup();
+        beginList(ui, "##lists", ImVec2(listW, listH), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        for (EmpireId k : all) {
+            ImGui::PushID(int(k.index()));
+            ImGui::PushStyleColor(ImGuiCol_Text, empireColor(s, k));
+            if (ImGui::Selectable(k == me ? "Our Empire" : s.empire(k).name.c_str(), !general_ && k == empire_)) {
+                empire_ = k;
+                general_ = false;
+                selected_ = -1;
+            }
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", s.empire(k).name.c_str());
+            ImGui::PopID();
+        }
+        if (ImGui::Selectable("Other Events", general_)) {
+            general_ = true;
+            selected_ = -1;
+        }
+        ui.tagItem("history:other-events");
+        endList(ui);
+        MiniMapStyle style;
+        style.owners = false;
+        if (!general_)
+            for (const auto& c : s.colonies)
+                if (c && c->owner == empire_ && (empire_ == me || ui.me().hasExplored(s.galaxy.object(c->planet).system)))
+                    style.fills.push_back({s.galaxy.object(c->planet).system, empireColor(s, empire_)});
+        if (selected_ >= 0 && size_t(selected_) < events.size() && events[size_t(selected_)].where)
+            style.highlight.push_back(events[size_t(selected_)].where->system);
+        miniMap(ui, "##historyMap", {kSide, kSide}, style);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + listW);
+        ImGui::TextColored(kTextDim, "%s", general_ ? "The selected event's system is highlighted." : "Known colonies in the empire's colour.");
+        ImGui::PopTextWrapPos();
+        ImGui::EndGroup();
+        ImGui::SameLine();
+
+        // The lines, oldest first, under decade headings.
+        beginList(ui, "##events", ImVec2(0, 0), kListLineStep, ImGuiChildFlags_AlwaysUseWindowPadding);
+        if (events.empty()) ImGui::TextColored(kTextDim, "Nothing recorded yet.");
+        else if (ImGui::BeginTable("##timeline", 2, ImGuiTableFlags_None)) {
+            ImGui::TableSetupColumn("Date", ImGuiTableColumnFlags_WidthFixed, ui.px(52));
+            ImGui::TableSetupColumn("Event", ImGuiTableColumnFlags_WidthStretch);
+            std::string decade;
+            for (size_t i = 0; i < events.size(); ++i) {
+                if (const std::string heading = decadeHeading(events[i].turn); heading != decade) {
+                    decade = heading;
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextColored(imColorV(palette::kHeading), "%s", heading.c_str());
+                }
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::PushID(int(i));
+                if (ImGui::Selectable(formatDate(events[i].turn).c_str(), selected_ == int(i), ImGuiSelectableFlags_SpanAllColumns))
+                    selected_ = int(i);
+                ImGui::PopID();
+                ImGui::TableSetColumnIndex(1);
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextUnformatted(events[i].text.c_str());
+                ImGui::PopTextWrapPos();
+            }
+            ImGui::EndTable();
+        }
+        endList(ui);
+
+        d.beginButtons();
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    EmpireId empire_;
+    bool general_ = false;
+    int selected_ = -1;
+};
+
+// ---- Victory Conditions ------------------------------------------------------------------------------
+
+// The original's Victory Conditions window (spec 06 §1.5, confirmed: binary):
+// a row per condition, a column per empire it shows (victoryColumnVisible:
+// the Score Display option read one step off), and an "X" where an empire
+// meets the condition; the years, the peace and the qualifier, once met, mark
+// every column. A condition that is off shows its title only. OpenSE4 adds
+// the Game column, each figure's progress on hover and the paging.
+class VictoryScreen final : public Screen {
+public:
+    bool draw(UiContext& ui) override {
+        Dialog d(ui, "Victory Conditions", DialogSize::Large);
+        if (!d.open()) return d.keepOpen();
+        const game::GameState& s = ui.state();
+        const game::Rules& r = ui.rules();
+        const game::VictoryConditions& v = s.options.victory;
+        std::vector<EmpireId> all;
+        for (const game::Empire& e : s.empires)
+            if (victoryColumnVisible(s, ui.session.player(), e.id)) all.push_back(e.id);
+
+        d.beginContent();
+        heading(ui, "Victory Conditions");
+        ImGui::SameLine();
+        const bool any = v.score || v.years || v.percentOfSecond || v.techPercent || v.peace;
+        ImGui::TextColored(kTextDim, "%s", any ? "Checked at the end of every turn; the first condition met ends the game."
+                                             : "None set: nothing ends the game automatically.");
+        if (s.gameOver || s.lastTurn) {
+            ImGui::TextColored(kTextWarn, "%s", s.gameOver           ? "The game is over; the Scores window shows the final ranking."
+                                                : game::turnBased(s) ? "A condition is met: this is the last turn. The Scores window shows the ranking."
+                                                                     : "A condition is met: the game is complete. The Scores window shows the ranking.");
+            if (validEmpire(s, s.winner)) {
+                ImGui::SameLine();
+                ImGui::TextColored(kTextWarn, "Best score:");
+                ImGui::SameLine();
+                empireLabel(ui, s.winner);
+            }
+        }
+
+        // Scores of every living empire, for the "% of second place" figure on hover.
+        std::vector<std::pair<int64_t, EmpireId>> scores;
+        for (const game::Empire& e : s.empires)
+            if (e.alive) scores.push_back({game::score::empireScore(r, s, e.id), e.id});
+        std::sort(scores.begin(), scores.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        auto bestOther = [&](EmpireId e) {
+            for (const auto& [sc, id] : scores)
+                if (id != e) return sc;
+            return int64_t{0};
+        };
+        const uint32_t years10 = s.turn;  // tenths of a year elapsed
+
+        const size_t first = size_t(page_) * kPerPage;
+        const size_t cols = std::min(all.size() - std::min(all.size(), first), size_t(kPerPage));
+        // Scroll sideways only when the columns do not fit.
+        const float cellPad = 2 * ImGui::GetStyle().CellPadding.x + 1;
+        const bool scroll = ui.px(280 + 100 * float(cols)) + float(cols + 2) * cellPad > ImGui::GetContentRegionAvail().x;
+        const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+                                      (scroll ? ImGuiTableFlags_ScrollX : ImGuiTableFlags_NoHostExtendX);
+        const float rowH = ImGui::GetTextLineHeight() + 2 * ImGui::GetStyle().CellPadding.y + 1;
+        if (ImGui::BeginTable("##victory", int(cols) + 2, flags, ImVec2(0, scroll ? rowH * 7 + ImGui::GetStyle().ScrollbarSize + ui.px(4) : 0))) {
+            ImGui::TableSetupScrollFreeze(1, 0);
+            ImGui::TableSetupColumn("Condition", ImGuiTableColumnFlags_WidthFixed, ui.px(170));
+            ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthFixed, ui.px(110));
+            for (size_t c = 0; c < cols; ++c)
+                ImGui::TableSetupColumn(s.empire(all[first + c]).name.c_str(), ImGuiTableColumnFlags_WidthFixed, ui.px(100));
+            ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextColored(kTextBlue, "Condition");
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(kTextBlue, "Game");
+            for (size_t c = 0; c < cols; ++c) {
+                ImGui::TableSetColumnIndex(int(c) + 2);
+                empireLabel(ui, all[first + c]);
+            }
+            // A row: the title (plain when the condition is off), OpenSE4's game
+            // figure, then an X in each column that meets it, its progress on hover.
+            auto row = [&](VictoryRow which, const std::string& title, const std::string& onTitle, const std::string& game, auto&& progress) {
+                const bool on = victoryRowOn(v, which);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextColored(on ? ImVec4(0.92f, 0.94f, 1, 1) : kTextDim, "%s", on ? onTitle.c_str() : title.c_str());
+                if (!on) return;
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextColored(ImVec4(0.92f, 0.94f, 1, 1), "%s", game.c_str());
+                for (size_t c = 0; c < cols; ++c) {
+                    ImGui::TableSetColumnIndex(int(c) + 2);
+                    const EmpireId e = all[first + c];
+                    const float w = ImGui::GetContentRegionAvail().x;
+                    const ImVec2 cellMin = ImGui::GetCursorScreenPos();
+                    if (victoryMark(r, s, which, e)) {
+                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (w - ImGui::CalcTextSize("X").x) * 0.5f));
+                        ImGui::TextColored(kTextGood, "X");
+                    } else {
+                        ImGui::Dummy(ImVec2(w, ImGui::GetTextLineHeight()));
+                    }
+                    if (ImGui::IsMouseHoveringRect(cellMin, ImVec2(cellMin.x + w, cellMin.y + ImGui::GetTextLineHeight())) && ImGui::IsWindowHovered()) {
+                        const std::string text = progress(e);
+                        if (!text.empty()) ImGui::SetTooltip("%s", text.c_str());
+                    }
+                }
+            };
+            auto pct = [](int64_t a, int64_t b) { return b > 0 ? a * 100 / b : 0; };
+            row(VictoryRow::Score, "Score", std::format("Score of {}", formatNumber(v.scoreValue)), "First to reach", [&](EmpireId e) {
+                return std::format("{}% of the score", pct(game::score::empireScore(r, s, e), v.scoreValue));
+            });
+            row(VictoryRow::Years, "Years", std::format("After {} years", game::score::yearsText(v.yearsTurns)),
+                std::format("{}.{} of {} years", years10 / 10, years10 % 10, game::score::yearsText(v.yearsTurns)),
+                [&](EmpireId) { return std::string{}; });
+            row(VictoryRow::PercentOfSecond, "Percent of second place", std::format("{}% of second place", v.percentOfSecondValue), "Leader vs. next",
+                [&](EmpireId e) {
+                    const int64_t sc = game::score::empireScore(r, s, e), other = bestOther(e);
+                    return std::format("{}% of the next best score", other > 0 ? sc * 100 / other : (sc > 0 ? 999 : 0));
+                });
+            row(VictoryRow::Tech, "Percent of technology", std::format("{}% of all technology", v.techPercentValue), "Tech levels owned",
+                [&](EmpireId e) {
+                    if (e != ui.session.player() && ui.me().relation(e).treaty != Treaty::Partnership) return std::string{};
+                    const auto [owned, total] = techProgress(r, s, s.empire(e));
+                    return std::format("{}% of all technology", pct(owned, total));
+                });
+            row(VictoryRow::Peace, "Years of peace", std::format("{} years of peace", game::score::yearsText(v.peaceTurns)),
+                std::format("{}.{} years so far", s.peacefulTurns / 10, s.peacefulTurns % 10), [&](EmpireId) { return std::string{}; });
+            row(VictoryRow::Delay, "No victory before", std::format("No victory before {} years", game::score::yearsText(v.delayTurns)),
+                years10 >= uint32_t(std::max(0, v.delayTurns)) ? std::string("Passed")
+                                                               : std::format("{} years left", game::score::yearsText(v.delayTurns - int64_t{years10})),
+                [&](EmpireId) { return std::string{}; });
+            ImGui::EndTable();
+        }
+        ImGui::Spacing();
+        wrappedText("An X marks each empire that meets a condition; hover over a cell for its progress.", kTextDim);
+        d.beginButtons();
+        pageButtons(d, page_, all.size(), kPerPage);
+        d.close();
+        return d.keepOpen();
+    }
+
+private:
+    static constexpr int kPerPage = 10;
+    int page_ = 0;
+};
+
+} // namespace
+
+std::unique_ptr<Screen> makeEmpires(const ScreenArgs& args) { return std::make_unique<EmpiresScreen>(args); }
+std::unique_ptr<Screen> makeBorders(const ScreenArgs&) { return std::make_unique<BordersScreen>(); }
+std::unique_ptr<Screen> makeTreatyGrid(const ScreenArgs&) { return std::make_unique<TreatyGridScreen>(); }
+std::unique_ptr<Screen> makeScores(const ScreenArgs&) { return std::make_unique<ScoresScreen>(); }
+std::unique_ptr<Screen> makeComparisons(const ScreenArgs&) { return std::make_unique<ComparisonsScreen>(); }
+std::unique_ptr<Screen> makeHistory(const ScreenArgs& args) { return std::make_unique<HistoryScreen>(args); }
+std::unique_ptr<Screen> makeVictoryConditions(const ScreenArgs&) { return std::make_unique<VictoryScreen>(); }
+
+} // namespace opense4::client::classic

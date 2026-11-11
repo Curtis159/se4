@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "turns": 3,
+  "evidence": [
+    "Sentry is a real serialized native order",
+    "Three turn boundaries preserve order and location without idle-ship prompts",
+    "Save/load preserves Sentry",
+    "Another order replaces Sentry; Clear Orders restores idle attention"
+  ]
+}

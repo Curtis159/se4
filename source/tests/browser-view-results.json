@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "runtime": "native C++ browserSnapshot and actual engine rules",
+  "evidence": [
+    "Prior planet/asteroid/design privacy checks remain passing",
+    "Construction research unlocks are unavailable before and researchable after next level",
+    "Research preview does not mutate state checksum",
+    "Log metadata distinguishes location, Research and no destination"
+  ]
+}

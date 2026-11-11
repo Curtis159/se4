@@ -1,0 +1,33 @@
+# Browser adaptation of OpenSE4 learning topics; original sources retained upstream.
+title = "Diplomacy and intelligence"
+summary = "Meet empires, exchange messages and manage intelligence projects."
+minutes = 15
+[setup]
+seed = 404
+computer_players = 2
+quadrant_size = "small"
+events = "none"
+starting_ships = ["Attack Ship", "Attack Ship"]
+[[step]]
+title = "Meet neighbours"
+text = "Explore until another empire appears in your contacts."
+done = { empires_met = 1 }
+[[step]]
+title = "Diplomacy"
+text = "Open Status, then Diplomacy. Contacted empires show their current treaty. Custom teammates are fixed partners."
+done = { window = "empires" }
+[[step]]
+title = "Send a message"
+text = "Choose a contacted empire, select a message or treaty proposal, and Send."
+done = { command = "SendMessage" }
+[[step]]
+title = "Read the answer"
+text = "End a turn and check Log and Diplomacy for the reply. Treaty offers can be accepted or declined inside the app."
+done = { turns_passed = 1 }
+[[step]]
+title = "Intelligence"
+text = "Open Status, then Intelligence. Choose a researched project and a valid target, or counter-intelligence for defense. Add it to the queue."
+done = { command = "SetIntel" }
+[[step]]
+title = "Keep funding work"
+text = "Intelligence points fund the queued projects when the turn ends. Your income depends on facilities and empire modifiers."

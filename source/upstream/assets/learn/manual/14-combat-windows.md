@@ -1,0 +1,164 @@
+---
+windows: tactical-combat, tactical-orders, tactical-options, tactical-launch, combat-piece-report, strategic-combat, combat-replay, combat-replay-options, combat-simulator
+---
+# Battle windows
+
+This chapter shows you how to fight a battle by hand, how to watch one, how to replay it, and
+how to test your designs in the Combat Simulator. The rules behind all of them are in
+[Combat](combat).
+
+## How battles reach you
+
+In a turn-based game on this computer (alone or hotseat), every battle with a human side stops
+the game as it breaks out, before the first combat turn, and asks how to fight it. The question
+is the **Strategic Combat** window itself, with two buttons: `Tactical` (`T`) fights it in the
+Tactical Combat window, `Strategic` (`S`) lets the strategies fight it right there while you
+watch. One answer covers every human side in that battle. When the battle breaks out during a
+computer player's turn, a notice naming the system comes first; `Begin` goes on. Nothing else
+happens until the battle is over and its window closed: the battle reports, the Log entries and
+the rest of the turn come after.
+
+- In a game set up with **Strategic combat only**, the Strategic Combat window opens the same way, with `Begin` and `Close` instead of the question.
+- In simultaneous games you read about battles in the Log, and watch them with `Combat Replay`; when the game's settings ask for it, every battle on this computer is shown in the Strategic Combat window as it breaks out, battles between computer players included, without a notice first.
+- In network and play-by-e-mail games the host fights every battle at once; you watch the battles you were in (by e-mail, those your own orders started) afterwards.
+
+## Tactical combat
+
+When you choose **Tactical**, the **Tactical Combat** window fills the screen. You cannot close it
+or save until the battle is over.
+
+Press **Begin** at the bottom right (or `E`) to start the battle; until then `Orders` is dim, but
+you can click any piece, an enemy's too, to look at it in the panels, and `Auto` already works.
+`Begin` then becomes `End Turn`.
+
+**The title strip** at the top shows the battle's location, the combat turn and the empires in the
+battle, the one whose phase it is framed in yellow. The two selectors at its right step through
+your pieces: the one with the ship through those that can still move, the one with the crosshair
+through those that can still fire; the left half of each picks the next piece (as `Space`,
+`Ctrl+N` and `Ctrl+F`), the right half the previous one (`Ctrl+B`, `Ctrl+D`). "Next" goes through
+your pieces from the last to the first, "previous" the other way. Group leaders come first, then
+any other piece; when nothing can move any more, the ship selector picks your first planet. At
+the start of each of your phases the first group leader that can move is selected for you (else
+the first piece that can). The small box at the far right closes the window, but only once the
+battle is over.
+
+**The map** fills the left of the window. The mouse wheel zooms, dragging with the middle button
+pans, and the arrow keys scroll. The overview map at the bottom right shows the whole battlefield
+with a dotted rectangle for the part you see; click or drag on it to move the view.
+
+In your phase:
+
+- **Left-click** one of your pieces to select it.
+- **Left-click an empty square** to move the selected piece there. The pointer shows the path.
+- **Left-click an enemy** to fire the weapons ticked in the weapon grid, one after the other. The pointer shows whether you can fire, and why not. A click on a piece that is not an enemy (an ally, your own drones, a neutral object) is refused with a message.
+- **Right-click** any piece, or click the current piece panel, for its **Combat Piece Report**: movement, shields, damage, supplies, the number of targets it can engage, its combat group and formation. Its tabs list a ship's components, a planet's facilities, the cargo and the abilities: a ship's come from its hull and every component of its design, even those shot away; a planet shows only its own, not those of its facilities.
+- Click the map, or press `Space`, to skip an animation.
+
+**The current piece panel** at the top right shows the selected piece's picture, name, size and
+movement, its owner's flag, and two rows of blocks: blue for what is left of its shields, red for
+what is left of its structure (a planet also writes its structure in thousands); click it for
+the piece's report. It stays empty until a piece is selected. Under it, the **weapon grid** holds
+the piece's weapons, six to a row: a ticked weapon stands on teal, red bars at the top right count
+the combat turns a weapon still needs to reload (up to five), and each cell has its mount's letter
+at the top left and its level at the bottom right; a unit group's cell shows how many of the
+weapon it has at the top right. Every ready weapon is ticked when you select a piece, at the
+start of each phase and after the piece moves, and a weapon that fires is unticked. Click a
+weapon to tick or untick it; `Shift+A` ticks every ready weapon and `Shift+C` unticks all. Hover
+over a weapon to see its chance to hit and its damage against the target. When a piece has more
+weapons than the grid holds, the arrows under it scroll the grid. Further down, the target panel
+(on a screen at least 1024 pixels wide) shows the piece of another empire, an ally's too, under
+the pointer while one of your pieces is selected, and the piece a seeker strikes: its distance
+in squares, and its shields and structure as blocks. It empties when the pointer moves to an
+empty square or a neutral object, or while you aim a ram or a capture. After each hit is drawn
+it writes the damage done: what the shields lost in blue, what the structure lost in red.
+
+The buttons:
+
+| Button | What it does |
+|---|---|
+| `Options` | The **Combat Options** window (below). |
+| `Orders` | The special orders below. |
+| `Auto` | A check box: let every side follow its strategies. Play then pauses after the last player's phase of each combat turn; `End Turn` goes on. Click it again to take control back (in the simulator, Race 1 comes back to you and the computer plays every other race). After `Resolve Combat` all four buttons dim and `Auto` stays pressed. |
+| `End Turn` | End your phase (`E`). A phase in which none of your pieces can act ends by itself. |
+
+The **Tactical Combat Orders** window holds:
+
+- `Launch Units`: launch fighters, satellites or drones from the selected piece, 1, 5, 10 or all of a kind at a time, within its launch rate for the turn. `L` opens it directly.
+- `Launch Fighters in Groups`: launch fighters in groups of 5 to 50.
+- `Drop Troops` (`T`): land the selected ship's troops at once on an adjacent colony of another empire (see [Ground combat and capture](ground-combat-and-capture)).
+- `Ram Ship` (`R`) and `Capture Ship` (`C`): close the window, then click the target. Ramming needs movement left and an adjacent target that is neither yours nor a friend's (an enemy seeker or a neutral object will do). Capturing needs an adjacent enemy ship with its shields down and boarding parties on your ship. While `Auto` is off, a message box says why an order was refused. When a boarding is over, a message box says whether the ship was taken, the attempt failed, or the target blew itself up, to each side played by hand.
+- `Set Group Leader`, `Set Group Member`, `Clear Group Assignment`, `Clear All Group Assignments`: combat groups 1 to 9. A leader picks a formation, and its members follow it; a leader given its own number again picks a new formation. `Alt+1` to `Alt+9` and `Ctrl+1` to `Ctrl+9` do the same from the keyboard; `Alt+0` or `Ctrl+0` clears the selected piece's group.
+- `Resolve Combat`: let every side's strategies fight the rest of the battle. It asks first.
+
+Your drones always act by themselves, at the start of your phase. Pieces you leave idle do not
+fire by themselves.
+
+The **Combat Options** window, headed *Options In Use*, holds check boxes for the animation of ship movement,
+sound and music, *Fast Tactical Combat*, and display switches: group identifiers (a small box on
+every piece in a group, whoever owns it: blue a leader, red a member, with the group's number),
+the viewing rectangle on the map, centring the map on the current ship when it is out of view,
+the chance to hit of each weapon when you point at an enemy, and the grid. In the simulator it also has `Stop Combat`. *Music On* is
+lit only while music is on and your copy's settings allow it ([Settings](settings)).
+
+The battle is drawn at the original's pace: a ship turns before it moves and then slides across
+its square in about half a second; beams are drawn and wiped out stamp by stamp and torpedoes fly
+toward their targets; a hit that gets through the shields explodes for about a second, while one
+the shields take whole only flashes the target's shield ring. A miss ends half a square off the
+target. *Fast Tactical Combat* keeps every picture but removes the waits. In the Strategic Combat
+window there is no animation at all: the battle runs as fast as your computer allows, several
+combat turns between two pictures.
+
+> Look at the chance to hit before you click: a 5 % shot wastes supplies and a reload.
+
+When the battle is over, **Combat Complete** appears; after `OK` the window closes by itself.
+
+## Strategic combat
+
+The **Strategic Combat** window shows a battle fought by the strategies. Press `Begin`: the battle
+is then fought before your eyes, as fast as it can be shown: the small map moves after each side's
+moves, and the forces list and the combat turn in the title strip change after each combat turn.
+
+- The **Combat Forces** list shows, for each empire, its pieces by hull with how many are left (**Current**) and how many were lost (**Lost**, in red), and its planets.
+- The small map shows every piece as a coloured square. Point at one to see its name and owner.
+- `Close` stays dim until the battle is over.
+
+When troops land during the battle, the Ground Combat window opens and the battle waits for it.
+
+## Replays
+
+Select a battle in the [Log](window:log) and press `Combat Replay` to play it back in the
+**Combat Replay** window. It looks like the tactical window without its panels: the map, an
+empty weapon grid on the right, `Options` and `Next` under it and the overview map at the
+bottom. The view stays where you put it: click the overview, scroll with the arrow keys, or
+zoom with the mouse wheel.
+
+- `Next` (or `Space`) plays the next combat turn; it dims after the last one.
+- `Options` opens the replay's options: animation, *Fast Tactical Combat*, the viewing rectangle, the grid, and `Stop Replay`. Under *OpenSE4*, *List each combat turn's events and the summary* shows, in place of the empty grid, what happens in each combat turn (moves, shots, hits, misses, launches and losses) and a summary at the end.
+- `Esc` closes the replay.
+
+Point at a piece to see its design and owner at the top right.
+
+## The Combat Simulator
+
+The [Combat Simulator](window:combat-simulator) fights a test battle that changes nothing in your
+game: no losses, no experience. Open it with `Simulator` in the [Designs](window:designs) window.
+
+The battle is fought between ten imaginary races, **Race 1** to **Race 10**. You command Race 1;
+the computer plays the others (change this with `Computer Control`).
+
+1. In **Owner for item** at the bottom right, choose the race that new items join. Each race is shown as a box in its own colour with its number.
+2. Click an entry in the **Items to choose** list at the top right to add it: your designs, the enemy designs you have seen (with their empire's name), and the planets of your home system, all in alphabetical order. Each click adds one ship, or one unit to that race's group of its kind, or one more copy of a planet (the same planet can fight several times). Right-click an item for its report.
+3. The **Combat Vehicles** list on the left shows everything in the battle, one row per ship, unit group or planet, with its race's numbered box, what it carries (or a group's units) and its fleet. Click a row to remove it.
+4. `Fleets For Plr` opens Fleet Transfer for the chosen race's ships, to form fleets with a formation and a strategy (`Existing Fleets` there shows your real fleets, for viewing only). `Change Cargo` opens Transfer Cargo with everything in the battle on the left and a **Storehouse** on the right: a copy of your first colony stocked with 1,000 of every unit design you own or have seen and 10,000M people. Click cargo to move it between a vehicle or planet and the Storehouse; people you load onto a ship stay aboard in the battle. The `No Obsolete` check box hides your obsolete designs; `Strategies` opens the strategy editor.
+5. Choose **Tactical** or **Strategic** and press `Begin`. One race is enough, and nobody needs to see an enemy first: the battle starts as soon as some race has something on the field.
+
+With **Tactical**, the simulator closes while you fight in the Tactical Combat window and comes
+back afterwards with the same setup. With **Strategic**, every race follows its strategies and the
+Strategic Combat window opens over the simulator. `Cancel` closes the simulator and forgets the
+setup.
+
+Each design starts the test battle new, fully supplied and without experience. A race whose first
+item is an enemy design gets that enemy's race and technology. The races start on different edges
+of the map, and races with planets or bases start in the middle.
+
+> Before you build twenty ships of a new design, pit five of them against the enemy designs you have seen. The simulator is free.

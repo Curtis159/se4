@@ -1,0 +1,68 @@
+{
+  "passed": true,
+  "actions": [
+    "zero starting ships and designs",
+    "reject unresearched hull",
+    "require a working shipyard",
+    "research technology",
+    "preview and create design",
+    "construct ship",
+    "move ship",
+    "scrap and construct facility",
+    "construct colony ship",
+    "colonize planet",
+    "explore through warp",
+    "save/load",
+    "reject invalid command"
+  ],
+  "evidence": [
+    {
+      "turn": 1,
+      "checksum": "6087579229692616368",
+      "ships": 0,
+      "colonies": 1
+    },
+    {
+      "turn": 2,
+      "checksum": "8951937093131442003",
+      "ships": 1,
+      "colonies": 1
+    },
+    {
+      "turn": 3,
+      "checksum": "13029033583942226838",
+      "ships": 1,
+      "colonies": 1
+    },
+    {
+      "turn": 4,
+      "checksum": "10053719791884512280",
+      "ships": 1,
+      "colonies": 1
+    },
+    {
+      "turn": 5,
+      "checksum": "9521709307395104187",
+      "ships": 2,
+      "colonies": 1
+    },
+    {
+      "turn": 6,
+      "checksum": "5916536746756556832",
+      "ships": 1,
+      "colonies": 2
+    },
+    {
+      "turn": 7,
+      "checksum": "883314641815712196",
+      "ships": 1,
+      "colonies": 2
+    },
+    {
+      "turn": 7,
+      "checksum": "12310723667606731027",
+      "ships": 1,
+      "colonies": 2
+    }
+  ]
+}

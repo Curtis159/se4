@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "runtime": "actual optimized WASM engine and native command validation",
+  "evidence": [
+    "prototype edit preserves ID; Retrofit selects latest researched family components, preserves mounts, validates and does not mutate while previewing",
+    "obsolete/restore persist and deleted designs cannot reappear in obsolete listings",
+    "independent yard queues block direct edit/delete; revisions and obsolescence leave queued builds and ships intact; save/load retains design management state"
+  ]
+}

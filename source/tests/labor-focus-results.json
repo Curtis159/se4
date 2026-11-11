@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "bonusPercent": 5,
+  "resourceDelta": 303,
+  "evidence": [
+    "Native colony-only output and treasury income increase",
+    "Research output increases; unavailable intelligence is rejected",
+    "Focus persists through native save/load and does not compound",
+    "Real planetary construction clears focus; occupied queues cannot be overwritten",
+    "New human games default to priority allocation"
+  ]
+}

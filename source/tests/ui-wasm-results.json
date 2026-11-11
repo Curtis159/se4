@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "runtime": "jsdom DOM + actual WASM Node worker; not browser visual QA",
+  "evidence": [
+    "hamburger dropdown closes on Escape and outside selection",
+    "system board, colony ownership banner and contextual colonization status",
+    "guided hull, required core, categorized equipment, capacity guard and review before saving",
+    "rename through C++",
+    "compact queue grid, collapsed components, spent/total amounts and resource icons after numbers through C++",
+    "resource income signs, status breakdown, and live construction forecast on hold/resume",
+    "categorized unlock cards, native queue allocation, repeat, reorder and explicit cancellation through C++",
+    "design validation and creation through C++",
+    "colony hull offers and requires colony module, caps engines, and saves a complete colony ship",
+    "blue turn guide navigates to each idle ship and colony without advancing; ready turn is gold",
+    "ship construction and map selection",
+    "actual movement orders display native route lines and per-sector turn labels, Stop clears them",
+    "map detail toggle and accessible known-system picker",
+    "download and load through C++",
+    "return to game",
+    "eight-page New Game, race creation/download, original native creation and first-turn shipyard guidance",
+    "hotseat privacy handoff and automatic play-by-email next-player save download",
+    "Hegemon selectable in packaged Quick Game, native AI turn processing and Hegemon-tagged save download",
+    "failed End Turn restores the real WASM checkpoint and offers a diagnostic recovery download",
+    "main-menu Learn remains greyed out after initialization, busy updates and gameplay; disabled activation cannot open scenarios"
+  ]
+}

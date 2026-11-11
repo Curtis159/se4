@@ -1,0 +1,10 @@
+import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';
+import {findPreset,validatePresets,compareProfiles} from '../src/presets.js';
+const races=JSON.parse(fs.readFileSync(new URL('../assets/races.json',import.meta.url)));
+const profiles=JSON.parse(fs.readFileSync(new URL('../assets/empire-presets.json',import.meta.url)));
+test('all 21 original empire files decoded',()=>assert.equal(profiles.length,21));
+test('all 16 Quick Start races match original binary empire file',()=>{assert.equal(races.length,16);assert.ok(validatePresets(races,profiles));});
+test('original Terran characteristic percentages',()=>{const p=findPreset('Terran',profiles);assert.equal(p.characteristicValues.Intelligence,120);assert.equal(p.characteristicValues['Mining Aptitude'],110);assert.equal(p.surfaceName,'Rock');});
+test('original Eee traits and environment',()=>{const p=findPreset('Eee',profiles);assert.ok(p.traitNames.includes('Ancient Race'));assert.equal(p.surfaceName,'Gas Giant');assert.equal(p.atmosphereName,'Carbon Dioxide');});
+test('racial differences come from binary files',()=>{assert.ok(compareProfiles(findPreset('Terran',profiles),findPreset('Eee',profiles)).length>0);});
+test('Fazrah selects fazrah.emp rather than Braz sharing the same art style',()=>{assert.equal(findPreset('Fazrah',profiles).file,'fazrah.emp');});

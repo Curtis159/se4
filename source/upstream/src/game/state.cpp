@@ -1,0 +1,443 @@
+#include "game/state.hpp"
+
+#include <algorithm>
+#include <tuple>
+
+namespace opense4::game {
+
+std::string_view displayName(OrderKind k) {
+    switch (k) {
+        case OrderKind::MoveTo: return "Move To";
+        case OrderKind::Warp: return "Warp Through";
+        case OrderKind::Attack: return "Attack";
+        case OrderKind::Resupply: return "Resupply";
+        case OrderKind::Repair: return "Repair";
+        case OrderKind::Explore: return "Explore";
+        case OrderKind::Colonize: return "Colonize";
+        case OrderKind::Sentry: return "Sentry";
+        case OrderKind::LoadCargo: return "Load Cargo";
+        case OrderKind::DropCargo: return "Drop Cargo";
+        case OrderKind::LaunchUnits: return "Launch Units";
+        case OrderKind::RecoverUnits: return "Recover Units";
+        case OrderKind::Cloak: return "Cloak";
+        case OrderKind::Decloak: return "Decloak";
+        case OrderKind::SweepMines: return "Sweep Mines";
+        case OrderKind::UseComponent: return "Use Component";
+        case OrderKind::StellarManipulation: return "Stellar Manipulation";
+        case OrderKind::MoveToWaypoint: return "Move To Waypoint";
+        case OrderKind::SelfDestruct: return "Self-Destruct";
+        case OrderKind::UseFacility: return "Use Facility";
+        case OrderKind::ConvertResources: return "Convert Resources";
+        // The Scrap window's orders, as the order list shows them (spec 03 §15).
+        case OrderKind::Scrap: return "Scrap / Analyze / Mothball";
+        case OrderKind::Analyze: return "Deconstruct & Analyze";
+        case OrderKind::Mothball: return "Mothball";
+        case OrderKind::Unmothball: return "Unmothball";
+        case OrderKind::Retrofit: return "Retrofit";
+        case OrderKind::FireOn: return "Fire On And Destroy";
+        // The ministers' own orders (spec 05 §7.5).
+        case OrderKind::Seek: return "Seek";
+        case OrderKind::JoinFleet: return "Join Fleet";
+        case OrderKind::Abandon: return "Abandon Planet";
+        case OrderKind::Count: break;
+    }
+    return "?";
+}
+
+std::optional<ruleset::VehicleType> unitTypeOf(CargoKind k) {
+    using V = ruleset::VehicleType;
+    switch (k) {
+        case CargoKind::Troops: return V::Troop;
+        case CargoKind::Fighters: return V::Fighter;
+        case CargoKind::Mines: return V::Mine;
+        case CargoKind::Satellites: return V::Satellite;
+        case CargoKind::Drones: return V::Drone;
+        case CargoKind::WeaponPlatforms: return V::WeaponPlatform;
+        case CargoKind::None:
+        case CargoKind::Population:
+        case CargoKind::Count: break;
+    }
+    return std::nullopt;
+}
+
+CargoKind cargoKindOf(ruleset::VehicleType t) {
+    using V = ruleset::VehicleType;
+    switch (t) {
+        case V::Troop: return CargoKind::Troops;
+        case V::Fighter: return CargoKind::Fighters;
+        case V::Mine: return CargoKind::Mines;
+        case V::Satellite: return CargoKind::Satellites;
+        case V::Drone: return CargoKind::Drones;
+        case V::WeaponPlatform: return CargoKind::WeaponPlatforms;
+        default: return CargoKind::None;
+    }
+}
+
+std::string_view displayName(CargoKind k) {
+    switch (k) {
+        case CargoKind::Population: return "Population";
+        case CargoKind::Troops: return "Troops";
+        case CargoKind::Fighters: return "Fighters";
+        case CargoKind::Mines: return "Mines";
+        case CargoKind::Satellites: return "Satellites";
+        case CargoKind::Drones: return "Drones";
+        case CargoKind::WeaponPlatforms: return "Weapon Platforms";
+        case CargoKind::None:
+        case CargoKind::Count: break;
+    }
+    return "";
+}
+
+std::string_view displayName(MessageType t) {
+    switch (t) {
+        case MessageType::General: return "General Message";
+        case MessageType::ProposeTreaty: return "Propose Treaty";
+        case MessageType::AcceptTreaty: return "Accept Treaty";
+        case MessageType::RefuseTreaty: return "Refuse Treaty";
+        case MessageType::CounterTreaty: return "Counter Treaty";
+        case MessageType::BreakTreaty: return "Break Treaty";
+        case MessageType::DeclareWar: return "Declare War";
+        case MessageType::ProposeTrade: return "Propose Trade";
+        case MessageType::AcceptTrade: return "Accept Trade";
+        case MessageType::RefuseTrade: return "Refuse Trade";
+        case MessageType::CounterTrade: return "Counter Trade";
+        case MessageType::Gift: return "Gift";
+        case MessageType::Tribute: return "Tribute";
+        case MessageType::AcceptGift: return "Accept Gift";
+        case MessageType::RefuseGift: return "Refuse Gift";
+        case MessageType::Surrender: return "Surrender";
+        case MessageType::GrantIndependence: return "Grant Independence";
+        case MessageType::DemandGift: return "Demand Gift";
+        case MessageType::DemandTribute: return "Demand Tribute";
+        case MessageType::DemandSurrender: return "Demand Surrender";
+        case MessageType::DemandRemoveShips: return "Demand Remove Ships";
+        case MessageType::DemandRemoveColonies: return "Demand Remove Colonies";
+        case MessageType::DemandLeavePlanet: return "Demand Leave Planet";
+        case MessageType::RequestStopHostilities: return "Request Stop Hostilities";
+        case MessageType::RequestBreakTreaty: return "Request Break Treaty";
+        case MessageType::RequestDeclareWar: return "Request Declare War";
+        case MessageType::RequestMakePeace: return "Request Make Peace";
+        case MessageType::RequestSupport: return "Request Support";
+        case MessageType::RequestAttackEmpire: return "Request Attack Empire";
+        case MessageType::RequestAttackPlanet: return "Request Attack Planet";
+        case MessageType::DemandStopEspionage: return "Demand Stop Espionage";
+        case MessageType::DemandStopSabotage: return "Demand Stop Sabotage";
+        case MessageType::DemandStopAttacks: return "Demand Stop Attacks";
+        case MessageType::AcceptDemand: return "Accept Demand";
+        case MessageType::RefuseDemand: return "Refuse Demand";
+        case MessageType::Count: break;
+    }
+    return "?";
+}
+
+LogEntry* addLog(GameState& s, EmpireId empire, LogCategory category, std::string title, std::string text, std::optional<Location> where,
+                 std::string picture) {
+    if (!empire.valid() || empire.index() >= s.empires.size()) return nullptr;
+    const LogGoto target = category == LogCategory::Research ? LogGoto::Research : LogGoto::Location;
+    return &s.empire(empire).log.emplace_back(
+        LogEntry{s.turn, category, std::move(title), std::move(text), where, std::move(picture), target, {}});
+}
+
+void addHistory(GameState& s, EmpireId empire, EmpireId about, std::string text, std::optional<Location> where) {
+    if (!empire.valid() || empire.index() >= s.empires.size()) return;
+    if (about.valid() && about.index() >= s.empires.size()) about = {};
+    if (where && !(where->system.valid() && where->system.index() < s.galaxy.systems.size() && where->sector.valid())) where.reset();
+    s.empire(empire).historyEvents.push_back(HistoryEntry{s.turn, about, std::move(text), where});
+}
+
+namespace {
+template <class List>
+auto seenLowerBound(List& list, DesignId d) {
+    return std::lower_bound(list.begin(), list.end(), d, [](const SeenDesign& x, DesignId id) { return x.design < id; });
+}
+} // namespace
+
+bool knowsDesign(const Knowledge& k, DesignId d) { return designSeenTurn(k, d).has_value(); }
+
+std::optional<uint32_t> designSeenTurn(const Knowledge& k, DesignId d) {
+    const auto it = seenLowerBound(k.seenDesigns, d);
+    if (it == k.seenDesigns.end() || it->design != d) return std::nullopt;
+    return it->turn;
+}
+
+void seeDesign(Knowledge& k, DesignId d, uint32_t turn) {
+    if (!d.valid()) return;
+    const auto it = seenLowerBound(k.seenDesigns, d);
+    if (it != k.seenDesigns.end() && it->design == d) it->turn = std::max(it->turn, turn);
+    else k.seenDesigns.insert(it, SeenDesign{d, turn});
+}
+
+std::vector<DesignId> seenDesignIds(const Knowledge& k) {
+    std::vector<DesignId> out;
+    out.reserve(k.seenDesigns.size());
+    for (const SeenDesign& x : k.seenDesigns) out.push_back(x.design);
+    return out;
+}
+
+uint32_t GameState::freeSlot() const {
+    std::vector<uint32_t> used;
+    used.reserve(vehicles.size() + galaxy.objects.size());
+    for (const Vehicle& v : vehicles) used.push_back(v.slot);
+    for (const StarSystem& sys : galaxy.systems)
+        for (ObjectId o : sys.objects) used.push_back(galaxy.object(o).slot);
+    std::sort(used.begin(), used.end());
+    uint32_t slot = 0;
+    for (uint32_t u : used) {
+        if (u > slot) break;
+        if (u == slot) ++slot;
+    }
+    return slot;
+}
+
+ObjectId GameState::addObject(SpaceObject obj, SystemId system) {
+    obj.id = ObjectId{galaxy.objects.size()};
+    obj.system = system;
+    obj.slot = freeSlot();
+    // The system lists its objects in object order (spec 04 §19.2 Q57).
+    std::vector<ObjectId>& list = galaxy.system(system).objects;
+    const auto at = std::find_if(list.begin(), list.end(), [&](ObjectId o) { return galaxy.object(o).slot > obj.slot; });
+    list.insert(at, obj.id);
+    galaxy.objects.push_back(std::move(obj));
+    colonies.resize(galaxy.objects.size());
+    for (Empire& e : empires) e.knowledge.knownWarpLink.resize(galaxy.objects.size(), options.omnipresent ? 1 : 0);
+    return galaxy.objects.back().id;
+}
+
+Vehicle& GameState::addVehicle(Vehicle v) {
+    v.id = VehicleId{nextVehicleId++};
+    // The lowest slot of the object list that no object of any kind holds (spec 03 §6.3 step 5).
+    v.slot = freeSlot();
+    arrived(v);  // placed in its system
+    // "Automatically use Individual Ministers for newly built vehicles": every
+    // new vehicle and launched unit group starts under minister control (spec 02 §10).
+    if (v.owner.valid() && v.owner.index() < empires.size() && empires[v.owner.index()].ministersForNewVehicles) v.minister = true;
+    vehicles.push_back(std::move(v));  // ids are increasing: stays sorted
+    return vehicles.back();
+}
+
+Fleet& GameState::addFleet(Fleet f) {
+    f.id = FleetId{nextFleetId++};
+    if (!f.location.system.valid() && !f.members.empty())
+        if (const Vehicle* first = vehicle(f.members.front())) f.location = first->location;
+    fleets.push_back(std::move(f));
+    return fleets.back();
+}
+
+void GameState::removeDeadVehicles() {
+    std::erase_if(vehicles, [](const Vehicle& v) { return v.count <= 0; });
+    tidyFleets();
+}
+
+void GameState::tidyFleets(bool keepEmpty) {
+    std::vector<FleetId> abandoned;
+    for (Fleet& f : fleets) {
+        // A fleet with no members at all is one Fleet Transfer made
+        // (cmd::CreateFleet): its Close button deletes it while it is empty,
+        // and loading a saved game drops any left (spec 03 §9).
+        if (f.members.empty()) {
+            if (!keepEmpty) abandoned.push_back(f.id);
+            continue;
+        }
+        std::erase_if(f.members, [&](VehicleId id) {
+            const Vehicle* v = vehicle(id);
+            return !v || v->count <= 0 || v->fleet != f.id;
+        });
+        // A chosen leader that left or was destroyed is no longer chosen (spec 03 §9).
+        if (f.leader.valid() && std::find(f.members.begin(), f.members.end(), f.leader) == f.members.end()) f.leader = {};
+        if (fleetMembersAt(*this, f).empty()) abandoned.push_back(f.id);
+    }
+    for (FleetId id : abandoned) disbandFleet(*this, id);
+}
+
+std::vector<ObjectRef> objectOrder(const GameState& s) {
+    std::vector<ObjectRef> out;
+    out.reserve(s.vehicles.size() + s.galaxy.objects.size());
+    for (const StarSystem& sys : s.galaxy.systems)
+        for (ObjectId o : sys.objects) out.push_back(ObjectRef{o, {}, s.galaxy.object(o).slot});
+    for (const Vehicle& v : s.vehicles) out.push_back(ObjectRef{{}, v.id, v.slot});
+    // Slots are unique; the rest only keeps the order fixed should two ever meet.
+    std::sort(out.begin(), out.end(), [](const ObjectRef& a, const ObjectRef& b) {
+        return std::tuple(a.slot, a.vehicle.valid(), a.object.value, a.vehicle.value) < std::tuple(b.slot, b.vehicle.valid(), b.object.value, b.vehicle.value);
+    });
+    return out;
+}
+
+std::vector<VehicleId> vehiclesInObjectOrder(const GameState& s) {
+    std::vector<std::pair<uint32_t, VehicleId>> slots;
+    slots.reserve(s.vehicles.size());
+    for (const Vehicle& v : s.vehicles) slots.emplace_back(v.slot, v.id);
+    std::sort(slots.begin(), slots.end());
+    std::vector<VehicleId> out;
+    out.reserve(slots.size());
+    for (const auto& [slot, id] : slots) out.push_back(id);
+    return out;
+}
+
+// ---- Fleets ----------------------------------------------------------------------------------------
+
+namespace {
+
+bool earlierInObjectOrder(const Vehicle& a, const Vehicle& b) { return std::pair(a.slot, a.id) < std::pair(b.slot, b.id); }
+
+const std::vector<Order>& noOrders() {
+    static const std::vector<Order> none;
+    return none;
+}
+
+} // namespace
+
+const Vehicle* fleetLeader(const GameState& s, const Fleet& f) {
+    if (const Vehicle* v = s.vehicle(f.leader); v && v->count > 0 && v->fleet == f.id) return v;
+    const Vehicle* first = nullptr;
+    for (VehicleId id : f.members)
+        if (const Vehicle* v = s.vehicle(id); v && v->count > 0 && v->fleet == f.id && (!first || earlierInObjectOrder(*v, *first))) first = v;
+    return first;
+}
+
+std::vector<VehicleId> fleetMembersAt(const GameState& s, const Fleet& f) {
+    std::vector<VehicleId> out;
+    for (VehicleId id : f.members)
+        if (const Vehicle* v = s.vehicle(id); v && v->count > 0 && v->fleet == f.id && v->location == f.location) out.push_back(id);
+    return out;
+}
+
+std::vector<VehicleId> fleetGroup(const GameState& s, const Fleet& f) { return fleetMembersAt(s, f); }
+
+bool inFleetGroup(const GameState& s, const Vehicle& v) {
+    if (!v.fleet.valid() || v.count <= 0) return false;
+    const Fleet* f = s.fleet(v.fleet);
+    return f && v.location == f->location && std::find(f->members.begin(), f->members.end(), v.id) != f->members.end();
+}
+
+std::vector<VehicleId> taggedVehicles(const GameState& s, EmpireId empire, std::span<const VehicleId> tagged) {
+    std::vector<VehicleId> out;
+    auto add = [&](VehicleId id) {
+        if (std::find(out.begin(), out.end(), id) == out.end()) out.push_back(id);
+    };
+    for (VehicleId id : tagged) {
+        const Vehicle* v = s.vehicle(id);
+        if (!v || v->count <= 0 || v->owner != empire) continue;
+        if (const Fleet* f = v->fleet.valid() ? s.fleet(v->fleet) : nullptr) {
+            for (VehicleId member : fleetGroup(s, *f)) add(member);
+        } else {
+            add(id);
+        }
+    }
+    return out;
+}
+
+const Vehicle* fleetOrderHolder(const GameState& s, const Fleet& f) {
+    const Vehicle* holder = nullptr;
+    for (VehicleId id : fleetGroup(s, f))
+        if (const Vehicle* v = s.vehicle(id); !v->orders.empty() && (!holder || earlierInObjectOrder(*v, *holder))) holder = v;
+    return holder;
+}
+
+const std::vector<Order>& fleetOrders(const GameState& s, const Fleet& f) {
+    const Vehicle* holder = fleetOrderHolder(s, f);
+    return holder ? holder->orders : noOrders();
+}
+
+bool fleetRepeats(const GameState& s, const Fleet& f) {
+    if (const Vehicle* holder = fleetOrderHolder(s, f)) return holder->repeatOrders;
+    // Nobody has orders: the first member's switch (Repeat is set on every list alike).
+    const std::vector<VehicleId> group = fleetGroup(s, f);
+    const Vehicle* first = nullptr;
+    for (VehicleId id : group)
+        if (const Vehicle* v = s.vehicle(id); !first || earlierInObjectOrder(*v, *first)) first = v;
+    return first && first->repeatOrders;
+}
+
+size_t orderListShift(const std::vector<Order>& orders, bool repeat, uint16_t shift) {
+    return !repeat || orders.empty() ? 0 : shift % orders.size();
+}
+
+void completeHeadOrder(std::vector<Order>& orders, bool repeat, uint16_t& shift) {
+    if (orders.empty()) return;
+    const size_t turned = orderListShift(orders, repeat, shift);
+    const Order done = orders.front();
+    orders.erase(orders.begin());
+    if (repeat) orders.push_back(done);
+    shift = static_cast<uint16_t>(repeat && !orders.empty() ? (turned + 1) % orders.size() : 0);
+}
+
+void removeHeadOrder(std::vector<Order>& orders, bool repeat, uint16_t& shift) {
+    if (orders.empty()) return;
+    // The original takes out its current order and its index stays, now on
+    // the next one (on the first after the last).
+    const size_t turned = orderListShift(orders, repeat, shift);
+    orders.erase(orders.begin());
+    shift = static_cast<uint16_t>(repeat && !orders.empty() ? turned % orders.size() : 0);
+}
+
+std::vector<Order> originalOrderList(const std::vector<Order>& orders, bool repeat, uint16_t shift) {
+    std::vector<Order> out = orders;
+    const size_t turned = orderListShift(orders, repeat, shift);
+    std::rotate(out.begin(), out.end() - static_cast<std::ptrdiff_t>(turned), out.end());
+    return out;
+}
+
+void changeOrderList(std::vector<Order>& orders, bool& repeat, uint16_t& shift, std::vector<Order> full, std::optional<size_t> added,
+                     bool newRepeat) {
+    if (!added || *added != orders.size() || full.size() < orders.size()) {
+        orders = std::move(full);
+        repeat = newRepeat;
+        shift = 0;
+        return;
+    }
+    const auto tail = full.begin() + static_cast<std::ptrdiff_t>(*added);
+    if (newRepeat != repeat) {
+        // Repeat switched: the list restarts at its first order (spec 03 §8).
+        orders = originalOrderList(orders, repeat, shift);
+        orders.insert(orders.end(), tail, full.end());
+        repeat = newRepeat;
+        shift = 0;
+        return;
+    }
+    const size_t turned = orderListShift(orders, repeat, shift);
+    orders.insert(orders.end() - static_cast<std::ptrdiff_t>(turned), tail, full.end());
+    shift = static_cast<uint16_t>(turned);
+}
+
+void fleetMemberMoved(GameState& s, const Vehicle& v) {
+    if (!v.fleet.valid()) return;
+    if (Fleet* f = s.fleet(v.fleet)) f->location = v.location;
+}
+
+void leaveFleet(GameState& s, Vehicle& v) {
+    v.fleet = {};
+    v.orders.clear();
+    v.repeatOrders = false;
+    // tidyFleets takes it off the member list, clears a choice of it as the
+    // leader (the first member leads again, spec 03 §9) and disbands the
+    // fleet when no member is left at its location.
+    s.tidyFleets();
+}
+
+void joinFleet(Fleet& f, Vehicle& v) {
+    f.members.push_back(v.id);
+    v.fleet = f.id;
+    v.orders.clear();
+    v.repeatOrders = false;
+}
+
+void disbandFleet(GameState& s, FleetId id) {
+    Fleet* f = s.fleet(id);
+    if (!f) return;
+    for (VehicleId m : f->members)
+        if (Vehicle* v = s.vehicle(m); v && v->fleet == id) {
+            v->fleet = {};
+            v->orders.clear();
+            v->repeatOrders = false;
+        }
+    std::erase_if(s.fleets, [&](const Fleet& x) { return x.id == id; });
+}
+
+std::vector<const Vehicle*> GameState::vehiclesAt(Location where) const {
+    std::vector<const Vehicle*> out;
+    for (const Vehicle& v : vehicles)
+        if (v.location == where) out.push_back(&v);
+    return out;
+}
+
+} // namespace opense4::game
