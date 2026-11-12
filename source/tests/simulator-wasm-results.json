@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "evidence": [
+    "Native simulator accepts two assembled armed forces and fleet formations",
+    "Native playback reaches the recorded final event",
+    "Planet simulation records population and colony outcome",
+    "Invalid design is rejected",
+    "Successful and rejected simulations leave campaign checksum unchanged"
+  ]
+}

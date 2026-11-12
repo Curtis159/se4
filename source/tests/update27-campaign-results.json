@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "evidence": [
+    "Private campaign loaded without modifying original download",
+    "Exhausted scout has queued movement for next turn",
+    "Turn-based Attack includes destination; Engage enters enemy sector and records battle",
+    "Visible contact artwork and presence colors available without revealing components",
+    "Native diplomacy exposes over 20 applicable message types and trade package choices",
+    "Construction chooser precedes queued items",
+    "Native combat replay cursor and colony-population summary verified",
+    "Simulator and rejected simulations preserve campaign checksum",
+    "Native campaign fleet formation and strategy changes verified",
+    "Separate Colonies and Ships tabs verified",
+    "Superseded and answered messages removed; stale reply actions hidden"
+  ]
+}

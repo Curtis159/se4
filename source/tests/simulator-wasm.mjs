@@ -1,0 +1,15 @@
+import create from '../web/engine-hegemon/opense4.mjs';
+import {fileURLToPath} from 'node:url';import assert from 'node:assert/strict';import {writeFile} from 'node:fs/promises';
+const engine=await create({locateFile:n=>fileURLToPath(new URL('../web/engine-hegemon/'+n,import.meta.url)),printErr:()=>{}});
+async function call(method,args={}){const result=JSON.parse(await engine.ccall('se4_call','string',['string','string'],[method,JSON.stringify(args)],{async:true}));if(result.error)throw Error(result.error);return result;}
+let s=await call('initialize',{race:'Terran',seed:12345,aiMode:'classic',opponents:1,systemCount:12});
+const hull=s.catalog.hulls.find(h=>h.name==='Escort');assert.ok(hull);
+for(const [name,weapon]of [['Simulator missile escort','Capital Ship Missile I'],['Simulator gun escort','Depleted Uranium Cannon I']]){
+ const entries=[];for(const [part,count]of [['Bridge',1],['Life Support',1],['Crew Quarters',1],['Ion Engine I',6],[weapon,1]]){const c=s.catalog.components.find(c=>c.name===part);assert.ok(c,part);for(let i=0;i<count;i++)entries.push({component:c.id,mount:-1});}
+ const result=await call('command',{type:'engine',command:{kind:'create_design',design:{name,hull:hull.id,entries,design_type:'Attack Ship'}}});assert.ok(result.accepted,result.error);
+}
+s=await call('snapshot');const before=s.checksum,options=await call('simulatorOptions');assert.equal(options.designs.length,2);assert.ok(options.formations.length>1);const items=options.designs.map((d,side)=>({kind:'design',id:d.id,side,count:1,fleet:side,cargo:[]}));
+const result=await call('simulateCombat',{seed:42,items,fleets:[{side:0,name:'A',formation:1,strategy:0},{side:1,name:'B',formation:2,strategy:0}]});assert.equal(result.battle,-1);let frame=await call('combatFrame',{battle:-1,cursor:0});assert.ok(frame.eventCount>0);const finish=await call('combatFrame',{battle:-1,cursor:frame.eventCount});assert.equal(finish.cursor,frame.eventCount);assert.ok(finish.round>0);assert.equal((await call('snapshot')).checksum,before);
+const colony=s.colonies[0];await call('simulateCombat',{seed:42,items:[{kind:'design',id:options.designs[0].id,side:0,count:1,fleet:-1},{kind:'planet',id:colony.planet,side:1,count:1,fleet:-1}],fleets:[]});frame=await call('combatFrame',{battle:-1,cursor:0});assert.ok(frame.summary.some(l=>l.includes('Population lost:')));assert.equal((await call('snapshot')).checksum,before);
+await assert.rejects(()=>call('simulateCombat',{items:[{kind:'design',id:999999,side:0,count:1},{kind:'design',id:options.designs[0].id,side:1,count:1}],fleets:[]}),/design/i);assert.equal((await call('snapshot')).checksum,before);
+await writeFile('tests/simulator-wasm-results.json',JSON.stringify({passed:true,evidence:['Native simulator accepts two assembled armed forces and fleet formations','Native playback reaches the recorded final event','Planet simulation records population and colony outcome','Invalid design is rejected','Successful and rejected simulations leave campaign checksum unchanged']},null,2));console.log('PASS actual WASM combat simulator, replay, colony losses, fleet setup and campaign isolation.');

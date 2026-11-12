@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "evidence": [
+    "Latest researched is checked by default; Engines offers II while legacy I remains fitted",
+    "Unchecking shows both engine versions and remembers the preference",
+    "Update checkpoint saves and restores the actual WASM campaign checksum, then removes its temporary backup",
+    "Storage failure refuses checkpoint creation rather than proceeding with restart"
+  ]
+}
