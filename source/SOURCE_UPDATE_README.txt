@@ -1,1 +1,1 @@
-Cumulative GPL source overlay, release 27. Read RELEASE_27.md and SETUP_27.md. Original game data and C++/Emscripten toolchains are needed to rebuild. The GitHub bundle site/ is already built. Private campaigns and credentials are excluded. AI audit harness is opt-in.
+Cumulative GPL source overlay, release 28. Read RELEASE_28.md and SETUP_28.md. Original game data and C++/Emscripten toolchains are needed to rebuild. The GitHub bundle site/ is already built. Private campaigns and credentials are excluded. AI audit harness is opt-in.

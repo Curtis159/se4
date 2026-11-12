@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "providedSave": true,
+  "evidence": [
+    "Supplied save loads in the real WASM worker; simulator tab and force selectors render",
+    "Loaded code shows Build 28 in the menu",
+    "Manual update check displays persistent up-to-date, failure, downloading and update-ready results",
+    "Only a ready update offers Save & update",
+    "UI checks leave campaign checksum unchanged"
+  ]
+}

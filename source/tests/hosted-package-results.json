@@ -2,16 +2,18 @@
   "passed": true,
   "runtime": "local HTTP, actual compressed WASM worker and service-worker handlers; not visual browser/device QA",
   "size": {
-    "totalBytes": 26427533,
+    "totalBytes": 26431980,
     "largestBytes": 2948803,
-    "files": 2064,
-    "indexBytes": 3702,
+    "files": 2066,
+    "indexBytes": 3854,
     "engineCompression": "gzip chunks, browser DecompressionStream, SHA-256 verification"
   },
   "evidence": [
     "engine gzip chunks download, decompress and verify SHA-256",
     "same native campaign checksum as baseline engine",
     "Hegemon conversion back to AI, genuine decisions without fallback",
-    "all offline assets cached; offline navigation and code retrieved"
+    "all offline assets cached; offline navigation and versioned code retrieved",
+    "Legacy unversioned JavaScript cache cannot mask the new simulator entry point",
+    "Every imported application module carries the same build identity"
   ]
 }

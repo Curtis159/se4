@@ -25,7 +25,7 @@ transport=(web/'src/wasm-transport.js').read_text(encoding='utf-8').replace('exp
 transport=transport.replace("new URL('./wasm-worker.js',import.meta.url)","URL.createObjectURL(new Blob([workerSource],{type:'text/javascript'}))")
 transport=transport.replace(",{type:'module'}","")
 transport=transport.replace('this.nextId=0;',"this.worker.postMessage({boot:true,wasm:wasmBase64,assets:assetsBase64});this.nextId=0;")
-js='\n'.join((web/'src'/f).read_text(encoding='utf-8') for f in ['design-parts.js','app-updates.js','research-model.js','route-selection.js','design-types.js','construction-filters.js','bridge.js','presets.js','turn-guide.js','sector-markers.js','online-games.js','local-saves.js'])
+js='\n'.join((web/'src'/f).read_text(encoding='utf-8') for f in ['build-info.js','design-parts.js','app-updates.js','research-model.js','route-selection.js','design-types.js','construction-filters.js','bridge.js','presets.js','turn-guide.js','sector-markers.js','online-games.js','local-saves.js'])
 js=re.sub(r'\bexport ', '',js)
 app=(web/'src/app.js').read_text(encoding='utf-8');app=re.sub(r'^import .*?;\n','',app,flags=re.M)
 for name,var in [('races','racesData'),('empire-presets','presetsData'),('classic-art','classicArtData'),('../online-config','onlineConfigData')]:
@@ -38,7 +38,7 @@ classic_art=json.loads((web/'assets/classic-art.json').read_text(encoding='utf-8
 for key,path in classic_art.items():classic_art[key]='data:image/'+('png' if path.endswith('.png') else 'webp')+';base64,'+b64(web/path)
 preamble='const onlineConfigData='+(web/'online-config.json').read_text(encoding='utf-8')+';\n'+'const classicArtData='+json.dumps(classic_art)+';\nconst workerSource='+json.dumps(worker)+';\nconst wasmBase64='+json.dumps(b64(engine_dir/'opense4.wasm'))+';\nconst assetsBase64='+json.dumps(b64(engine_dir/'opense4.data'))+';\nconst racesData='+json.dumps(races)+';\nconst presetsData='+(web/'assets/empire-presets.json').read_text(encoding='utf-8')+';\n'
 html=(web/'index.html').read_text(encoding='utf-8').replace('<link rel="stylesheet" href="style.css">','<style>'+(web/'style.css').read_text(encoding='utf-8')+'</style>')
-html=html.replace('OpenSE4 Browser</title>','OpenSE4 Browser — '+('Hegemon · Combat and Fleets Update 27' if hegemon else 'Combat and Fleets Update 27')+'</title>')
+html=html.replace('OpenSE4 Browser</title>','OpenSE4 Browser — '+('Hegemon · Combat and Fleets Update 28' if hegemon else 'Combat and Fleets Update 28')+'</title>')
 script=preamble+js+'\n'+transport+'\n'+app
 html=html.replace('<script type="module" src="src/app.js"></script>','<script type="module">'+script.replace('</script','<\\/script')+'</script>')
 out=root/('OpenSE4_Hegemon_WASM.html' if hegemon else 'OpenSE4_Headless_WASM.html');out.write_text(html,encoding='utf-8',newline='\n');print(out)
