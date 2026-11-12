@@ -24,6 +24,9 @@ add_library(engine STATIC ${game_sources} ${rules_sources} ${core_sources}
  upstream/src/client/classic/screens/setup_model.cpp
  upstream/src/client/classic/screens/colony_logic.cpp
  upstream/src/client/classic/sector_view.cpp
+ upstream/src/client/classic/map_style.cpp
+ upstream/src/client/classic/replay.cpp
+ upstream/src/client/classic/screens/empire_logic.cpp
  upstream/src/sdk/codec.cpp upstream/src/sdk/names.cpp)
 target_include_directories(engine PUBLIC upstream/src "${TOMLPLUSPLUS_DIR}/include")
 target_compile_definitions(engine PUBLIC TOML_FLOAT_CHARCONV=0)
@@ -71,4 +74,18 @@ if(NOT EMSCRIPTEN)
  target_link_libraries(browser_team_tests PRIVATE engine)
  add_executable(browser_production_tests tests/production-rules.cpp)
  target_link_libraries(browser_production_tests PRIVATE engine)
+endif()
+
+option(OPENSE4_BUILD_AI_AUDIT "Build offline AI audit harness (not shipped to browsers)" OFF)
+if(OPENSE4_BUILD_AI_AUDIT)
+ add_executable(ai_audit tests/ai-audit.cpp)
+ target_link_libraries(ai_audit PRIVATE engine)
+ if(OPENSE4_ENABLE_HEGEMON)
+  target_compile_definitions(ai_audit PRIVATE OPENSE4_ENABLE_HEGEMON)
+ endif()
+ if(EMSCRIPTEN)
+  set_target_properties(ai_audit PROPERTIES SUFFIX ".mjs" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/audit")
+  target_compile_options(ai_audit PRIVATE -O1 -fexceptions)
+  target_link_options(ai_audit PRIVATE -O2 -g0 -fexceptions --no-entry -sMODULARIZE=1 -sEXPORT_NAME=createAudit -sENVIRONMENT=node -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=67108864 -sSTACK_SIZE=8388608 -sMAXIMUM_MEMORY=2147483648 -sSUPPORT_LONGJMP=emscripten -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=1048576 "-sEXPORTED_FUNCTIONS=['_se4_audit','_malloc','_free']" "-sEXPORTED_RUNTIME_METHODS=['ccall']" "--preload-file" "${SE4_DATA_DIR}@/se4")
+ endif()
 endif()

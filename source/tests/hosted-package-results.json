@@ -2,10 +2,10 @@
   "passed": true,
   "runtime": "local HTTP, actual compressed WASM worker and service-worker handlers; not visual browser/device QA",
   "size": {
-    "totalBytes": 26336074,
-    "largestBytes": 2883845,
-    "files": 2062,
-    "indexBytes": 3453,
+    "totalBytes": 26427533,
+    "largestBytes": 2948803,
+    "files": 2064,
+    "indexBytes": 3702,
     "engineCompression": "gzip chunks, browser DecompressionStream, SHA-256 verification"
   },
   "evidence": [

@@ -1,3 +1,6 @@
+#include "sdk/names.hpp"
+#include "game/simulator.hpp"
+#include "game/sight.hpp"
 #include "game/yard_idle.hpp"
 #include "game/labor_focus.hpp"
 #include "client/classic/screens/colony_logic.hpp"
@@ -42,6 +45,7 @@ namespace {
 std::filesystem::path root = "/se4";
 std::unique_ptr<Rules> rules;
 std::optional<GameState> state;
+std::optional<GameState> simulationState;EmpireId simulationViewer;
 std::string output;
 // The built-in C++ AI is always available. Hegemon requires OpenSE4's
 // MicroPython SDK to be linked and its original mod package loaded.
@@ -65,6 +69,7 @@ int number(const Value& v, const char* key, int fallback) {
  if(!p->isInt() || p->asInt()<0 || p->asInt()>1000000) throw std::runtime_error(std::string(key)+" is out of range");
  return static_cast<int>(p->asInt());
 }
+int signedNumber(const Value& v,const char* key,int fallback){auto p=v.find(key);if(!p)return fallback;if(!p->isInt()||p->asInt()<-1||p->asInt()>1000000)throw std::runtime_error(std::string(key)+" is out of range");return static_cast<int>(p->asInt());}
 void requireGame() { if(!state) throw std::runtime_error("Initialize or load a game first"); }
 void ensureRules(std::string_view desired = "classic",std::string_view packageFolder="hegemon") {
  if (desired != "classic" && desired != "hegemon")
@@ -132,6 +137,7 @@ Value call(std::string_view method,const Value& args) {
   for(const auto& order:ship->orders)if(order.kind==OrderKind::Warp&&order.object.valid()){const auto& wp=known.galaxy.object(order.object);locations.push_back(locationOf(known.galaxy,wp.id));if(wp.destination.valid())locations.push_back(locationOf(known.galaxy,wp.destination));}
   std::set<std::string> seen;auto warn=[&](std::string text){if(seen.insert(text).second)warnings.push(text);};
   for(const auto l:locations){if(l.system.index()>=known.galaxy.systems.size()||l.system.index()>=known.empire(viewer).knowledge.explored.size()||!known.empire(viewer).knowledge.explored[l.system.index()])continue;
+   if(l.system!=ship->location.system&&!state->options.omnipresent){bool presence=false;for(const auto& v:state->vehicles)if(v.owner==viewer&&v.count>0&&v.location.system==l.system)presence=true;for(const auto& c:state->colonies)if(c&&c->owner==viewer&&state->galaxy.object(c->planet).system==l.system)presence=true;if(!presence)continue;}
    const auto& sys=known.galaxy.system(l.system);if(l.system!=ship->location.system)for(auto id:sys.objects){const auto* colony=known.colony(id);if(colony&&colony->owner!=viewer&&!sameTeam(known,viewer,colony->owner))warn(sys.name+": entering "+known.empire(colony->owner).name+" space");}if(sumValue1(parseAbilities(sys.abilities),AbilityKind::SectorDamage)>0||sumValue1(parseAbilities(sys.abilities),AbilityKind::SystemDamage)>0)warn(sys.name+": damaging system");
    for(auto id:sys.objects){const auto& o=known.galaxy.object(id);if(o.sector!=l.sector)continue;const auto abilities=parseAbilities(o.abilities);if(sumValue1(abilities,AbilityKind::SectorDamage)>0)warn(o.name+": storm or sector damage");if(sumValue1(abilities,AbilityKind::WarpPointTurbulence)>0)warn(o.name+": warp turbulence");const auto* c=known.colony(o.id);if(c&&c->owner!=viewer&&!sameTeam(known,viewer,c->owner))warn(known.empire(c->owner).name+": foreign colony");}
    for(const auto& other:known.vehicles)if(other.owner!=viewer&&!sameTeam(known,viewer,other.owner)&&other.location==l)warn(known.empire(other.owner).name+": foreign ships");
@@ -253,6 +259,27 @@ Value call(std::string_view method,const Value& args) {
   state=std::move(*created);lessonProgress.reset();auto initial=snapshot();guard.committed=true;return initial;
  }
  if(method=="snapshot") return snapshot();
+ if(method=="combatFrame"){requireGame();const int id=signedNumber(args,"battle",-1);if(id==-1){if(!simulationState)throw std::runtime_error("Run a simulation first");return browserCombatFrame(*rules,*simulationState,simulationViewer,static_cast<int>(simulationState->combats.size()-1),number(args,"cursor",0));}return browserCombatFrame(*rules,*state,viewer,id,number(args,"cursor",0));}
+ if(method=="simulatorOptions"){
+  requireGame();auto designs=Value::emptyList(),cargo=Value::emptyList(),planets=Value::emptyList(),formations=Value::emptyList(),strategies=Value::emptyList();
+  auto describe=[&](DesignId id){const auto& d=state->design(id);const auto& h=rules->hull(d.hull);const auto& e=state->empire(d.owner);return Value(ValueMap{{"id",id.value},{"name",e.name+" · "+d.name},{"type",sdk::enumName(h.type)},{"art",std::format("races/{}/{}_portrait_{}.webp",e.race.style,e.race.style,h.primaryBitmap)}});};
+  for(auto id:combat::simulatorDesigns(*rules,*state,viewer,false))designs.push(describe(id));
+  for(const auto& d:state->designs)if((d.owner==viewer||knowsDesign(state->empire(viewer).knowledge,d.id))&&isUnitType(rules->hull(d.hull).type)&&rules->hull(d.hull).type!=ruleset::VehicleType::Mine)cargo.push(describe(d.id));
+  for(const auto& o:state->galaxy.objects)if(o.kind==ObjectKind::Planet&&state->empire(viewer).hasExplored(o.system)&&sight::canSeePlanet(*rules,*state,viewer,o.id))planets.push(Value(ValueMap{{"id",o.id.value},{"name",o.name},{"foreign",state->colony(o.id)&&state->colony(o.id)->owner!=viewer}}));
+  for(size_t i=0;i<rules->data().formations.size();++i)formations.push(Value(ValueMap{{"id",static_cast<int>(i)},{"name",rules->data().formations[i].name}}));for(size_t i=0;i<state->empire(viewer).strategies.size();++i)strategies.push(Value(ValueMap{{"id",static_cast<int>(i)},{"name",state->empire(viewer).strategies[i].name}}));
+  return Value(ValueMap{{"designs",designs},{"cargo",cargo},{"planets",planets},{"formations",formations},{"strategies",strategies}});
+ }
+ if(method=="simulateCombat"){
+  requireGame();auto source=*state;combat::SimulatorSetup setup;setup.viewer=viewer;setup.seed=static_cast<uint64_t>(number(args,"seed",12345));setup.sides={{"Side A",true},{"Side B",true}};
+  if(auto* list=args.find("fleets"))for(const auto& value:list->asList()){combat::SimulatorFleet f;f.side=number(value,"side",0);f.name=text(value,"name","Fleet");f.formation=static_cast<uint32_t>(number(value,"formation",0));f.strategy=static_cast<uint32_t>(number(value,"strategy",0));if(f.formation>=rules->data().formations.size())throw std::runtime_error("Unknown formation");setup.fleets.push_back(f);}
+  if(auto* list=args.find("items"))for(const auto& value:list->asList()){combat::SimulatorItem item;item.side=number(value,"side",0);item.count=number(value,"count",1);item.fleet=signedNumber(value,"fleet",-1);
+   if(text(value,"kind")=="planet"){item.kind=combat::SimulatorItem::Kind::Planet;item.planet=ObjectId{static_cast<uint32_t>(number(value,"id",-1))};if(item.planet.index()>=state->galaxy.objects.size()||!state->empire(viewer).hasExplored(state->galaxy.object(item.planet).system)||!sight::canSeePlanet(*rules,*state,viewer,item.planet))throw std::runtime_error("Planet is not visible");auto& home=source.galaxy.system(source.empire(viewer).homeSystem).objects;if(std::find(home.begin(),home.end(),item.planet)==home.end())home.push_back(item.planet);
+    if(auto* c=source.colony(item.planet);c&&c->owner!=viewer){c->facilities.clear();std::erase_if(c->cargo.units,[&](const auto& u){return !knowsDesign(source.empire(viewer).knowledge,u.design);});}
+   }else item.design=DesignId{static_cast<uint32_t>(number(value,"id",-1))};
+   if(auto* cargo=value.find("cargo"))for(const auto& u:cargo->asList())item.cargo.push_back({DesignId{static_cast<uint32_t>(number(u,"design",-1))},number(u,"count",1)});setup.items.push_back(item);
+  }
+  if(const auto problem=combat::simulatorProblem(*rules,source,setup);!problem.empty())throw std::runtime_error(problem);auto sim=combat::buildSimulation(*rules,source,setup);auto battle=combat::startSimulation(*rules,std::move(sim));battle.finish();simulationState=battle.state();if(simulationState->combats.empty())throw std::runtime_error("No battle recorded");simulationViewer=simulationState->combats.back().participants.front();return Value(ValueMap{{"battle",-1}});
+ }
  if(method=="command") {
   requireGame();
   Command command;

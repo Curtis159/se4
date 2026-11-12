@@ -5,6 +5,7 @@
 #include "game/serialize.hpp"
 #include "game/yard_idle.hpp"
 #include "game/commands.hpp"
+#include "game/combat.hpp"
 #include "client/classic/screens/setup_model.hpp"
 #include "ruleset/ruleset.hpp"
 #include <cassert>
@@ -27,6 +28,7 @@ int main(int argc,char** argv){assert(argc==2);auto data=ruleset::loadRuleset(st
   s.empire(me).techLevels[i]=0;const auto before=stateChecksum(s);auto researchView=browserSnapshot(r,s,me);assert(stateChecksum(s)==before);const auto* construction=entry(field(field(researchView,"research"),"areas"),i);assert(construction);const auto& unlocks=field(*construction,"researchUnlocks");assert(unlocks.size()>0);auto projected=s.empire(me);projected.techLevels[i]=1;for(const auto& next:unlocks.asList()){ruleset::TechAreaId id{static_cast<uint32_t>(field(next,"id").asInt())};assert(!research::isResearchable(r,s,s.empire(me),id));assert(research::isResearchable(r,s,projected,id));}
  }
  LogEntry event;event.title="A ship completed";event.location=Location{world.system,world.sector};event.target=LogGoto::Location;s.empire(me).log={event};auto logView=browserSnapshot(r,s,me);assert(field(field(logView,"log").asList()[0],"destination").find("location"));s.empire(me).log[0].target=LogGoto::Research;logView=browserSnapshot(r,s,me);assert(field(field(field(logView,"log").asList()[0],"destination"),"page").asString()=="research");s.empire(me).log[0].target=LogGoto::None;logView=browserSnapshot(r,s,me);assert(field(field(logView,"log").asList()[0],"destination").isNull());
- std::cout<<"PASS native survey and asteroid values, race-specific capacities, ruins, finite resources, exact-design intelligence privacy and save persistence.\n";
+CombatRecord battle;battle.turn=s.turn;battle.location=locationOf(s.galaxy,planet);battle.participants={me,enemy};CombatPiece piece;piece.owner=me;piece.name="Replay ship";piece.startX=2;piece.startY=3;battle.pieces.push_back(piece);CombatEvent replayEvent;replayEvent.kind=CombatEvent::Kind::Move;replayEvent.round=1;replayEvent.piece=0;replayEvent.x=4;replayEvent.y=5;battle.events.push_back(replayEvent);s.combats.push_back(battle);int battleId=static_cast<int>(s.combats.size()-1);auto frame=browserCombatFrame(r,s,me,battleId,1);assert(field(frame,"pieces").asList()[0].find("x")->asInt()==4);assert(field(browserCombatFrame(r,s,enemy,battleId,0),"cursor").asInt()==0);bool denied=false;try{browserCombatFrame(r,s,EmpireId{2},battleId,0);}catch(const std::runtime_error&){denied=true;}assert(denied);
+  std::cout<<"PASS native survey and asteroid values, race-specific capacities, ruins, finite resources, exact-design intelligence privacy and save persistence.\n";
 }
 

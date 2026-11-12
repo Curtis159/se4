@@ -1,1 +1,1 @@
-Cumulative source overlay, release 26. Original game data and a C++/Emscripten toolchain are required to rebuild. Read RELEASE_26.md and SETUP_26.md. The GitHub bundle also contains a ready-built site/ folder, so Netlify/GitHub Pages need no C++ build. Private campaigns and server secrets are excluded.
+Cumulative GPL source overlay, release 27. Read RELEASE_27.md and SETUP_27.md. Original game data and C++/Emscripten toolchains are needed to rebuild. The GitHub bundle site/ is already built. Private campaigns and credentials are excluded. AI audit harness is opt-in.

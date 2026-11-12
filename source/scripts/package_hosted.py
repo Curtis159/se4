@@ -26,7 +26,7 @@ for race in races:race['image']=asset(race['image'])
 write('assets/races.json',json.dumps(races));write('assets/empire-presets.json',(web/'assets/empire-presets.json').read_text(encoding='utf-8'))
 write('_headers','/engine-hegemon/*.bin\n  Cache-Control: public, max-age=0, must-revalidate\n/assets/art/*\n  Cache-Control: public, max-age=31536000, immutable\n/sw.js\n  Cache-Control: no-cache\n')
 signature=hashlib.sha256(b''.join(hashlib.sha256(f.read_bytes()).digest() for f in sorted(dest.rglob('*')) if f.is_file() and f.name not in ['sw.js','cache-manifest.json','HOSTING_SIZE.json'])).hexdigest()[:16]
-write('sw.js',(web/'sw-hosted.js').read_text(encoding='utf-8').replace("opense4-hosted-26'",f"opense4-hosted-26-{signature}'"))
+write('sw.js',(web/'sw-hosted.js').read_text(encoding='utf-8').replace("opense4-hosted-27'",f"opense4-hosted-27-{signature}'"))
 paths=['./'+f.relative_to(dest).as_posix() for f in dest.rglob('*') if f.is_file() and f.name not in ['cache-manifest.json','_headers','HOSTING_SIZE.json']]
 write('cache-manifest.json',json.dumps(paths))
 files=[f for f in dest.rglob('*') if f.is_file()];sizes={'totalBytes':sum(f.stat().st_size for f in files),'largestBytes':max(f.stat().st_size for f in files),'files':len(files),'indexBytes':(dest/'index.html').stat().st_size,'engineCompression':'gzip chunks, browser DecompressionStream, SHA-256 verification'};assert sizes['largestBytes']<=8*1024*1024

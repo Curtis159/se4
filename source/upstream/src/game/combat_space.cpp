@@ -3914,6 +3914,13 @@ void Battle::finish() {
         rec_.summary.push_back(std::format("{}: {}", s_.empire(e).name, word));
     }
     for (const std::string& line : groundReports_) rec_.summary.push_back(line);
+    // Persist colony casualties in the replay summary for every participant.
+    for (const Piece& p : pieces_) if (p.kind == Kind::Planet || p.colonyLost) {
+        int64_t remaining = 0; for (const auto& group : p.population) remaining += group.millions;
+        rec_.summary.push_back(std::format("{}: {}. Population lost: {}M; remaining: {}M.", p.name,
+            p.colonyLost ? "colony destroyed" : p.capturedBy.valid() ? "colony captured" : "colony survived", p.popKilled, p.colonyLost ? 0 : remaining));
+    }
+
 
     // Fleet experience earned during the battle.
     for (const auto& [f, exp] : fleetExp_)
