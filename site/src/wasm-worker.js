@@ -1,4 +1,4 @@
-import createOpenSE4 from '../engine/opense4.mjs?build=30-65728b035c3a63de';
+import createOpenSE4 from '../engine/opense4.mjs?build=31-0bcb8b374596ffdb';
 let engine;
 const ready=createOpenSE4({locateFile:name=>new URL('../engine/'+name,import.meta.url).href,printErr:message=>console.warn(message)}).then(m=>engine=m);
 self.onmessage=async ({data:{id,method,args}})=>{

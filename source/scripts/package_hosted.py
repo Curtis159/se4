@@ -3,7 +3,7 @@ from pathlib import Path
 import gzip,hashlib,json,shutil,sys,re
 root=Path(__file__).resolve().parents[1];web=root/'web';dest=Path(sys.argv[1]).resolve();dest.mkdir(parents=True,exist_ok=True)
 inputs=[web/'index.html',web/'style.css',web/'sw-hosted.js',Path(__file__),*sorted((web/'src').glob('*.js')),*sorted((web/'engine-hegemon').glob('opense4.*')),*sorted((web/'assets').rglob('*'))]
-build='30-'+hashlib.sha256(b''.join(hashlib.sha256(f.read_bytes()).digest()for f in inputs if f.is_file())).hexdigest()[:16]
+build='31-'+hashlib.sha256(b''.join(hashlib.sha256(f.read_bytes()).digest()for f in inputs if f.is_file())).hexdigest()[:16]
 def versioned(path):return path+'?build='+build
 # All executable dependencies share a build identity, including through an old cache.
 def version_urls(text):
@@ -35,8 +35,8 @@ races=json.loads((web/'assets/races.json').read_text(encoding='utf-8'))
 for race in races:race['image']=asset(race['image'])
 write('assets/races.json',json.dumps(races));write('assets/empire-presets.json',(web/'assets/empire-presets.json').read_text(encoding='utf-8'))
 write('_headers','/engine-hegemon/*.bin\n  Cache-Control: public, max-age=0, must-revalidate\n/assets/art/*\n  Cache-Control: public, max-age=31536000, immutable\n/sw.js\n  Cache-Control: no-cache\n')
-write('build.json',json.dumps({'version':30,'id':build}))
-write('sw.js',(web/'sw-hosted.js').read_text(encoding='utf-8').replace("opense4-hosted-30'",f"opense4-hosted-{build}'"))
+write('build.json',json.dumps({'version':31,'id':build}))
+write('sw.js',(web/'sw-hosted.js').read_text(encoding='utf-8').replace("opense4-hosted-31'",f"opense4-hosted-{build}'"))
 paths=[]
 for f in dest.rglob('*'):
  if f.is_file() and f.name not in ['cache-manifest.json','_headers','HOSTING_SIZE.json','sw.js']:

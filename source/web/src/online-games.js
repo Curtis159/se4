@@ -1,7 +1,7 @@
 // Supabase REST boundary. Requires an authenticated user's access token.
 // Nothing in this adapter simulates game rules or contains a service-role key.
 export class OnlineGames {
- constructor({url,publishableKey,accessToken,fetcher=fetch}){const origin=new URL(url);if(origin.protocol!=='https:'&&origin.hostname!=='localhost'&&origin.hostname!=='127.0.0.1')throw Error('Supabase needs HTTPS');this.url=origin.origin;this.key=publishableKey;this.token=accessToken;this.fetcher=fetcher;}
+ constructor({url,publishableKey,accessToken,fetcher=(...args)=>globalThis.fetch(...args)}){const origin=new URL(url);if(origin.protocol!=='https:'&&origin.hostname!=='localhost'&&origin.hostname!=='127.0.0.1')throw Error('Supabase needs HTTPS');this.url=origin.origin;this.key=publishableKey;this.token=accessToken;this.fetcher=fetcher;}
  async request(path,body,method='POST'){const response=await this.fetcher(this.url+path,{method,headers:{apikey:this.key,Authorization:'Bearer '+this.token,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates'},...(body===undefined?{}:{body:JSON.stringify(body)})});const text=await response.text();let data;try{data=text?JSON.parse(text):null;}catch{throw Error('Invalid online service response');}if(!response.ok)throw Error(data?.message||'Online request failed ('+response.status+')');return data;}
  rpc(name,args){return this.request('/rest/v1/rpc/'+name,args);}
  create(name,mode,setup){return this.rpc('se4_create_game',{title:name,play_mode:mode,configuration:setup});}
