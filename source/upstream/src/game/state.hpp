@@ -988,7 +988,7 @@ struct CombatEvent {
     // (spec 06 §1.10.2). Recovered: carrier `target` took `amount` units of
     // the launched group `piece` back aboard; with none left the group leaves
     // the map (save format 10).
-    enum class Kind : uint8_t { Move, Fire, Hit, Miss, Destroyed, Captured, Launch, Seeker, UnitsLost, Boarding, Recovered };
+    enum class Kind : uint8_t { Move, Fire, Hit, Miss, Destroyed, Captured, Launch, Seeker, UnitsLost, Boarding, Recovered, RoundEnd };
     Kind kind = Kind::Move;
     uint8_t round = 0;
     uint32_t piece = 0;       // index into CombatRecord::pieces

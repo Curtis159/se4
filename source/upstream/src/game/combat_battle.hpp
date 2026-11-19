@@ -241,7 +241,7 @@ public:
     EmpireId phaseEmpire() const { return stage_ == Stage::Orders || stage_ == Stage::Paused ? phaseEmpire_ : EmpireId{}; }
     bool autoOn() const { return autoAll_; }
     int round() const { return round_; }
-    int lastRound() const { return std::max(1, cs_.spaceTurns - 1); }
+    int lastRound() const { return std::max(1, cs_.spaceTurns); }
     const std::vector<Piece>& pieces() const { return pieces_; }
     const CombatRecord& record() const { return rec_; }
     const std::vector<EmpireId>& empires() const { return empires_; }

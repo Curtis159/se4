@@ -1,0 +1,2352 @@
+// Combat (docs/spec/04): to-hit, damage at range, shields/armor/damage types,
+// the whole-component damage model, seekers and point defense, units, mines,
+// planets, boarding, conversion, strategies, experience, mood events, the
+// map and start boxes, the replay record, ground combat and determinism. All
+// content is invented for the tests.
+
+#include "combat_fixture.hpp"
+#include "engine_fixture.hpp"
+
+#include "datafile/datafile.hpp"
+
+#include "game/ai.hpp"
+#include "game/combat.hpp"
+#include "game/combat_detail.hpp"
+#include "game/design.hpp"
+#include "game/movement.hpp"
+#include "game/query.hpp"
+#include "game/setup.hpp"
+#include "game/sight.hpp"
+#include "game/tactical.hpp"
+#include "game/turn.hpp"
+#include "game/xmath.hpp"
+
+#include <doctest/doctest.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <format>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+
+using namespace opense4;
+using namespace opense4::game;
+using namespace opense4::test;
+namespace combat = opense4::game::combat;
+
+using namespace opense4::ctest;
+using ruleset::VehicleType;
+using ruleset::WeaponKind;
+
+// ---- Identifiers, strategies, settings --------------------------------------------------------------
+
+TEST_CASE("combat: damage types and weapon targets parse") {
+    for (size_t i = 0; i < static_cast<size_t>(combat::DamageType::Count); ++i) {
+        const auto t = static_cast<combat::DamageType>(i);
+        CHECK(combat::parseDamageType(combat::identifier(t)) == t);
+    }
+    CHECK(combat::parseDamageType("skips  normal shields") == combat::DamageType::SkipsNormalShields);
+    CHECK(combat::parseDamageType("Something From A Mod") == combat::DamageType::Normal);
+    CHECK(combat::isPlanetOnlyDamage(combat::DamageType::PlagueLevel3));
+    CHECK(combat::isSpecialEffect(combat::DamageType::CrewConversion));
+    CHECK_FALSE(combat::isSpecialEffect(combat::DamageType::SkipsArmor));
+    // The types that use and feed the damage pool (spec 04 §9.1).
+    CHECK(combat::isHullDamaging(combat::DamageType::Normal));
+    CHECK(combat::isHullDamaging(combat::DamageType::QuarterDamageToShields));
+    CHECK(combat::isHullDamaging(combat::DamageType::SkipsShieldsAndArmor));
+    CHECK_FALSE(combat::isHullDamaging(combat::DamageType::OnlyEngines));
+    CHECK_FALSE(combat::isHullDamaging(combat::DamageType::ShieldsOnly));
+    CHECK_FALSE(combat::isHullDamaging(combat::DamageType::PushesTarget));
+
+    const std::vector<std::string> classic{"Ships", "Planets", "Ftr", "Sat", "Drone"};
+    CHECK(combat::parseWeaponTargets(classic) ==
+          (combat::kTargetShips | combat::kTargetPlanets | combat::kTargetFighters | combat::kTargetSatellites | combat::kTargetDrones));
+    const std::vector<std::string> overrideList{"Seekers, Fighters"};
+    CHECK(combat::parseWeaponTargets(overrideList) == (combat::kTargetSeekers | combat::kTargetFighters));
+    const std::vector<std::string> all{"All"};
+    CHECK(combat::parseWeaponTargets(all) == 63);
+    const std::vector<std::string> prose{"Only ships and planets"};
+    CHECK(combat::parseWeaponTargets(prose) == (combat::kTargetShips | combat::kTargetPlanets));
+    CHECK(combat::targetMaskOf(VehicleType::Base) == combat::kTargetShips);
+    CHECK(combat::targetMaskOf(VehicleType::Mine) == 0);
+}
+
+TEST_CASE("combat: strategy records become typed settings") {
+    ruleset::CombatStrategy raw{"Skirmisher",
+                                {{"Primary Movement Strategy", "Maximum Weapons Range"},
+                                 {"Secondary Movement Strategy", "Don't Get Hurt"},
+                                 {"Targeting Priority 1", "Weakest"},
+                                 {"Targeting Priority 2", "Does Not Have Weapons"},
+                                 {"Use Type Priority First", "True"},
+                                 {"Type Priority Seekers(On Us)", "2"},
+                                 {"Type Priority Bases(No Weapons)", "9"},
+                                 {"Dont Fire On Planets", "True"},
+                                 {"Break Formation Fighters", "TRUE"},
+                                 {"Fighters Launch Group Amount", "6"},
+                                 {"Drones Per Target", "4"},
+                                 {"Damage Percent Per Ship", "55"},
+                                 {"Damage Until All Weapons Gone", "true"}}};
+    const combat::Strategy st = combat::parseStrategy(raw);
+    CHECK(st.name == "Skirmisher");
+    CHECK(st.primary == combat::MoveStrategy::MaximumRange);
+    CHECK(st.secondary == combat::MoveStrategy::DontGetHurt);
+    CHECK(st.targeting[0] == combat::TargetKey::Weakest);
+    CHECK(st.targeting[1] == combat::TargetKey::NoWeapons);
+    CHECK(st.typePriorityFirst);
+    CHECK(st.typePriority[static_cast<size_t>(combat::TargetCategory::SeekersOnUs)] == 2);
+    CHECK(st.typePriority[static_cast<size_t>(combat::TargetCategory::BasesNoWeapons)] == 9);
+    CHECK(st.dontFireOn[static_cast<size_t>(combat::TargetCategory::Planets)]);
+    CHECK_FALSE(st.dontFireOn[static_cast<size_t>(combat::TargetCategory::Ships)]);
+    CHECK(st.breakFormation[static_cast<size_t>(combat::TargetCategory::Fighters)]);
+    CHECK(st.fighterLaunchGroup == 6);
+    CHECK(st.dronesPerTarget == 4);
+    CHECK(st.damagePercentShip == 55);
+    CHECK(st.damageUntilWeaponsGone);
+    CHECK(combat::Strategy{}.dronesPerTarget == 3);   // the default (spec 04 §10.7)
+
+    CHECK(combat::parseStrategy({"Troops", {{"Primary Movement Strategy", "Drop Troops (if carrying)"}}}).primary ==
+          combat::MoveStrategy::DropTroops);
+    CHECK(combat::parseStrategy({"Boarders", {{"Primary Movement Strategy", "Board Enemy Ships"}}}).primary ==
+          combat::MoveStrategy::BoardEnemyShips);
+    CHECK(combat::parseStrategy({"Kamikaze", {{"Primary Movement Strategy", "Ram"}}}).primary == combat::MoveStrategy::Ram);
+
+    // The fixture's own record, and the defaults for everything it leaves out.
+    const auto& fixture = engineRules().data().combatStrategies;
+    REQUIRE_FALSE(fixture.empty());
+    const combat::Strategy cautious = combat::parseStrategy(fixture.front());
+    CHECK(cautious.primary == combat::MoveStrategy::OptimalRange);
+    CHECK(cautious.fighterLaunchGroup == 5);
+    CHECK(cautious.typePriority[static_cast<size_t>(combat::TargetCategory::Ships)] == 1);
+}
+
+TEST_CASE("combat: the Strategies window's Add makes the original's new strategy (spec 04 §16)") {
+    using C = combat::TargetCategory;
+    const ruleset::CombatStrategy raw = combat::newStrategyRecord("Patrol");
+    CHECK(raw.name == "Patrol");
+    const combat::Strategy st = combat::parseStrategy(raw);
+    CHECK(st.fighterLaunchGroup == 5);
+    CHECK(st.dronesPerTarget == 3);
+    CHECK(st.damagePercentShip == 80);
+    CHECK(st.damagePercentPlanet == 100);
+    CHECK(st.damagePercentFighters == 100);
+    CHECK(st.damagePercentSatellites == 100);
+    CHECK_FALSE(st.damageUntilWeaponsGone);
+    for (C on : {C::Carriers, C::ColonyShips, C::Fighters, C::Satellites, C::Planets, C::Transports})
+        CHECK(st.breakFormation[static_cast<size_t>(on)]);
+    for (C off : {C::Bases, C::Ships, C::Mines, C::BasesNoWeapons, C::ShipsNoWeapons, C::Drones})
+        CHECK_FALSE(st.breakFormation[static_cast<size_t>(off)]);
+    // Its movement, targeting, type ranks and Dont Fire On flags (spec 04 §19.7 Q98, confirmed: binary).
+    CHECK(st.primary == combat::MoveStrategy::OptimalRange);
+    CHECK(st.secondary == combat::MoveStrategy::OptimalRange);
+    CHECK(st.targeting == std::array{combat::TargetKey::MostDamaged, combat::TargetKey::Strongest, combat::TargetKey::Nearest,
+                                     combat::TargetKey::Largest});
+    CHECK_FALSE(st.typePriorityFirst);
+    const std::vector<std::pair<C, int>> ranks{{C::Bases, 2},          {C::Ships, 1},           {C::Carriers, 5},    {C::ColonyShips, 6},
+                                               {C::Fighters, 12},      {C::Satellites, 7},      {C::Mines, 14},      {C::Planets, 3},
+                                               {C::Transports, 9},     {C::BasesNoWeapons, 13}, {C::ShipsNoWeapons, 4}, {C::SeekersOnUs, 10},
+                                               {C::SeekersOnOthers, 11}, {C::Drones, 8}};
+    for (const auto& [c, rank] : ranks) CHECK(st.typePriority[static_cast<size_t>(c)] == rank);
+    for (size_t c = 0; c < combat::kTargetCategories; ++c) {
+        const C cat = static_cast<C>(c);
+        const bool off = cat == C::ColonyShips || cat == C::Planets || cat == C::BasesNoWeapons || cat == C::ShipsNoWeapons || cat == C::SeekersOnOthers;
+        CHECK(st.dontFireOn[c] == off);
+    }
+    // The same values are what every key a record leaves out starts from.
+    const combat::Strategy empty = combat::parseStrategy({"Empty", {}});
+    CHECK(empty.primary == st.primary);
+    CHECK(empty.secondary == st.secondary);
+    CHECK(empty.targeting == st.targeting);
+    CHECK(empty.typePriority == st.typePriority);
+    CHECK(empty.dontFireOn == st.dontFireOn);
+    CHECK(empty.fighterLaunchGroup == 5);
+    CHECK(empty.damagePercentShip == 80);
+    for (C on : {C::Carriers, C::ColonyShips, C::Fighters, C::Satellites, C::Planets, C::Transports, C::SeekersOnUs, C::SeekersOnOthers})
+        CHECK(empty.breakFormation[static_cast<size_t>(on)]);
+}
+
+TEST_CASE("combat: settings come from Settings.txt with stock defaults") {
+    const combat::CombatSettings cs = combat::loadSettings(combatRules());
+    CHECK(cs.spaceTurns == 30);
+    CHECK(cs.baseToHit == 100);
+    CHECK(cs.toHitPerSquare == 10);
+    CHECK(cs.planetDefense == -200);
+    CHECK(cs.damagePerPopulation == 10);
+    // Militia: one per 20M, truncated, no minimum (spec 04 §13).
+    CHECK(combat::militiaCount(cs, int64_t{0}) == 0);
+    CHECK(combat::militiaCount(cs, int64_t{7}) == 0);
+    CHECK(combat::militiaCount(cs, int64_t{45}) == 2);
+    const std::vector<PopulationGroup> groups{{EmpireId{0u}, 39}, {EmpireId{1u}, 39}};
+    CHECK(combat::militiaCount(cs, groups) == 2);   // per group: 1 + 1, not 78 / 20 = 3
+}
+
+// ---- To-hit and damage at range ------------------------------------------------------------------------
+
+TEST_CASE("combat: chance to hit") {
+    const combat::CombatSettings cs = combat::loadSettings(combatRules());
+    // The spec's worked example: 100 - 50 + 25 - 40 = 35 %.
+    CHECK(combat::detail::toHitChance(cs, 5, 25, 40, 0) == 35);
+    CHECK(combat::detail::toHitChance(cs, 1, 200, 0, 0) == 99);
+    CHECK(combat::detail::toHitChance(cs, 15, 0, 0, 0) == 1);
+    CHECK(combat::detail::toHitChance(cs, 2, 0, 0, 30) == 50);
+
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    const VehicleId shooter = spawn(s, frigate(s, ar.a, "Spotter", 1, {"Test Combat Sensor", "Test Laser", "CT Always Hit"}), ar.loc);
+    const VehicleId dodger = spawn(s, frigate(s, ar.b, "Dodger", 1, {"Test ECM"}), ar.loc);
+    const size_t laser = 5;
+    // Sensors +10, ECM +10.
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(dodger), 0, *s.vehicle(shooter), 1) == 0);   // not a weapon
+    s.vehicle(shooter)->damage[6] = 1000;   // the talisman is destroyed: roll normally
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(shooter), laser, *s.vehicle(dodger), 3) == 70);
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(shooter), laser, *s.vehicle(dodger), 9) == 10);
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(shooter), laser, *s.vehicle(dodger), 12) == 1);
+    // Racial aggressiveness and crew experience count as points.
+    s.empire(ar.a).race.characteristics[static_cast<size_t>(Characteristic::Aggressiveness)] = 120;
+    s.vehicle(dodger)->experience = 15;
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(shooter), laser, *s.vehicle(dodger), 5) == 100 - 50 + 10 + 20 - 10 - 15);
+    // A mount's to-hit bonus, then the clamp.
+    Design mounted = s.design(s.vehicle(shooter)->design);
+    mounted.name = "Mounted";
+    mounted.entries[laser].mount = mountIndex(r, "CT Long Mount");
+    s.vehicle(shooter)->design = addDesign(s, mounted);
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(shooter), laser, *s.vehicle(dodger), 1) == 99);
+    // Weapons Always Hit, direct fire and point-defense alike (confirmed: binary).
+    s.vehicle(shooter)->damage[6] = 0;
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(shooter), laser, *s.vehicle(dodger), 9) == 100);
+    const VehicleId picket = spawn(s, frigate(s, ar.a, "Picket", 1, {"CT PD", "CT Always Hit"}), ar.loc);
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(picket), 4, *s.vehicle(dodger), 9) == 100);
+}
+
+TEST_CASE("combat: to-hit parts add up by family, the system bonus is offense only") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    const VehicleId gunner = spawn(s, frigate(s, ar.a, "Gunner", 1, {"Test Laser"}), ar.loc);
+    // Two parts of one family: only the best counts; another family adds (spec 04 §7).
+    const VehicleId one = spawn(s, frigate(s, ar.b, "One", 1, {"CT ECM A", "CT ECM B"}), ar.loc);
+    const VehicleId two = spawn(s, frigate(s, ar.b, "Two", 1, {"CT ECM A", "CT Stealth Armor"}), ar.loc);
+    const size_t laser = 4;
+    CHECK(vehicleToHitDefense(r, s, *s.vehicle(one)) == 20);
+    CHECK(vehicleToHitDefense(r, s, *s.vehicle(two)) == 30);
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(gunner), laser, *s.vehicle(one), 2) == 100 - 20 - 20);
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(gunner), laser, *s.vehicle(two), 2) == 100 - 20 - 30);
+    // The family's best intact part counts: with ECM A destroyed, ECM B remains.
+    s.vehicle(one)->damage[4] = 1000;
+    CHECK(vehicleToHitDefense(r, s, *s.vehicle(one)) == 15);
+    // Mothballed ships have no offense or defense.
+    s.vehicle(two)->status = VehicleStatus::Mothballed;
+    CHECK(combat::detail::vehicleDefense(r, s, *s.vehicle(two), 0, 0) == 0);
+}
+
+TEST_CASE("combat: system modifiers add up over colonies and vehicles") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    const SystemId sys = ar.loc.system;
+    CHECK(combat::detail::systemModifier(r, s, ar.a, sys, AbilityKind::CombatModifierSystem) == 0);
+    // Each colony adds its best facility; each vehicle its best component (confirmed: binary).
+    Colony& home = homeworld(s, ar.a);
+    home.facilities.push_back(facilityIndex(r, "CT Combat Center 10"));
+    home.facilities.push_back(facilityIndex(r, "CT Combat Center 4"));
+    CHECK(combat::detail::systemModifier(r, s, ar.a, sys, AbilityKind::CombatModifierSystem) == 10);
+    spawn(s, frigate(s, ar.a, "Flagship", 1, {"CT Battle Computer", "CT Battle Computer"}), ar.loc);
+    spawn(s, frigate(s, ar.a, "Escort", 1, {"CT Battle Computer"}), ar.loc);
+    CHECK(combat::detail::systemModifier(r, s, ar.a, sys, AbilityKind::CombatModifierSystem) == 10 + 7 + 7);
+    CHECK(combat::detail::systemModifier(r, s, ar.b, sys, AbilityKind::CombatModifierSystem) == 0);
+    // The system bonus helps offense only (spec 04 §7).
+    const VehicleId gunner = spawn(s, frigate(s, ar.a, "Gunner", 1, {"Test Laser"}), ar.loc);
+    const VehicleId target = spawn(s, frigate(s, ar.b, "Target", 1, {}), ar.loc);
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(gunner), 4, *s.vehicle(target), 5) == 50 + 24);
+    CHECK(combat::toHitPercent(r, s, *s.vehicle(target), 4, *s.vehicle(gunner), 5) == 0);   // not a weapon entry
+}
+
+TEST_CASE("combat: damage at range with and without a mount") {
+    const Rules& r = combatRules();
+    const int32_t longMount = mountIndex(r, "CT Long Mount");
+    const DesignEntry plain{componentIndex(r, "CT Gun"), -1};
+    const DesignEntry mounted{componentIndex(r, "CT Gun"), longMount};
+    CHECK(combat::weaponDamage(r, plain, 1) == 10);
+    CHECK(combat::weaponDamage(r, plain, 0) == 0);   // outside 1..20 without a mount
+    CHECK(combat::weaponDamage(r, plain, 6) == 0);
+    CHECK(combat::weaponReach(r, plain) == 5);
+    // Index clamp(r - 2, 1, 20): ranges 1..3 read entry 1; the table ends two squares later; damage x1.5.
+    CHECK(combat::weaponDamage(r, mounted, 1) == 15);
+    CHECK(combat::weaponDamage(r, mounted, 3) == 15);
+    CHECK(combat::weaponDamage(r, mounted, 7) == 15);
+    CHECK(combat::weaponDamage(r, mounted, 8) == 0);
+    CHECK(combat::weaponReach(r, mounted) == 7);
+    // With a mount, ranges past the table read entry 20 (confirmed: binary).
+    const DesignEntry twenty{componentIndex(r, "CT Twenty Gun"), longMount};
+    CHECK(combat::weaponDamage(r, {componentIndex(r, "CT Twenty Gun"), -1}, 21) == 0);
+    CHECK(combat::weaponDamage(r, twenty, 40) == 8);   // round(5 x 1.5) = 8 (7.5 rounds to even)
+    CHECK(combat::weaponReach(r, twenty) == combat::kCombatMapWidth);
+    // The mount's percentage is rounded, ties to even.
+    const DesignEntry odd{componentIndex(r, "CT Odd Gun"), longMount};
+    CHECK(combat::weaponDamage(r, odd, 3) == 22);   // 15 x 1.5 = 22.5
+    CHECK(combat::weaponDamage(r, odd, 4) == 38);   // 25 x 1.5 = 37.5
+    // Structure and supply scale too, rounded.
+    CHECK(combat::detail::combatStructure(r, odd) == 15);   // 10 x 1.5
+    CHECK(combat::detail::supplyPerShot(r, {componentIndex(r, "Test Laser"), -1}) == 5);
+    CHECK(combat::detail::supplyPerShot(r, {componentIndex(r, "Test Laser"), longMount}) == 8);   // 7.5 -> 8
+    // A direct-fire mount does nothing for a seeking weapon.
+    const DesignEntry torpedo{componentIndex(r, "CT Torpedo"), longMount};
+    CHECK_FALSE(combat::detail::mountApplies(r, torpedo));
+    CHECK(combat::weaponDamage(r, torpedo, 1) == 37);
+    CHECK(combat::weaponDamage(r, torpedo, 11) == 0);
+    // Warheads and troop weapons count with their largest entry.
+    CHECK(combat::weaponLargestDamage(r, {componentIndex(r, "Test Warhead"), -1}) == 60);
+}
+
+// ---- The damage pipeline --------------------------------------------------------------------------------
+
+TEST_CASE("combat: one shield pool, whole components, armor first, the damage pool") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    // Entries: 0 bridge, 1 life support, 2 crew, 3 engine, 4 shield(20), 5 phased shield(20), 6-7 armor(40), 8 laser(15), 9 fuel.
+    const DesignId d = frigate(s, ar.a, "Target", 1, {"Test Shield", "CT Phased Shield", "Test Armor Plate", "Test Armor Plate", "Test Laser"});
+    const VehicleId id = spawn(s, d, ar.loc);
+    const Vehicle base = *s.vehicle(id);
+    Rng rng(99);
+    using DT = combat::DamageType;
+    using Kind = combat::detail::ShieldState::Kind;
+
+    struct Result {
+        combat::detail::HitResult out;
+        combat::detail::ShieldState sh;
+        int64_t pool = 0;
+        Vehicle v;
+    };
+    auto hit = [&](int64_t damage, DT type, int64_t pool = 0) {
+        Result res{{}, {}, pool, base};
+        combat::detail::refreshShields(r, s, res.v, 0, 0, res.sh, true);
+        res.out = combat::detail::hitVehicle(r, s, res.v, res.sh, res.pool, damage, type, rng);
+        return res;
+    };
+    auto armorLost = [&](const Vehicle& v) { return int(destroyed(r, s, v, 6)) + int(destroyed(r, s, v, 7)); };
+    auto internalsLost = [&](const Vehicle& v) {
+        int n = 0;
+        for (size_t e : {0, 1, 2, 3, 4, 5, 8, 9}) n += destroyed(r, s, v, e);
+        return n;
+    };
+
+    {
+        const auto res = hit(0, DT::Normal);
+        CHECK(res.sh.max == 40);   // normal and phased generators fill one pool
+        CHECK(res.sh.kind == Kind::Normal);
+    }
+    {
+        const auto res = hit(15, DT::Normal);
+        CHECK(res.sh.current == 25);
+        CHECK(res.pool == 0);
+    }
+    {
+        const auto res = hit(70, DT::Normal);   // 30 gets through: too little for a 40-point plate, so it waits in the pool
+        CHECK(res.sh.current == 0);
+        CHECK(res.out.reached == 30);
+        CHECK(armorLost(res.v) == 0);
+        CHECK(res.pool == 30);
+    }
+    {
+        const auto res = hit(100, DT::Normal);   // 60: one plate falls whole, 20 left over
+        CHECK(armorLost(res.v) == 1);
+        CHECK(internalsLost(res.v) == 0);
+        CHECK(res.pool == 20);
+    }
+    {
+        const auto res = hit(30, DT::SkipsAllShields, 30);   // the pool joins the next hit
+        CHECK(res.sh.current == 40);
+        CHECK(armorLost(res.v) == 1);
+        CHECK(res.pool == 20);
+    }
+    {
+        const auto res = hit(15, DT::SkipsNormalShields);   // the pool is normal, so it is skipped
+        CHECK(res.sh.current == 40);
+        CHECK(res.pool == 15);
+    }
+    {
+        const auto res = hit(100, DT::ShieldsOnly);
+        CHECK(res.sh.current == 0);
+        CHECK(res.out.reached == 0);
+        CHECK(res.pool == 0);
+    }
+    {
+        const auto res = hit(15, DT::QuadDamageToShields);   // 60 against 40 shields: 20 left, back to 5
+        CHECK(res.sh.current == 0);
+        CHECK(res.pool == 5);
+    }
+    {
+        const auto res = hit(10, DT::HalfDamageToShields);
+        CHECK(res.sh.current == 35);
+        CHECK(res.out.reached == 0);
+    }
+    {
+        const auto res = hit(30, DT::SkipsShieldsAndArmor);   // internals only; the pool keeps what did not fit
+        CHECK(armorLost(res.v) == 0);
+        CHECK(internalsLost(res.v) >= 1);
+        int lost = 0;
+        for (size_t e : {0, 1, 2, 3, 4, 5, 8, 9})
+            if (destroyed(r, s, res.v, e)) lost += combat::detail::combatStructure(r, s.design(d).entries[e]);
+        CHECK(lost + res.pool == 30);
+    }
+    {
+        const auto res = hit(25, DT::OnlyEngines);   // shields still absorb (history 1.70)
+        CHECK_FALSE(destroyed(r, s, res.v, 3));
+        const auto big = hit(50, DT::OnlyEngines);
+        CHECK(destroyed(r, s, big.v, 3));
+        CHECK(armorLost(big.v) + internalsLost(big.v) == 1);
+        CHECK(big.pool == 0);   // the "Only" types lose their leftover
+    }
+    {
+        const auto res = hit(100, DT::OnlyWeapons);   // ignores shields and armor, harmless beyond the weapons
+        CHECK(res.sh.current == 40);
+        CHECK(destroyed(r, s, res.v, 8));
+        CHECK(internalsLost(res.v) == 1);
+        CHECK_FALSE(res.out.destroyed);
+        CHECK_FALSE(combat::detail::canAffectVehicle(r, s, res.v, res.sh, DT::OnlyWeapons));
+    }
+    {
+        auto res = hit(100, DT::OnlyShieldGenerators);   // losing generators caps the shields
+        combat::detail::refreshShields(r, s, res.v, 0, 0, res.sh, false);
+        CHECK(res.sh.max == 0);
+        CHECK(res.sh.current == 0);
+    }
+    {
+        const int total = combat::detail::designStructure(r, s.design(d));
+        CHECK(total == 195);
+        const auto res = hit(total + 15, DT::SkipsAllShields);
+        CHECK(res.out.destroyed);
+        CHECK(vehicleDestroyed(r, s, res.v));
+        CHECK(res.pool == 15);
+    }
+    // Armor always goes first, whatever the draw (confirmed: binary).
+    for (uint64_t seed = 1; seed <= 30; ++seed) {
+        Rng local(seed);
+        Vehicle v = base;
+        const int64_t left = combat::detail::destroyComponents(r, s, v, 110, DT::Normal, local);
+        CHECK(armorLost(v) == 2);
+        CHECK(left <= 30);
+    }
+    CHECK_FALSE(combat::detail::canAffectVehicle(r, s, base, {}, DT::OnlyPlanetPopulation));
+    CHECK_FALSE(combat::detail::canAffectVehicle(r, s, base, {}, DT::ShieldsOnly));
+}
+
+TEST_CASE("combat: shield kinds, the system bonus and disruption") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    using Kind = combat::detail::ShieldState::Kind;
+    const Vehicle phased = *s.vehicle(spawn(s, frigate(s, ar.a, "Ghost", 1, {"CT Phased Shield", "CT Phased Shield"}), ar.loc));
+    combat::detail::ShieldState sh;
+    combat::detail::refreshShields(r, s, phased, 0, 0, sh, true);
+    CHECK(sh.kind == Kind::Phased);   // phased only when every generator is
+    CHECK(sh.max == 40);
+    int64_t pool = 0;
+    Rng rng(3);
+    Vehicle v = phased;
+    combat::detail::hitVehicle(r, s, v, sh, pool, 15, combat::DamageType::SkipsNormalShields, rng);
+    CHECK(sh.current == 25);   // a phased pool stops shield-skipping damage
+    // The system modifier adds only when positive and only to a ship that has shields; disruption subtracts.
+    combat::detail::refreshShields(r, s, phased, 25, 10, sh, true);
+    CHECK(sh.max == 55);
+    combat::detail::refreshShields(r, s, phased, -25, 0, sh, true);
+    CHECK(sh.max == 40);
+    combat::detail::refreshShields(r, s, phased, 0, 100, sh, true);
+    CHECK(sh.max == 0);
+    const Vehicle bare = *s.vehicle(spawn(s, frigate(s, ar.a, "Bare", 1, {}), ar.loc));
+    combat::detail::refreshShields(r, s, bare, 25, 0, sh, true);
+    CHECK(sh.max == 0);
+    // No supplies: no shields.
+    Vehicle dry = phased;
+    dry.supply = 0;
+    combat::detail::refreshShields(r, s, dry, 0, 0, sh, true);
+    CHECK(sh.max == 0);
+}
+
+TEST_CASE("combat: emissive, crystalline and organic armor") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    Rng rng(5);
+    {
+        const VehicleId id = spawn(s, design(s, ar.a, "Glow", "Test Frigate", {"Test Bridge", "CT Emissive Armor"}), ar.loc);
+        Vehicle v = *s.vehicle(id);
+        combat::detail::ShieldState sh;
+        int64_t pool = 10;
+        CHECK(combat::detail::hitVehicle(r, s, v, sh, pool, 15, combat::DamageType::Normal, rng).reached == 0);
+        CHECK(pool == 10);   // a hit no larger than E does nothing, and the pool keeps its value
+        CHECK(combat::detail::hitVehicle(r, s, v, sh, pool, 16, combat::DamageType::Normal, rng).reached == 11);   // 16 + 10 - 15
+        CHECK(pool == 11);
+        // Skips Armor is not reduced by emissive armor: 20 destroys the 20-point bridge.
+        int64_t other = 0;
+        combat::detail::hitVehicle(r, s, v, sh, other, 20, combat::DamageType::SkipsArmor, rng);
+        CHECK(destroyed(r, s, v, 0));
+    }
+    {
+        const VehicleId id = spawn(s, design(s, ar.a, "Prism", "Test Frigate", {"Test Bridge", "Test Shield", "CT Crystal Armor"}), ar.loc);
+        Vehicle v = *s.vehicle(id);
+        v.supply = 10;
+        combat::detail::ShieldState sh;
+        combat::detail::refreshShields(r, s, v, 0, 0, sh, true);
+        int64_t pool = 0;
+        combat::detail::hitVehicle(r, s, v, sh, pool, 20, combat::DamageType::Normal, rng);
+        CHECK(sh.current == 0);
+        const auto out = combat::detail::hitVehicle(r, s, v, sh, pool, 12, combat::DamageType::Normal, rng);
+        CHECK(sh.current == 5);   // 5 points of what got through became shields
+        CHECK(out.reached == 12);   // and the damage itself is not reduced
+    }
+    {
+        const VehicleId id = spawn(s, design(s, ar.a, "Moss", "Test Frigate", {"Test Bridge", "CT Organic Armor", "CT Organic Armor"}), ar.loc);
+        Vehicle v = *s.vehicle(id);
+        v.damage[1] = 40;
+        v.damage[2] = 40;
+        CHECK(combat::detail::hasDestroyedRegeneratingArmor(r, s, v));
+        // Whole components in design order, each costing its structure.
+        CHECK(combat::detail::restoreRegeneratingArmor(r, s, v, 50) == 40);
+        CHECK(v.damage[1] == 0);
+        CHECK(v.damage[2] == 40);
+        CHECK(combat::detail::restoreRegeneratingArmor(r, s, v, 10000) == 40);
+        CHECK_FALSE(combat::detail::hasDestroyedRegeneratingArmor(r, s, v));
+    }
+}
+
+TEST_CASE("combat: unit hit points and experience") {
+    const Rules& r = combatRules();
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    // H = structure + X; fighters, troops and platforms count X twice (spec 04 §9.4).
+    const DesignId fighter = design(s, ar.a, "Shielded Wasp", "Test Fighter Hull", {"Test Fighter Engine", "Test Shield"});
+    const combat::detail::UnitToughness f = combat::detail::unitToughness(r, s.design(fighter));
+    CHECK(f.structure == 5 + 10);
+    CHECK(f.shields == 20);
+    CHECK(f.doubled);
+    CHECK(combat::detail::unitHitPoints(r, s.design(fighter)) == 5 + 10 + 2 * 20);
+    const DesignId sat = design(s, ar.a, "Shielded Sat", "Test Satellite Hull", {"Test Satellite Gun", "Test Shield"});
+    CHECK(combat::detail::unitHitPoints(r, s.design(sat)) == 10 + 10 + 20);
+    // Experience in tenths, capped at 50; a gain past 50 sets it to 50.
+    int whole = 49, tenths = 5;
+    combat::detail::addExperience(whole, tenths, 10);
+    CHECK(whole == 50);
+    CHECK(tenths == 0);
+    whole = 3;
+    tenths = 9;
+    combat::detail::addExperience(whole, tenths, 1);
+    CHECK(whole == 4);
+    CHECK(tenths == 0);
+}
+
+// ---- Battles ------------------------------------------------------------------------------------------------
+
+TEST_CASE("combat: combatPossible respects treaties, cloaking and mines") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    const VehicleId x = spawn(s, frigate(s, ar.a, "X", 1, {"CT Cloak"}), ar.loc);
+    CHECK_FALSE(combat::combatPossible(r, s, ar.loc));   // nobody to fight
+    const VehicleId y = spawn(s, frigate(s, ar.b, "Y", 1, {}), ar.loc);
+    CHECK(combat::combatPossible(r, s, ar.loc));   // unarmed ships still fight (spec 04 §2)
+    setTreaty(s, ar.a, ar.b, Treaty::NonAggression);
+    CHECK_FALSE(combat::combatPossible(r, s, ar.loc));
+    s.empire(ar.a).relation(ar.b).treaty = Treaty::War;   // one side hostile is enough
+    CHECK(combat::combatPossible(r, s, ar.loc));
+    // An undetected cloaked ship does not start combat.
+    s.empire(ar.b).knowledge.present.assign(s.galaxy.systems.size(), 0);
+    s.vehicle(x)->status = VehicleStatus::Cloaked;
+    CHECK_FALSE(combat::combatPossible(r, s, ar.loc));
+    s.vehicle(x)->status = VehicleStatus::Normal;
+    CHECK(combat::combatPossible(r, s, ar.loc));
+    // Mines alone start an encounter with a hostile vehicle.
+    s.vehicle(y)->count = 0;
+    s.removeDeadVehicles();
+    CHECK_FALSE(combat::combatPossible(r, s, ar.loc));
+    const DesignId mine = design(s, ar.b, "Mine", "Test Mine Hull", {"Test Warhead"});
+    spawn(s, mine, ar.loc, 3);
+    // Mines judge by their owner's side of the treaty (spec 03 §12): B still rates A at Non-Aggression.
+    CHECK_FALSE(combat::combatPossible(r, s, ar.loc));
+    s.empire(ar.b).relation(ar.a).treaty = Treaty::War;
+    CHECK(combat::combatPossible(r, s, ar.loc));
+    setTreaty(s, ar.a, ar.b, Treaty::NonAggression);
+    CHECK_FALSE(combat::combatPossible(r, s, ar.loc));
+}
+
+TEST_CASE("combat: the battle check - one-directional in turn-based games; colonies never see in simultaneous ones") {
+    // Spec 04 §2 (confirmed: binary).
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    const VehicleId mover = spawn(s, frigate(s, ar.a, "Mover", 1, {"CT Cloak"}), ar.loc);
+    const VehicleId lurker = spawn(s, frigate(s, ar.b, "Lurker", 1, {"CT Cloak"}), ar.loc);
+    const combat::BattleCheck byMover{{mover}}, byLurker{{lurker}}, daily{};
+    s.vehicle(lurker)->status = VehicleStatus::Cloaked;
+    REQUIRE_FALSE(sight::canSeeVehicle(r, s, ar.a, *s.vehicle(lurker)));
+    // A's ship steps in; B's cloaked ship sees it, but A sees nothing hostile: no battle.
+    CHECK_FALSE(combat::battleCheck(r, s, ar.loc, byMover));
+    CHECK_FALSE(combat::combatPossible(r, s, ar.loc, byMover));
+    // B's cloaked ship itself steps in: A's uncloaked ship does not see it either.
+    CHECK_FALSE(combat::battleCheck(r, s, ar.loc, byLurker));
+    // A sees it with sensors: A's step now finds a hostile object.
+    const VehicleId eye = spawn(s, frigate(s, ar.a, "Eye", 1, {"CT Sensor"}), Location{ar.loc.system, Sector{0, 0}});
+    REQUIRE(sight::canSeeVehicle(r, s, ar.a, *s.vehicle(lurker)));
+    CHECK(combat::battleCheck(r, s, ar.loc, byMover));
+    // A wholly cloaked group that another empire present sees, and that empire is hostile to it.
+    CHECK(combat::battleCheck(r, s, ar.loc, byLurker));
+    s.empire(ar.a).relation(ar.b).treaty = Treaty::NonAggression;  // A's side at peace: it does not count
+    CHECK_FALSE(combat::battleCheck(r, s, ar.loc, byLurker));
+    CHECK_FALSE(combat::battleCheck(r, s, ar.loc, byMover));
+    s.empire(ar.a).relation(ar.b).treaty = Treaty::War;
+    s.vehicle(eye)->count = 0;
+    // Without the sensors A cannot see the cloaked ship; but once B has another
+    // object there that A sees, B's cloaked step starts a battle all the same:
+    // the watcher may see any object of the moving empire in the sector
+    // (corrected 2026-10-14, complete listing).
+    REQUIRE_FALSE(sight::canSeeVehicle(r, s, ar.a, *s.vehicle(lurker)));
+    CHECK_FALSE(combat::battleCheck(r, s, ar.loc, byLurker));
+    const VehicleId beacon = spawn(s, frigate(s, ar.b, "Beacon", 1, {}), ar.loc);
+    CHECK(combat::battleCheck(r, s, ar.loc, byLurker));
+    s.vehicle(beacon)->count = 0;
+    s.removeDeadVehicles();
+
+    // Simultaneous games: a colony alone never counts as the side that sees.
+    Arena col = makeArena();
+    GameState& t = col.s;
+    const Colony& home = homeworld(t, col.a);
+    const Location there = locationOf(t.galaxy, home.planet);
+    spawn(t, frigate(t, col.a, "Colony Eye", 1, {"CT Sensor"}), Location{there.system, Sector{0, 0}});
+    const VehicleId sneak = spawn(t, frigate(t, col.b, "Sneak", 1, {"CT Cloak"}), there);
+    t.vehicle(sneak)->status = VehicleStatus::Cloaked;
+    REQUIRE(sight::canSeeVehicle(r, t, col.a, *t.vehicle(sneak)));
+    CHECK_FALSE(combat::battleCheck(r, t, there, daily));   // A has only its colony there; B's ship is cloaked
+    CHECK_FALSE(combat::combatPossible(r, t, there));
+    // In a turn-based game the cloaked ship stepping in is seen by the colony's owner.
+    CHECK(combat::battleCheck(r, t, there, combat::BattleCheck{{sneak}}));
+    t.vehicle(sneak)->status = VehicleStatus::Normal;  // uncloaked, it sees the colony
+    CHECK(combat::battleCheck(r, t, there, daily));
+
+    // A minefield is never what a simultaneous check sees; a turn-based step
+    // that sees one passes the check, and a check that passes always starts a
+    // battle (spec 04 §2, §19.2 Q73).
+    Arena mf = makeArena();
+    const VehicleId walker = spawn(mf.s, frigate(mf.s, mf.a, "Walker", 1, {}), mf.loc);
+    const VehicleId field = spawn(mf.s, design(mf.s, mf.b, "Mine", "Test Mine Hull", {"Test Warhead"}), mf.loc, 3);
+    mf.s.empire(mf.b).relation(mf.a).treaty = Treaty::NonAggression;  // only A's view counts
+    CHECK_FALSE(combat::battleCheck(r, mf.s, mf.loc, daily));
+    const bool seen = combat::detail::visibleTo(r, mf.s, mf.a, *mf.s.vehicle(field));
+    CHECK(seen);   // the fixture's mines have no cloak
+    CHECK(combat::battleCheck(r, mf.s, mf.loc, combat::BattleCheck{{walker}}));
+    CHECK(combat::detail::battleForces(r, mf.s, mf.loc, combat::BattleCheck{{walker}}).battle);
+}
+
+TEST_CASE("combat: a check that sees only a minefield fights a battle that ends at once") {
+    // Spec 04 §2, §19.2 Q73 (confirmed: binary): the battle is set up as usual,
+    // ends at its first end check (after one whole combat turn when unseen), and
+    // every participant gets a report.
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    s.options.simultaneous = false;
+    const VehicleId walker = spawn(s, frigate(s, ar.a, "Walker", 2, {"CT Gun"}), ar.loc);
+    spawn(s, design(s, ar.b, "Mine", "Test Mine Hull", {"Test Warhead"}), ar.loc, 3);
+    s.vehicle(walker)->orders.push_back(Order{OrderKind::MoveTo, ar.loc});
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc, std::vector<VehicleId>{}, combat::BattleCheck{{walker}});
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    CHECK(rec.participants == std::vector<EmpireId>{ar.a});
+    for (const CombatEvent& e : rec.events) CHECK(e.round == 1);   // one combat turn
+    bool reported = false;
+    for (const LogEntry& l : s.empire(ar.a).log) reported = reported || l.title.starts_with("Battle at");
+    CHECK(reported);
+    CHECK(s.vehicle(walker)->count == 1);
+}
+
+TEST_CASE("combat: the battle check sees colonies by current sensors; minefields never see") {
+    // Spec 04 §2, §19.2 Q74, Q75 (confirmed: binary).
+    const Rules& r = combatRules();
+    {
+        // A colony hidden by a storm in its sector starts no battle for a ship
+        // whose sensors do not pierce it.
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        const ObjectId home = homeworld(s, ar.b).planet;   // an id: adding the storm moves the colonies
+        const Location there = locationOf(s.galaxy, home);
+        const VehicleId scout = spawn(s, frigate(s, ar.a, "Scout", 1, {}), there);
+        sight::markExplored(s, ar.a, there.system);
+        const combat::BattleCheck byScout{{scout}};
+        CHECK(combat::detail::colonyVisibleTo(r, s, ar.a, home));
+        CHECK(combat::battleCheck(r, s, there, byScout));
+        SpaceObject storm;
+        storm.kind = ObjectKind::Storm;
+        storm.sector = there.sector;
+        storm.name = "Squall";
+        storm.abilities.push_back(ab(AbilityKind::SectorSightObscuration, 3));
+        s.addObject(std::move(storm), there.system);
+        CHECK_FALSE(combat::detail::colonyVisibleTo(r, s, ar.a, home));
+        CHECK_FALSE(combat::battleCheck(r, s, there, byScout));
+        // Its owner always sees it; sensors that pierce the storm see it too.
+        CHECK(combat::detail::colonyVisibleTo(r, s, ar.b, home));
+        spawn(s, frigate(s, ar.a, "Eye", 1, {"CT Sensor"}), Location{there.system, Sector{0, 0}});
+        CHECK(combat::detail::colonyVisibleTo(r, s, ar.a, home));
+        CHECK(combat::battleCheck(r, s, there, byScout));
+    }
+    {
+        // Simultaneous games: a minefield never makes its owner a seeing side.
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        spawn(s, frigate(s, ar.a, "Walker", 1, {}), ar.loc);
+        const VehicleId field = spawn(s, design(s, ar.b, "Mine", "Test Mine Hull", {"Test Warhead"}), ar.loc, 3);
+        s.empire(ar.a).relation(ar.b).treaty = Treaty::NonAggression;   // A fights nobody; B's view alone would
+        REQUIRE(s.vehicle(field)->status != VehicleStatus::Cloaked);
+        CHECK_FALSE(combat::battleCheck(r, s, ar.loc, combat::BattleCheck{}));
+        // A vehicle of B there does see.
+        spawn(s, frigate(s, ar.b, "Picket", 1, {}), ar.loc);
+        CHECK(combat::battleCheck(r, s, ar.loc, combat::BattleCheck{}));
+    }
+}
+
+TEST_CASE("combat: a won battle - damage, kills, experience, mood, logs and the record") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const DesignId hunterDesign = frigate(s, ar.a, "Hunter", 3, {"CT Big Gun", "CT Big Armor"});
+    const DesignId preyDesign = frigate(s, ar.b, "Prey", 1, {});
+    const VehicleId hunter = spawn(s, hunterDesign, ar.loc);
+    const VehicleId prey = spawn(s, preyDesign, ar.loc);
+    Fleet f;
+    f.owner = ar.a;
+    f.name = "Hunters";
+    f.members = {hunter};
+    f.leader = hunter;
+    const FleetId fid = s.addFleet(f).id;
+    s.vehicle(hunter)->fleet = fid;
+    s.vehicle(hunter)->orders.push_back(Order{OrderKind::MoveTo, ar.loc});
+
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+
+    CHECK(s.vehicle(prey)->count == 0);
+    CHECK(s.vehicle(hunter)->count == 1);
+    CHECK(s.vehicle(hunter)->orders.size() == 1);   // combat does not clear orders (spec 03 §6.3)
+    // Experience only for kills: +1.0 for the ship; the fleet may gain 0.1 (spec 04 §15).
+    CHECK(s.vehicle(hunter)->experience == 1);
+    CHECK(s.vehicle(hunter)->experienceTenths == 0);
+    CHECK(s.fleet(fid)->experience == 0);
+    CHECK(s.fleet(fid)->experienceTenths <= 1);
+    CHECK(s.design(preyDesign).lost == 1);
+    // Enemy tonnage destroyed: the prey's hull tonnage (spec 04 §15; inferred measure).
+    CHECK(s.design(hunterDesign).enemyTonnageDestroyed == combatRules().hull(s.design(preyDesign).hull).tonnage);
+    CHECK(s.design(hunterDesign).enemyTonnageDestroyed > 0);
+    CHECK(s.design(preyDesign).enemyTonnageDestroyed == 0);
+
+    CHECK(moodCount(ctx, ar.a, "Battle in System - Win") == 1);
+    CHECK(moodCount(ctx, ar.b, "Battle in System - Loss") == 1);
+    CHECK(moodCount(ctx, ar.b, "Any Ship Lost") == 1);
+    CHECK(moodCount(ctx, ar.b, "Ship Lost in System") == 1);
+    CHECK(moodCount(ctx, ar.a, "Any Ship Lost") == 0);
+    REQUIRE(ctx.battleSites.size() == 1);
+    CHECK(ctx.battleSites.front() == ar.loc);
+    for (EmpireId e : {ar.a, ar.b}) {
+        const auto& log = s.empire(e).log;
+        CHECK(std::any_of(log.begin(), log.end(),
+                          [](const LogEntry& l) { return l.category == LogCategory::Combat && l.title.starts_with("Battle at"); }));
+    }
+    CHECK(designSeenTurn(s.empire(ar.b).knowledge, hunterDesign) == s.turn);  // seen in this battle
+
+    // The replay record.
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    CHECK(rec.location == ar.loc);
+    CHECK(rec.participants == std::vector<EmpireId>{ar.a, ar.b});
+    REQUIRE(rec.pieces.size() == 2);
+    CHECK(rec.pieces[0].vehicle == hunter);
+    CHECK(rec.pieces[1].vehicle == prey);
+    CHECK(rec.pieces[0].owner == ar.a);
+    CHECK(rec.pieces[0].name == s.vehicle(hunter)->name);
+    CHECK(rec.pieces[0].startX != rec.pieces[1].startX);
+    CHECK(countEvents(rec, CombatEvent::Kind::Fire) > 0);
+    CHECK(countEvents(rec, CombatEvent::Kind::Hit) > 0);
+    CHECK(countEvents(rec, CombatEvent::Kind::Destroyed) == 1);
+    for (const CombatEvent& e : rec.events) {
+        CHECK(e.piece < rec.pieces.size());
+        CHECK(e.target < rec.pieces.size());
+        CHECK(e.round >= 1);
+        CHECK(e.round <= 30);
+        CHECK(e.x >= 0);
+        CHECK(e.x < combat::kCombatMapWidth);
+        CHECK(e.y >= 0);
+        CHECK(e.y < combat::kCombatMapHeight);
+    }
+    CHECK(rec.summary.size() >= 2);
+
+    s.removeDeadVehicles();
+    CHECK(s.vehicle(prey) == nullptr);
+}
+
+TEST_CASE("combat: the record fixes the Log's damage and the survivors when the battle ends") {
+    // Spec 06 §4.1, §7 Q43 (confirmed: binary): the damage against the
+    // design's whole structure, damage from before the battle included.
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const DesignId hunterDesign = frigate(s, ar.a, "Hunter", 3, {"CT Big Gun", "CT Big Armor"});
+    const DesignId preyDesign = frigate(s, ar.b, "Prey", 1, {});
+    const VehicleId hunter = spawn(s, hunterDesign, ar.loc);
+    const VehicleId prey = spawn(s, preyDesign, ar.loc);
+    // The hunter starts the battle with a destroyed part.
+    Vehicle& h = *s.vehicle(hunter);
+    const Design& hd = s.design(hunterDesign);
+    h.damage.assign(hd.entries.size(), 0);
+    const size_t last = hd.entries.size() - 1;
+    h.damage[last] = combat::detail::combatStructure(combatRules(), hd.entries[last]);
+    const int full = combat::detail::designStructure(combatRules(), hd);
+    const int remaining = combat::detail::remainingStructure(combatRules(), s, h);
+    REQUIRE(remaining < full);
+
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    REQUIRE(rec.pieces.size() == 2);
+    CHECK(s.vehicle(prey)->count == 0);
+    CHECK(rec.pieces[0].damage == logDamagePercent(full, remaining));   // the unarmed prey never hit back
+    CHECK(rec.pieces[0].survivor == ar.a);
+    CHECK(rec.pieces[1].damage >= 0);
+    CHECK_FALSE(rec.pieces[1].survivor.valid());                       // destroyed: "Dead"
+}
+
+TEST_CASE("combat: unarmed sides end in a stalemate after one turn fewer than the setting") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    useStrategy(s, ar.a, {{"Primary Movement Strategy", "Point Blank"}});
+    useStrategy(s, ar.b, {{"Primary Movement Strategy", "Point Blank"}});
+    spawn(s, frigate(s, ar.a, "Scout A", 1, {}), ar.loc);
+    spawn(s, frigate(s, ar.b, "Scout B", 1, {}), ar.loc);
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    CHECK(moodCount(ctx, ar.a, "Battle in System - Stalemate") == 1);
+    CHECK(moodCount(ctx, ar.b, "Battle in System - Stalemate") == 1);
+    REQUIRE(s.combats.size() == 1);
+    CHECK(countEvents(s.combats.front(), CombatEvent::Kind::Fire) == 0);
+    for (const CombatEvent& e : s.combats.front().events) CHECK(e.round <= 30);
+}
+
+TEST_CASE("combat: surviving hostile sides fight the configured number of complete rounds") {
+    ruleset::Ruleset rs = buildCombatRuleset();
+    rs.settings.set("Number Of Space Combat Turns", "4");
+    const Rules shortRules{std::move(rs)};
+    Arena ar = makeArena(shortRules);
+    GameState& s = ar.s;
+    // Two gunboats that miss a lot: Long Gun damage never destroys the big armor in four turns.
+    const VehicleId a = spawn(s, frigate(s, ar.a, "A", 2, {"CT Long Gun", "CT Big Armor"}, shortRules), ar.loc);
+    spawn(s, frigate(s, ar.b, "B", 2, {"CT Long Gun", "CT Big Armor"}, shortRules), ar.loc);
+    TurnContext ctx = context(s, shortRules);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    REQUIRE(s.combats.size() == 1);
+    int last = 0;
+    for (const CombatEvent& e : s.combats.front().events) last = std::max(last, int(e.round));
+    CHECK(last == 4);
+    CHECK(s.vehicle(a)->count == 1);
+}
+
+TEST_CASE("combat: every owned object is a piece, but a bystander is never fired on") {
+    Arena ar = makeArena(7, 3);
+    GameState& s = ar.s;
+    setTreaty(s, ar.c, ar.a, Treaty::MilitaryAlliance);
+    setTreaty(s, ar.c, ar.b, Treaty::MilitaryAlliance);
+    spawn(s, frigate(s, ar.a, "A", 2, {"CT Gun", "CT Big Armor"}), ar.loc);
+    spawn(s, frigate(s, ar.b, "B", 2, {"CT Gun", "CT Big Armor"}), ar.loc);
+    const VehicleId c = spawn(s, frigate(s, ar.c, "C", 1, {"CT Gun"}), ar.loc);
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    REQUIRE(s.combats.size() == 1);
+    // The bystander is a piece (confirmed: binary), but no one fires on it and it fires on no one.
+    CHECK(s.combats.front().participants == std::vector<EmpireId>{ar.a, ar.b, ar.c});
+    const int cp = pieceOf(s.combats.front(), c);
+    for (const CombatEvent& e : s.combats.front().events) {
+        if (e.kind != CombatEvent::Kind::Fire) continue;
+        CHECK(static_cast<int>(e.piece) != cp);
+        CHECK(static_cast<int>(e.target) != cp);
+    }
+    CHECK(damageTaken(s, c) == 0);
+    CHECK(moodCount(ctx, ar.c, "Battle in System - Win") + moodCount(ctx, ar.c, "Battle in System - Stalemate") == 0);
+}
+
+TEST_CASE("combat: fleets start in formation, turned to the leader's facing") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const DesignId d = frigate(s, ar.a, "Liner", 1, {"CT Gun"});
+    const VehicleId lead = spawn(s, d, ar.loc), left = spawn(s, d, ar.loc), right = spawn(s, d, ar.loc);
+    // An unarmed member is no part of the combat group (spec 03 §9).
+    const VehicleId tender = spawn(s, frigate(s, ar.a, "Tender", 1, {"Test Cargo Bay"}), ar.loc);
+    Fleet f;
+    f.owner = ar.a;
+    f.members = {lead, tender, left, right};
+    f.leader = lead;
+    f.formation = 0;   // Test Line: slots one square either side of the leader
+    const FleetId fid = s.addFleet(f).id;
+    for (VehicleId v : {lead, left, right, tender}) s.vehicle(v)->fleet = fid;
+    spawn(s, design(s, ar.b, "Target", "Test Station", {"Test Bridge", "CT Big Armor"}), ar.loc);   // it cannot move
+    combat::TacticalBattle b(combatRules(), s, combat::TacticalBattle::Setup{ar.loc, std::vector<VehicleId>{}, {ar.a}});
+    REQUIRE(b.started());
+    REQUIRE(b.phaseEmpire() == ar.a);
+    auto find = [&](VehicleId id) -> const combat::TacticalPiece& {
+        for (const combat::TacticalPiece& p : b.pieces())
+            if (p.vehicle == id) return p;
+        FAIL("no piece");
+        return b.pieces().front();
+    };
+    const combat::TacticalPiece &L = find(lead), &M1 = find(left), &M2 = find(right), &T = find(tender);
+    // Pieces in the middle face a random direction from 1 to 4 (spec 04 §3).
+    CHECK(L.facing >= 1);
+    CHECK(L.facing <= 4);
+    // The slot's offset from the leader position, turned by the leader's facing (spec 03 §10).
+    auto turned = [&](int dx, int dy) -> std::pair<int, int> {
+        switch (L.facing) {
+            case 1: return {-dy, dx};
+            case 2: return {-dx, -dy};
+            case 3: return {dy, -dx};
+            case 4: return {dx - dy, dx + dy};
+            default: return {dx, dy};
+        }
+    };
+    CHECK(L.isLeader);
+    const int li = static_cast<int>(&L - b.pieces().data());
+    CHECK(M1.leader == li);
+    CHECK(M2.leader == li);
+    CHECK(std::pair{M1.x - L.x, M1.y - L.y} == turned(-1, 0));
+    CHECK(std::pair{M2.x - L.x, M2.y - L.y} == turned(1, 0));
+    CHECK(T.leader == -1);
+}
+
+TEST_CASE("combat: start boxes by where each piece came from") {
+    // Spec 04 §3 step 4: S is 6 for up to 20 pieces; boxes include both ends.
+    auto start = [](GameState s, Location where) {
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, where);
+        REQUIRE(s.combats.size() == 1);
+        return s.combats.front();
+    };
+    {
+        // One empire in the middle (the centre box), one from the north-west corner
+        // (facing 2), one through a warp point (the fixed centre box).
+        Arena ar = makeArena(7, 3);
+        GameState& s = ar.s;
+        const VehicleId holder = spawn(s, frigate(s, ar.a, "Holder", 2, {"CT Gun"}), ar.loc);
+        const VehicleId corner = spawn(s, frigate(s, ar.b, "Corner", 2, {"CT Gun"}), ar.loc);
+        arriveFrom(s, corner, -1, -1);
+        const VehicleId south = spawn(s, frigate(s, ar.b, "South", 2, {"CT Gun"}), ar.loc);
+        arriveFrom(s, south, 0, 1);
+        const VehicleId warped = spawn(s, frigate(s, ar.c, "Warped", 2, {"CT Gun"}), ar.loc);
+        warpIn(s, warped);
+        combat::TacticalBattle b(combatRules(), s, combat::TacticalBattle::Setup{ar.loc, std::vector<VehicleId>{}, {ar.a, ar.b, ar.c}});
+        REQUIRE(b.started());
+        const CombatRecord& rec = b.record();
+        const CombatPiece& h = rec.pieces[static_cast<size_t>(pieceOf(rec, holder))];
+        const CombatPiece& c = rec.pieces[static_cast<size_t>(pieceOf(rec, corner))];
+        const CombatPiece& so = rec.pieces[static_cast<size_t>(pieceOf(rec, south))];
+        const CombatPiece& w = rec.pieces[static_cast<size_t>(pieceOf(rec, warped))];
+        CHECK(h.startX >= 33);
+        CHECK(h.startX <= 39);
+        CHECK(h.startY >= 28);
+        CHECK(h.startY <= 34);
+        CHECK(c.startX <= 6);
+        CHECK(c.startY <= 6);
+        CHECK(so.startX >= 33);   // (36 - 3, 62 - 6), 6 x 6
+        CHECK(so.startX <= 39);
+        CHECK(so.startY >= 56);
+        CHECK(w.startX >= 34);
+        CHECK(w.startX <= 38);
+        CHECK(w.startY >= 29);
+        CHECK(w.startY <= 33);
+        auto facing = [&](VehicleId id) { return b.pieces()[static_cast<size_t>(pieceOf(rec, id))].facing; };
+        REQUIRE(b.round() == 1);   // every side is a player's: nobody has moved yet
+        CHECK(facing(warped) == 2);
+        CHECK(facing(corner) == 2);   // the top row, corners included
+        CHECK(facing(south) == 0);
+    }
+    {
+        // Two empires in the middle, one with a colony here: the colony's owner keeps
+        // the centre, the other takes the box for its number, two box sizes out.
+        Arena ar = makeArena(7, 2);
+        GameState& s = ar.s;
+        Colony& hw = homeworld(s, ar.b);
+        const Location there = locationOf(s.galaxy, hw.planet);
+        const VehicleId guard = spawn(s, frigate(s, ar.b, "Guard", 2, {"CT Gun"}), there);
+        const VehicleId visitor = spawn(s, frigate(s, ar.a, "Visitor", 2, {"CT Gun"}), there);
+        const CombatRecord rec = start(s, there);
+        const CombatPiece& g = rec.pieces[static_cast<size_t>(pieceOf(rec, guard))];
+        const CombatPiece& v = rec.pieces[static_cast<size_t>(pieceOf(rec, visitor))];
+        CHECK(std::abs(g.startX - 36) <= 6);
+        CHECK(std::abs(g.startY - 31) <= 6);
+        // The visitor's box is 1 (up-left) or 2 (down-right), 12 squares out, depending on
+        // where the system lists its first object.
+        const bool upLeft = v.startX <= 30 && v.startY <= 25;
+        const bool downRight = v.startX >= 48 && v.startY >= 43;
+        CHECK((upLeft || downRight));
+        // Planets take a top-left square in x 33-39, y 28-34.
+        for (const CombatPiece& p : rec.pieces)
+            if (p.kind == CombatPiece::Kind::Planet || p.kind == CombatPiece::Kind::Obstacle) {
+                CHECK(p.startX >= 33);
+                CHECK(p.startX <= 39 + 4);   // moved aside only when its square was taken
+                CHECK(p.startY >= 28);
+            }
+    }
+    {
+        // More than 60 pieces: S is 24 and corner boxes are 48 wide and 24 deep.
+        Arena ar = makeArena(7, 2);
+        GameState& s = ar.s;
+        const DesignId d = frigate(s, ar.b, "Swarm", 1, {"CT Gun"});
+        std::vector<VehicleId> swarm;
+        for (int k = 0; k < 62; ++k) {
+            swarm.push_back(spawn(s, d, ar.loc));
+            arriveFrom(s, swarm.back(), 1, -1);   // from the north-east
+        }
+        spawn(s, frigate(s, ar.a, "Holder", 2, {"CT Gun"}), ar.loc);
+        const CombatRecord rec = start(s, ar.loc);
+        int wide = 0;
+        for (VehicleId id : swarm) {
+            const CombatPiece& p = rec.pieces[static_cast<size_t>(pieceOf(rec, id))];
+            CHECK(p.startY <= 24 + 2);
+            if (p.startX < 71 - 24) ++wide;   // beyond a square box of 24
+            CHECK(p.startX >= 71 - 48 - 2);
+        }
+        CHECK(wide > 0);
+    }
+}
+
+TEST_CASE("combat: the map, start boxes and attackers") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    // A was here; B came in from the north-west sector this turn.
+    const VehicleId defender = spawn(s, frigate(s, ar.a, "Holder", 2, {"CT Gun", "CT Big Armor"}), ar.loc);
+    const VehicleId attacker = spawn(s, frigate(s, ar.b, "Raider", 2, {"CT Gun", "CT Big Armor"}), ar.loc);
+    arriveFrom(s, attacker, -1, -1);
+    CHECK(combat::detail::arrivedThisTurn(s, *s.vehicle(attacker)));
+    CHECK_FALSE(combat::detail::arrivedThisTurn(s, *s.vehicle(defender)));
+    CHECK(combat::detail::arrivalDirection(s, *s.vehicle(attacker)) == std::pair{-1, -1});
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    const CombatPiece& d = rec.pieces[static_cast<size_t>(pieceOf(rec, defender))];
+    const CombatPiece& a = rec.pieces[static_cast<size_t>(pieceOf(rec, attacker))];
+    // Two pieces: 6-square boxes, both ends included. The attacker starts in the
+    // top-left corner, the defender in the centre box (33-39, 28-34).
+    CHECK(a.startX <= 6);
+    CHECK(a.startY <= 6);
+    CHECK(d.startX >= 33);
+    CHECK(d.startX <= 39);
+    CHECK(d.startY >= 28);
+    CHECK(d.startY <= 34);
+    // Defenders act first: the first event of the battle is the defender's.
+    REQUIRE_FALSE(rec.events.empty());
+    CHECK(rec.events.front().piece == static_cast<uint32_t>(pieceOf(rec, defender)));
+    // A warp arrival (another system) starts in the middle but still attacks.
+    Vehicle w = *s.vehicle(attacker);
+    w.cameFrom = {SystemId{(ar.loc.system.value + 1) % static_cast<uint32_t>(s.galaxy.systems.size())}, Sector{0, 0}};
+    CHECK(combat::detail::arrivedThisTurn(s, w));
+    CHECK(combat::detail::arrivedByWarp(s, w));
+    CHECK(combat::detail::arrivalDirection(s, w) == std::pair{0, 0});
+    // Last turn's move does not count.
+    w.cameFromTurn = s.turn + 1;
+    CHECK_FALSE(combat::detail::arrivedThisTurn(s, w));
+}
+
+TEST_CASE("combat: planets and neutral obstacles cover 4x4 squares") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    // A sector with a star in B's home system.
+    const SystemId sys = s.galaxy.object(homeworld(s, ar.b).planet).system;
+    std::optional<ObjectId> star;
+    for (ObjectId o : s.galaxy.system(sys).objects)
+        if (s.galaxy.object(o).kind == ObjectKind::Star) star = o;
+    REQUIRE(star.has_value());
+    const Location there = locationOf(s.galaxy, *star);
+    spawn(s, frigate(s, ar.a, "A", 2, {"CT Gun", "CT Big Armor"}), there);
+    spawn(s, frigate(s, ar.b, "B", 2, {"CT Gun", "CT Big Armor"}), there);
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, there);
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    auto obstacle = std::find_if(rec.pieces.begin(), rec.pieces.end(), [&](const CombatPiece& p) { return p.kind == CombatPiece::Kind::Obstacle; });
+    REQUIRE(obstacle != rec.pieces.end());
+    CHECK(obstacle->planet == *star);
+    CHECK_FALSE(obstacle->owner.valid());
+    CHECK(rec.participants == std::vector<EmpireId>{ar.a, ar.b});
+    // No two pieces overlap at the start; big pieces keep their footprint on the map.
+    std::set<std::pair<int, int>> used;
+    for (const CombatPiece& p : rec.pieces) {
+        const int size = p.kind == CombatPiece::Kind::Obstacle || p.kind == CombatPiece::Kind::Planet ? 4 : 1;
+        CHECK(p.startX + size <= combat::kCombatMapWidth);
+        CHECK(p.startY + size <= combat::kCombatMapHeight);
+        for (int dy = 0; dy < size; ++dy)
+            for (int dx = 0; dx < size; ++dx) CHECK(used.insert({p.startX + dx, p.startY + dy}).second);
+    }
+    // Nobody fires on an obstacle.
+    const auto oi = static_cast<uint32_t>(obstacle - rec.pieces.begin());
+    for (const CombatEvent& e : rec.events) CHECK(!(e.kind == CombatEvent::Kind::Fire && e.target == oi));
+}
+
+TEST_CASE("combat: combat movement is half the speed rounded up plus the best Combat Movement part") {
+    auto movesInRoundOne = [](int engines, bool thruster) {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        useStrategy(s, ar.a, {{"Primary Movement Strategy", "Point Blank"}});
+        const VehicleId mover = thruster ? spawn(s, frigate(s, ar.a, "Mover", engines, {"CT Gun", "CT Combat Thruster", "CT Combat Thruster"}), ar.loc)
+                                         : spawn(s, frigate(s, ar.a, "Mover", engines, {"CT Gun"}), ar.loc);
+        const VehicleId far = spawn(s, frigate(s, ar.b, "Far", 1, {"CT Big Armor"}), ar.loc);
+        arriveFrom(s, far, 1, 1);   // the target starts in the far corner
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE(s.combats.size() == 1);
+        const CombatRecord& rec = s.combats.front();
+        const int p = pieceOf(rec, mover);
+        int moves = 0;
+        for (const CombatEvent& e : rec.events)
+            if (e.kind == CombatEvent::Kind::Move && e.round == 1 && static_cast<int>(e.piece) == p) ++moves;
+        return moves;
+    };
+    CHECK(movesInRoundOne(5, false) == 3);   // 5 / 2 rounded up
+    CHECK(movesInRoundOne(4, false) == 2);
+    CHECK(movesInRoundOne(4, true) == 4);    // + 2 from the best thruster; two thrusters do not add
+}
+
+TEST_CASE("combat: seekers wait a turn, hit on arrival and point defense shoots them down") {
+    // Targets are bases, so the seekers never run out of range chasing them.
+    auto fight = [](bool pointDefense) {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        spawn(s, frigate(s, ar.a, "Launcher", 2, {"CT Torpedo", "CT Big Armor"}), ar.loc);
+        const DesignId base = pointDefense ? design(s, ar.b, "Guarded", "Test Station", {"Test Bridge", "CT PD", "CT Big Armor", "CT Big Armor"})
+                                           : design(s, ar.b, "Plain", "Test Station", {"Test Bridge", "CT Big Armor", "CT Big Armor"});
+        spawn(s, base, ar.loc);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE(s.combats.size() == 1);
+        const CombatRecord& rec = s.combats.front();
+        int impacts = 0, shotDown = 0, launched = 0;
+        int64_t impactDamage = 0;
+        std::map<uint32_t, int> launchRound;
+        for (const CombatEvent& e : rec.events) {
+            if (e.kind == CombatEvent::Kind::Seeker) {
+                ++launched;
+                launchRound.emplace(e.piece, e.round);
+            }
+            if (e.kind == CombatEvent::Kind::Move && rec.pieces[e.piece].kind == CombatPiece::Kind::Seeker) {
+                CHECK(e.round > launchRound[e.piece]);   // no movement in the launch turn
+            }
+            if (e.kind != CombatEvent::Kind::Hit) continue;
+            if (rec.pieces[e.piece].kind == CombatPiece::Kind::Seeker) {
+                ++impacts;
+                impactDamage += e.amount;
+            }
+            if (rec.pieces[e.target].kind == CombatPiece::Kind::Seeker) ++shotDown;
+        }
+        return std::tuple{impacts, shotDown, launched, impactDamage};
+    };
+    const auto [impacts, shotDown, launched, damage] = fight(false);
+    CHECK(launched > 0);
+    CHECK(impacts > 0);
+    CHECK(shotDown == 0);
+    CHECK(damage == impacts * 37);   // no roll: every arrival hits for the table value
+    const auto [impacts2, shotDown2, launched2, damage2] = fight(true);
+    CHECK(launched2 > 0);
+    CHECK(shotDown2 > 0);
+    CHECK(impacts2 < launched2);
+}
+
+namespace {
+
+// Where each seeker of a record left the battle (its Destroyed event), or none.
+std::map<uint32_t, size_t> seekerEnds(const CombatRecord& rec) {
+    std::map<uint32_t, size_t> out;
+    for (size_t i = 0; i < rec.events.size(); ++i)
+        if (rec.events[i].kind == CombatEvent::Kind::Destroyed && rec.pieces[rec.events[i].piece].kind == CombatPiece::Kind::Seeker)
+            out.emplace(rec.events[i].piece, i);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("combat: a seeker in flight keeps its side in the battle; a target's death takes its seekers at once (GitHub issue #17)") {
+    // The launcher dies to the fort's guns while its torpedoes fly (spec 04 §4,
+    // §10.1, confirmed: binary): seekers count as pieces for the end check, so
+    // the battle goes on until each strikes or vanishes, and none is left on
+    // the map when it ends before the turn limit. The verdict leaves seekers out.
+    const int lastRound = combat::loadSettings(combatRules()).spaceTurns;
+    int launcherDiedFirst = 0;
+    for (uint64_t seed = 1; seed <= 12; ++seed) {
+        CAPTURE(seed);
+        Arena ar = makeArena(seed);
+        GameState& s = ar.s;
+        const VehicleId launcher = spawn(s, frigate(s, ar.a, "Launcher", 2, {"CT Torpedo", "CT Torpedo"}), ar.loc);
+        spawn(s, design(s, ar.b, "Fort", "Test Station", {"Test Bridge", "CT Big Gun", "CT Big Gun", "CT Big Armor"}), ar.loc);
+        // It closes in, firing as it comes, and once its torpedoes are shot away
+        // it rams: it still counts as armed (spec 04 §16), so only its secondary
+        // strategy makes it ram rather than run.
+        useStrategy(s, ar.a, {{"Primary Movement Strategy", "Point Blank"}, {"Secondary Movement Strategy", "Ram"}});
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE(s.combats.size() == 1);
+        const CombatRecord& rec = s.combats.front();
+        const std::map<uint32_t, size_t> ends = seekerEnds(rec);
+        int launched = 0;
+        for (size_t p = 0; p < rec.pieces.size(); ++p)
+            if (rec.pieces[p].kind == CombatPiece::Kind::Seeker) {
+                ++launched;
+                if (rec.events.back().round < lastRound) CHECK(ends.count(static_cast<uint32_t>(p)) == 1);
+            }
+        CHECK(launched > 0);
+        // The launcher's death: the seekers still in flight then go on.
+        const int ship = pieceOf(rec, launcher);
+        size_t died = rec.events.size();
+        for (size_t i = 0; i < rec.events.size(); ++i)
+            if (rec.events[i].kind == CombatEvent::Kind::Destroyed && rec.events[i].piece == static_cast<uint32_t>(ship)) died = i;
+        REQUIRE(died < rec.events.size());
+        for (const auto& [seeker, end] : ends)
+            if (end > died) ++launcherDiedFirst;
+        CHECK(std::find(rec.summary.begin(), rec.summary.end(), std::format("{}: defeat", s.empire(ar.a).name)) != rec.summary.end());
+        CHECK(std::find(rec.summary.begin(), rec.summary.end(), std::format("{}: victory", s.empire(ar.b).name)) != rec.summary.end());
+    }
+    CHECK(launcherDiedFirst > 0);   // some flew on after their launcher died
+}
+
+TEST_CASE("combat: seekers aimed at a piece that dies leave the battle with it, before they move again") {
+    int dropped = 0;
+    for (int variant = 0; variant < 10; ++variant)
+        for (uint64_t seed = 1; seed <= 3; ++seed) {
+            auto [s, where] = battleScenario(variant, seed);
+            TurnContext ctx = context(s);
+            combat::resolveSpaceCombat(ctx, where);
+            REQUIRE_FALSE(s.combats.empty());
+            const CombatRecord& rec = s.combats.back();
+            std::map<uint32_t, uint32_t> target;
+            for (const CombatEvent& e : rec.events)
+                if (e.kind == CombatEvent::Kind::Seeker) target.emplace(e.piece, e.target);
+            std::map<uint32_t, size_t> deaths;
+            for (size_t i = 0; i < rec.events.size(); ++i)
+                if (rec.events[i].kind == CombatEvent::Kind::Destroyed) deaths.emplace(rec.events[i].piece, i);
+            for (const auto& [seeker, end] : seekerEnds(rec)) {
+                const auto t = deaths.find(target[seeker]);
+                if (t == deaths.end() || t->second > end) continue;   // it struck, expired or was shot down first
+                // Its target left first (destroyed, or a seeker that struck):
+                // the seeker went at that moment, only other seekers going
+                // between the two.
+                ++dropped;
+                for (size_t i = t->second + 1; i < end; ++i)
+                    CHECK((rec.events[i].kind == CombatEvent::Kind::Destroyed && rec.pieces[rec.events[i].piece].kind == CombatPiece::Kind::Seeker));
+            }
+        }
+    CHECK(dropped > 0);
+}
+
+TEST_CASE("combat: fighters launch from carriers, combine their hits and land again") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const DesignId fighter = design(s, ar.a, "Wasp", "Test Fighter Hull", {"Test Fighter Engine", "Test Fighter Gun", "CT Fighter Fuel"});
+    const DesignId carrierDesign = frigate(s, ar.a, "Carrier", 1, {"Test Fighter Bay", "Test Fighter Bay", "CT Big Armor"});
+    const VehicleId carrier = spawn(s, carrierDesign, ar.loc);
+    s.vehicle(carrier)->cargo.units.push_back({fighter, 5});
+    useStrategy(s, ar.a, {{"Primary Movement Strategy", "Point Blank"}, {"Fighters Launch Group Amount", "5"}});
+    const VehicleId target = spawn(s, design(s, ar.b, "Hulk", "Test Station", {"Test Bridge", "CT Big Armor"}), ar.loc);
+    warpIn(s, target);
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    int launched = 0;
+    for (const CombatEvent& e : rec.events)
+        if (e.kind == CombatEvent::Kind::Launch) {
+            launched += e.amount;
+            CHECK(rec.pieces[e.piece].kind == CombatPiece::Kind::UnitGroup);
+            CHECK(rec.pieces[e.piece].design == fighter);
+        }
+    CHECK(launched == 5);   // one group of the strategy's size 5
+    // The group's weapons fire together: one Hit event of several guns' damage.
+    const int tp = pieceOf(rec, target);
+    int combined = 0;
+    for (const CombatEvent& e : rec.events)
+        if (e.kind == CombatEvent::Kind::Hit && static_cast<int>(e.target) == tp && rec.pieces[e.piece].kind == CombatPiece::Kind::UnitGroup) {
+            CHECK((e.amount % 6 == 0 || e.amount % 4 == 0));   // whole guns of 6 (4 at range 3)
+            if (e.amount > 6) ++combined;
+        }
+    CHECK(combined > 0);
+    CHECK(hitsOn(rec, tp) > 0);
+    // Survivors land on their carrier after the battle.
+    CHECK(s.vehicle(carrier)->cargo.unitCount(fighter) == 5);
+    // The group was an object of the game from its launch; taken back aboard, it
+    // goes with the battle's losses (spec 04 §10.4).
+    CHECK(std::any_of(rec.pieces.begin(), rec.pieces.end(), [&](const CombatPiece& p) { return p.design == fighter && p.vehicle.valid(); }));
+    s.removeDeadVehicles();
+    CHECK(std::none_of(s.vehicles.begin(), s.vehicles.end(), [&](const Vehicle& v) { return v.design == fighter; }));
+}
+
+TEST_CASE("combat: fighters already in space stay there; only launched groups land") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const DesignId fighter = design(s, ar.a, "Wasp", "Test Fighter Hull", {"Test Fighter Engine", "Test Fighter Gun", "CT Fighter Fuel"});
+    const VehicleId carrier = spawn(s, frigate(s, ar.a, "Carrier", 1, {"Test Fighter Bay", "Test Fighter Bay", "CT Big Armor"}), ar.loc);
+    const VehicleId group = spawn(s, fighter, ar.loc, 3);
+    s.vehicle(group)->supply = 100;
+    spawn(s, design(s, ar.b, "Hulk", "Test Station", {"Test Bridge", "CT Big Armor"}), ar.loc);
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    REQUIRE(s.vehicle(group) != nullptr);
+    CHECK(s.vehicle(group)->count == 3);
+    CHECK(s.vehicle(carrier)->cargo.unitCount(fighter) == 0);
+}
+
+TEST_CASE("combat: unit groups lose members one by one; satellites fire each weapon") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const DesignId sat = design(s, ar.b, "Sentinel", "Test Satellite Hull", {"Test Satellite Gun", "Test Armor Plate"});
+    const VehicleId group = spawn(s, sat, ar.loc, 5);
+    useStrategy(s, ar.a, {{"Primary Movement Strategy", "Point Blank"}});
+    const DesignId gunship = frigate(s, ar.a, "Gunship", 3, {"CT Gun", "CT Big Armor"});   // 10 a hit: five hits per satellite
+    const VehicleId gun = spawn(s, gunship, ar.loc);
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    const int left = s.vehicle(group)->count;
+    CHECK(left < 5);
+    CHECK(s.design(sat).lost == 5 - left);
+    // Units killed from a group that survives credit nothing; the whole group credits every unit it had (spec 04 §15).
+    CHECK(s.design(gunship).enemyTonnageDestroyed == (left == 0 ? 5 * int64_t{combatRules().hull(s.design(sat).hull).tonnage} : 0));
+    CHECK(moodCount(ctx, ar.b, "Any Ship Lost") == 0);   // units are not ships
+    // A whole group killed gives +0.1; single members give nothing (spec 04 §15).
+    if (left == 0) CHECK(s.vehicle(gun)->experienceTenths == 1);
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    const int sp = pieceOf(rec, group);
+    std::map<int, int> firesPerRound;
+    for (const CombatEvent& e : rec.events)
+        if (e.kind == CombatEvent::Kind::Fire && static_cast<int>(e.piece) == sp) ++firesPerRound[e.round];
+    int most = 0;
+    for (const auto& [round, n] : firesPerRound) most = std::max(most, n);
+    CHECK(most >= 2);   // each satellite's gun fires on its own
+    CHECK(most <= 5);
+}
+
+TEST_CASE("combat: mines strike the entering group only, straight to the components") {
+    {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        const DesignId mine = design(s, ar.b, "Mine", "Test Mine Hull", {"Test Warhead"});
+        const VehicleId field = spawn(s, mine, ar.loc, 3);
+        const VehicleId victim = spawn(s, frigate(s, ar.a, "Victim", 1, {"Test Armor Plate", "Test Shield"}), ar.loc);   // 130 structure
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        CHECK(s.vehicle(victim)->count == 0);   // 60-point warheads; shields do not help
+        CHECK(s.vehicle(field)->count <= 1);
+        CHECK(s.combats.empty());               // mines are not a battle
+        CHECK(moodCount(ctx, ar.a, "Any Ship Lost") == 1);
+        CHECK(s.design(mine).enemyTonnageDestroyed == combatRules().hull(s.design(s.vehicle(victim)->design).hull).tonnage);
+    }
+    {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        const DesignId mine = design(s, ar.b, "Mine", "Test Mine Hull", {"Test Warhead"});
+        const VehicleId field = spawn(s, mine, ar.loc, 3);
+        const VehicleId sweeper = spawn(s, frigate(s, ar.a, "Sweeper", 1, {"Test Mine Sweeper"}), ar.loc);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        CHECK(s.vehicle(field)->count == 0);
+        CHECK(damageTaken(s, sweeper) == 0);
+        CHECK_FALSE(combat::combatPossible(combatRules(), s, ar.loc));
+    }
+    {
+        // Only the group that moved in is struck; a ship already there is left alone.
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        const DesignId mine = design(s, ar.b, "Mine", "Test Mine Hull", {"Test Warhead"});
+        const VehicleId field = spawn(s, mine, ar.loc, 1);
+        const VehicleId resident = spawn(s, frigate(s, ar.a, "Resident", 1, {"Test Armor Plate"}), ar.loc);
+        const VehicleId newcomer = spawn(s, frigate(s, ar.a, "Newcomer", 1, {"Test Armor Plate"}), ar.loc);
+        arriveFrom(s, newcomer, 1, 0);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        CHECK(s.vehicle(field)->count == 0);
+        CHECK(damageTaken(s, resident) == 0);
+        CHECK(damageTaken(s, newcomer) > 0);
+    }
+    {
+        // A group of an empire at peace with the mine owner is left alone. The
+        // vehicles movement names are struck group by group (a fleet, or one
+        // vehicle), so the peaceful group does not shield the hostile one.
+        Arena ar = makeArena(7, 3);
+        GameState& s = ar.s;
+        setTreaty(s, ar.b, ar.c, Treaty::NonAggression);
+        const DesignId mine = design(s, ar.b, "Mine", "Test Mine Hull", {"Test Warhead"});
+        const VehicleId field = spawn(s, mine, ar.loc, 2);
+        const VehicleId hostile = spawn(s, frigate(s, ar.a, "Hostile", 1, {"Test Armor Plate"}), ar.loc);
+        const VehicleId friendly = spawn(s, frigate(s, ar.c, "Friendly", 1, {"Test Armor Plate"}), ar.loc);
+        setTreaty(s, ar.a, ar.c, Treaty::NonAggression);
+        TurnContext ctx = context(s);
+        const std::vector<VehicleId> peaceful{friendly};
+        combat::resolveSpaceCombat(ctx, ar.loc, peaceful);
+        CHECK(s.vehicle(field)->count == 2);
+        CHECK(damageTaken(s, friendly) == 0);
+        // Nobody entered: no strike either.
+        combat::resolveSpaceCombat(ctx, ar.loc, std::span<const VehicleId>{});
+        CHECK(s.vehicle(field)->count == 2);
+        const std::vector<VehicleId> both{hostile, friendly};
+        combat::resolveSpaceCombat(ctx, ar.loc, both);
+        const bool used = s.vehicle(field) == nullptr || s.vehicle(field)->count < 2;
+        CHECK(used);
+        CHECK(damageTaken(s, friendly) == 0);
+        CHECK(damageTaken(s, hostile) > 0);
+    }
+}
+
+TEST_CASE("combat: planets fight with platforms, then lose population and facilities") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    Colony& home = homeworld(s, ar.b);
+    const ObjectId planet = home.planet;
+    const Location there = locationOf(s.galaxy, planet);
+    home.population = {{ar.b, 1000}};
+    const size_t facilitiesBefore = home.facilities.size();
+    const DesignId platform = design(s, ar.b, "Bastion", "CT Platform Hull", {"CT Platform Core", "CT Platform Gun"});
+    home.cargo.units.push_back({platform, 2});
+    const DesignId bomber = frigate(s, ar.a, "Bomber", 3, {"CT Big Gun", "CT Big Armor", "CT Big Armor"});
+    const VehicleId attacker = spawn(s, bomber, there);
+
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, there);
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    auto pl = std::find_if(rec.pieces.begin(), rec.pieces.end(), [&](const CombatPiece& p) { return p.kind == CombatPiece::Kind::Planet && p.planet == planet; });
+    REQUIRE(pl != rec.pieces.end());
+    CHECK(pl->startX + 4 <= combat::kCombatMapWidth);
+    const Colony* after = s.colony(planet);
+    REQUIRE(after != nullptr);
+    CHECK(after->cargo.unitCount(platform) == 0);   // platforms go first
+    CHECK(s.design(platform).lost == 2);
+    const int64_t killed = 1000 - after->totalPopulation();
+    CHECK(killed > 0);
+    CHECK(killed % 10 == 0);   // each 100-point hit kills 100 / 10 = 10M
+    CHECK(moodCount(ctx, ar.b, "1M Population Killed") == killed);
+    CHECK(moodCount(ctx, ar.b, "Battle in Sector - Loss") + moodCount(ctx, ar.b, "Battle in Sector - Stalemate") == 1);
+    // Facilities fall to at most (hit points) / (starting hit points / facilities) (spec 04 §11).
+    CHECK(after->facilities.size() <= facilitiesBefore);
+    if (facilitiesBefore > 0) {
+        const int64_t start = 1000 * 10 + 2 * 40;
+        const int64_t per = start / static_cast<int64_t>(facilitiesBefore);
+        CHECK(static_cast<int64_t>(after->facilities.size()) >= after->totalPopulation() * 10 / per);
+    }
+    CHECK(s.vehicle(attacker)->count == 1);
+}
+
+TEST_CASE("combat: platforms shield the population until destroyed") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    Colony& home = homeworld(s, ar.b);
+    const ObjectId planet = home.planet;
+    home.population = {{ar.b, 1000}};
+    const DesignId fortress = design(s, ar.b, "Fortress", "CT Platform Hull", {"CT Big Armor", "CT Big Armor", "CT Platform Gun"});
+    home.cargo.units.push_back({fortress, 2});
+    const VehicleId plinker =
+        spawn(s, frigate(s, ar.a, "Plinker", 3, {"CT Gun", "CT Big Armor", "CT Big Armor", "CT Big Armor"}), locationOf(s.galaxy, planet));
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, locationOf(s.galaxy, planet));
+    REQUIRE(s.colony(planet) != nullptr);
+    REQUIRE(s.combats.size() == 1);
+    CHECK(hitsOn(s.combats.front(), pieceOf(s.combats.front(), plinker)) > 0);   // the platforms fire back
+    CHECK(s.colony(planet)->cargo.unitCount(fortress) == 2);
+    CHECK(s.colony(planet)->totalPopulation() == 1000);
+    CHECK(moodCount(ctx, ar.b, "1M Population Killed") == 0);
+}
+
+TEST_CASE("combat: each platform weapon fires on its own and keeps its reload") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    Colony& home = homeworld(s, ar.b);
+    home.population = {{ar.b, 1000}};
+    const DesignId platform = design(s, ar.b, "Mortar", "CT Platform Hull", {"CT Big Armor", "CT Slow Gun"});
+    home.cargo.units.push_back({platform, 2});
+    spawn(s, frigate(s, ar.a, "Tank", 2, {"CT Big Armor", "CT Big Armor", "CT Big Armor"}), locationOf(s.galaxy, home.planet));
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, locationOf(s.galaxy, home.planet));
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    std::map<int, int> perRound;
+    for (const CombatEvent& e : rec.events)
+        if (e.kind == CombatEvent::Kind::Fire && rec.pieces[e.piece].kind == CombatPiece::Kind::Planet) ++perRound[e.round];
+    REQUIRE_FALSE(perRound.empty());
+    // Two platforms, one gun each: two shots in a turn, then two turns of reloading.
+    for (const auto& [round, n] : perRound) {
+        CHECK(n == 2);
+        CHECK(perRound.count(round + 1) == 0);
+        CHECK(perRound.count(round + 2) == 0);
+    }
+}
+
+TEST_CASE("combat: planet-only weapons") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    Colony& home = homeworld(s, ar.b);
+    const ObjectId planet = home.planet;
+    home.population = {{ar.b, 1000}};
+    const DesignId fortress = design(s, ar.b, "Fortress", "CT Platform Hull", {"CT Big Armor", "CT Big Armor"});
+    home.cargo.units.push_back({fortress, 1});
+    spawn(s, frigate(s, ar.a, "Plague Ship", 3, {"CT Neutron Bomb", "CT Plague Bomb", "CT Big Armor"}), locationOf(s.galaxy, planet));
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, locationOf(s.galaxy, planet));
+    REQUIRE(s.colony(planet) != nullptr);
+    CHECK(s.colony(planet)->cargo.unitCount(fortress) == 1);   // untouched
+    const int64_t killed = 1000 - s.colony(planet)->totalPopulation();
+    CHECK(killed > 0);
+    CHECK(killed % 5 == 0);   // 50 / 10 per hit
+    CHECK(s.colony(planet)->plagueLevel == 2);
+}
+
+TEST_CASE("combat: conditions weapons lower a planet's conditions by D x 0.1") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    Colony& home = homeworld(s, ar.b);
+    home.population = {{ar.b, 1000}};
+    s.galaxy.object(home.planet).conditions = Conditions::hundredths(120);
+    spawn(s, frigate(s, ar.a, "Polluter", 3, {"CT Climate Bomb", "CT Big Armor"}), locationOf(s.galaxy, home.planet));
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, locationOf(s.galaxy, home.planet));
+    const int64_t after = s.galaxy.object(home.planet).conditions.inHundredths();
+    CHECK(after < 120);
+    CHECK(after >= 0);
+    CHECK((120 - after) % 10 == 0);   // each 1-point hit costs 0.1
+    CHECK(s.colony(home.planet)->totalPopulation() == 1000);
+}
+
+TEST_CASE("combat: a planet hit past its shields sheds cargo above its capacity; planet-only weapons never trim") {
+    // Spec 02 §2, §13 Q49, Q54 (confirmed: binary): after each hit of a
+    // hull-damaging type that gets past the shields, inside the battle; the
+    // population held as cargo goes first, 1M at a time. The planet-only types never trim.
+    const Rules& r = combatRules();
+    for (const bool bomb : {true, false}) {
+        CAPTURE(bomb);
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        Colony& home = homeworld(s, ar.b);
+        home.population = {{ar.b, 1000}};
+        home.cargo.units.clear();
+        const int64_t capacity = colonyCargoCapacity(r, s, home);
+        const int64_t mass = r.setting("Population Mass", 5);
+        home.cargo.population = {{ar.b, capacity / mass + 3}};
+        REQUIRE(cargoSpaceUsed(r, s, home.cargo) > capacity);
+        spawn(s, frigate(s, ar.a, "Bomber", 3, {bomb ? "CT Neutron Bomb" : "CT Gun", "CT Big Armor"}), locationOf(s.galaxy, home.planet));
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, locationOf(s.galaxy, home.planet));
+        REQUIRE(s.colony(home.planet) != nullptr);
+        REQUIRE(s.colony(home.planet)->totalPopulation() < 1000);  // it took damage
+        REQUIRE(s.colony(home.planet)->cargo.population.size() == 1);
+        CHECK(s.colony(home.planet)->cargo.population[0].millions == (bomb ? capacity / mass + 3 : capacity / mass));
+    }
+}
+
+TEST_CASE("combat: the empire that destroys a ship gains its hull tonnage div 10 as experience") {
+    // Spec 02 §9: empire experience, only shown.
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const DesignId hunter = frigate(s, ar.a, "Hunter", 3, {"CT Big Gun", "CT Big Armor"});
+    const DesignId prey = frigate(s, ar.b, "Prey", 1, {});
+    spawn(s, hunter, ar.loc);
+    const VehicleId victim = spawn(s, prey, ar.loc);
+    s.empire(ar.a).experience = 7;
+    s.empire(ar.b).experience = 0;
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, ar.loc);
+    REQUIRE(s.vehicle(victim)->count == 0);
+    CHECK(s.empire(ar.a).experience == 7 + combatRules().hull(s.design(prey).hull).tonnage / 10);
+    CHECK(s.empire(ar.b).experience == 0);
+}
+
+TEST_CASE("combat: bombardment can wipe out a colony; the planet stays on the map") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    Colony& home = homeworld(s, ar.b);
+    const ObjectId planet = home.planet;
+    home.population = {{ar.b, 1}};
+    const std::array<int, 3> values = s.galaxy.object(planet).value;
+    spawn(s, frigate(s, ar.a, "Bomber", 3, {"CT Big Gun"}), locationOf(s.galaxy, planet));
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, locationOf(s.galaxy, planet));
+    CHECK(s.colony(planet) == nullptr);
+    // The population died out (spec 02 §2): each value drops by `Planet Value Percent Loss After Owner Death`.
+    for (size_t k = 0; k < 3; ++k) CHECK(s.galaxy.object(planet).value[k] == std::max(0, values[k] - 10));
+    // A starting planet's colony type is "Homeworld" (spec 02 §2).
+    CHECK(moodCount(ctx, ar.b, "Homeworld Lost") == 1);
+    CHECK(moodCount(ctx, ar.b, "Any Planet Lost") == 0);
+    CHECK(moodCount(ctx, ar.b, "1M Population Killed") == 1);
+    CHECK(moodCount(ctx, ar.a, "Battle in System - Win") == 1);
+    REQUIRE(s.combats.size() == 1);
+    CHECK(countEvents(s.combats.front(), CombatEvent::Kind::Destroyed) == 1);
+}
+
+TEST_CASE("combat: planets launch up to 100 of each kind per combat turn") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    Colony& home = homeworld(s, ar.b);
+    home.population = {{ar.b, 1000}};
+    const DesignId fighter = design(s, ar.b, "Hornet", "Test Fighter Hull", {"Test Fighter Engine", "Test Fighter Gun", "CT Fighter Fuel"});
+    home.cargo.units.push_back({fighter, 150});
+    spawn(s, frigate(s, ar.a, "Visitor", 2, {"CT Big Armor", "CT Big Armor"}), locationOf(s.galaxy, home.planet));
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, locationOf(s.galaxy, home.planet));
+    REQUIRE(s.combats.size() == 1);
+    std::map<int, int> perRound;
+    for (const CombatEvent& e : s.combats.front().events)
+        if (e.kind == CombatEvent::Kind::Launch) perRound[e.round] += e.amount;
+    CHECK(perRound[1] == 100);
+    CHECK(perRound[2] == 50);
+}
+
+TEST_CASE("combat: boarding captures ships; crew quarters, security and self-destruct resist") {
+    auto board = [](std::initializer_list<std::string_view> defenderParts) {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        useStrategy(s, ar.a, {{"Primary Movement Strategy", "Board Enemy Ships"}, {"Secondary Movement Strategy", "Don't Get Hurt"}});
+        const DesignId boarderDesign = frigate(s, ar.a, "Boarder", 4, {"Test Boarding Party", "Test Boarding Party"});
+        const VehicleId boarder = spawn(s, boarderDesign, ar.loc);
+        Design prize;
+        prize.owner = ar.b;
+        prize.name = "Prize";
+        prize.hull = hullIndex(combatRules(), "Test Frigate");
+        for (auto c : {"Test Bridge", "Test Life Support", "Test Crew Quarters", "Test Engine"})
+            prize.entries.push_back({componentIndex(combatRules(), c), -1});
+        for (auto c : defenderParts) prize.entries.push_back({componentIndex(combatRules(), c), -1});
+        const DesignId prizeDesign = addDesign(s, prize);
+        const VehicleId target = spawn(s, prizeDesign, ar.loc);
+        s.vehicle(target)->experience = 12;
+        s.vehicle(target)->orders.push_back(Order{OrderKind::Sentry});
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        return std::tuple{std::move(ar), boarder, target, std::move(ctx.moodEvents)};
+    };
+    {
+        auto [ar, boarder, target, moods] = board({});
+        const GameState& s = ar.s;
+        REQUIRE(s.vehicle(target) != nullptr);
+        CHECK(s.vehicle(target)->owner == ar.a);   // 40 attack against 4 (one crew quarters)
+        CHECK(s.vehicle(target)->experience == 0);
+        CHECK(s.vehicle(target)->orders.empty());
+        // The boarding parties are spent.
+        CHECK_FALSE(entryIntact(combatRules(), s, *s.vehicle(boarder), 7));
+        CHECK_FALSE(entryIntact(combatRules(), s, *s.vehicle(boarder), 8));
+        REQUIRE(s.combats.size() == 1);
+        CHECK(countEvents(s.combats.front(), CombatEvent::Kind::Captured) == 1);
+        int lost = 0;
+        for (const MoodEvent& m : moods)
+            if (m.empire == ar.b && m.trigger == "Any Ship Lost") lost += m.count;
+        CHECK(lost == 1);
+    }
+    {
+        // 40 attack against 40 + 4: a strict comparison. The strategy only boards
+        // a ship whose defense is below its attack, so it makes no attempt and
+        // keeps its boarding parties (spec 04 §16.1, §19.2 Q69).
+        auto [ar, boarder, target, moods] = board({"Test Security Station", "Test Security Station"});
+        const GameState& s = ar.s;
+        CHECK(s.vehicle(target)->owner == ar.b);
+        CHECK(entryIntact(combatRules(), s, *s.vehicle(boarder), 7));
+        CHECK(countEvents(s.combats.front(), CombatEvent::Kind::Captured) == 0);
+    }
+    {
+        auto [ar, boarder, target, moods] = board({"Test Crew Quarters", "Test Crew Quarters", "Test Crew Quarters", "Test Crew Quarters",
+                                                   "Test Crew Quarters", "Test Crew Quarters", "Test Crew Quarters", "Test Crew Quarters",
+                                                   "Test Crew Quarters"});
+        CHECK(ar.s.vehicle(target)->owner == ar.b);   // ten crew quarters: 40 against 40
+    }
+    {
+        auto [ar, boarder, target, moods] = board({"Test Self Destruct"});
+        const GameState& s = ar.s;
+        CHECK(s.vehicle(target)->count == 0);
+        CHECK(s.vehicle(boarder)->count == 0);
+    }
+}
+
+TEST_CASE("combat: crew conversion takes ships without a master computer") {
+    for (const bool computer : {false, true}) {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        spawn(s, frigate(s, ar.a, "Preacher", 3, {"CT Converter", "CT Always Hit", "CT Big Armor"}), ar.loc);
+        const VehicleId target = computer ? spawn(s, frigate(s, ar.b, "Robot", 1, {"Test Master Computer"}), ar.loc)
+                                          : spawn(s, frigate(s, ar.b, "Crewed", 1, {}), ar.loc);
+        s.vehicle(target)->experience = 7;
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        CHECK(s.vehicle(target)->owner == (computer ? ar.b : ar.a));
+        CHECK(s.vehicle(target)->experience == 7);   // conversion keeps the crew's experience
+    }
+}
+
+TEST_CASE("combat: tractor beams push by hull size and jammers slow reloads") {
+    auto moves = [](std::string_view tugHull, bool satellites) {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        Design tug;
+        tug.owner = ar.a;
+        tug.name = "Tug";
+        tug.hull = hullIndex(combatRules(), tugHull);
+        for (auto c : {"Test Bridge", "Test Life Support", "Test Crew Quarters", "Test Engine", "Test Engine", "Test Engine", "CT Tractor",
+                       "CT Always Hit", "CT Fuel Pod"})
+            tug.entries.push_back({componentIndex(combatRules(), c), -1});
+        spawn(s, addDesign(s, tug), ar.loc);
+        // Point Blank: a tractor beam deals no damage the attack map counts (spec 04 §16.1).
+        useStrategy(s, ar.a, {{"Primary Movement Strategy", "Point Blank"}});
+        const VehicleId target = satellites ? spawn(s, design(s, ar.b, "Buoy", "Test Satellite Hull", {"Test Armor Plate"}), ar.loc, 2)
+                                            : spawn(s, design(s, ar.b, "Station", "Test Station", {"Test Bridge", "CT Big Armor"}), ar.loc);
+        warpIn(s, target);   // beside the tug in the middle of the map
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE(s.combats.size() == 1);
+        const CombatRecord& rec = s.combats.front();
+        const int tp = pieceOf(rec, target);
+        int n = 0;
+        for (const CombatEvent& e : rec.events)
+            if (e.kind == CombatEvent::Kind::Move && static_cast<int>(e.piece) == tp) ++n;
+        return n;
+    };
+    CHECK(moves("Test Frigate", true) > 0);      // satellites cannot move by themselves
+    CHECK(moves("Test Frigate", false) == 0);    // a 150 kT hull cannot move a 500 kT base
+    CHECK(moves("CT Giant Hull", false) > 0);    // a 900 kT one can
+    auto shotsByStation = [](bool jam) {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        if (jam) spawn(s, frigate(s, ar.a, "Jammer", 3, {"CT Jammer", "CT Always Hit", "CT Big Armor", "CT Big Armor"}), ar.loc);
+        else spawn(s, frigate(s, ar.a, "Gunner", 3, {"CT Gun", "CT Always Hit", "CT Big Armor", "CT Big Armor"}), ar.loc);
+        const VehicleId station = spawn(s, design(s, ar.b, "Gun Station", "Test Station", {"Test Bridge", "CT Long Gun", "CT Big Armor"}), ar.loc);
+        warpIn(s, station);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE(s.combats.size() == 1);
+        const CombatRecord& rec = s.combats.front();
+        int shots = 0;
+        for (const CombatEvent& e : rec.events)
+            if (e.kind == CombatEvent::Kind::Fire && rec.pieces[e.piece].vehicle == station) ++shots;
+        return shots;
+    };
+    const int free = shotsByStation(false);
+    const int jammed = shotsByStation(true);
+    CHECK(free > 0);
+    CHECK(jammed < free);
+}
+
+TEST_CASE("combat: a ship without supplies neither fires nor raises shields; bases need none") {
+    {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        const VehicleId dry = spawn(s, frigate(s, ar.a, "Dry", 2, {"CT Gun", "Test Shield", "CT Big Armor"}), ar.loc);
+        s.vehicle(dry)->supply = 0;
+        spawn(s, frigate(s, ar.b, "Target", 1, {"CT Big Armor"}), ar.loc);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE(s.combats.size() == 1);
+        const int dp = pieceOf(s.combats.front(), dry);
+        for (const CombatEvent& e : s.combats.front().events) CHECK(!(e.kind == CombatEvent::Kind::Fire && static_cast<int>(e.piece) == dp));
+    }
+    {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        const VehicleId base = spawn(s, design(s, ar.a, "Fort", "Test Station", {"Test Bridge", "CT Gun", "CT Big Armor"}), ar.loc);
+        // Bases hold unlimited supply (spec 03 §7); even with none they fire.
+        s.vehicle(base)->supply = 0;
+        warpIn(s, spawn(s, frigate(s, ar.b, "Target", 1, {"CT Gun", "CT Big Armor"}), ar.loc));   // armed, beside the fort
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE(s.combats.size() == 1);
+        const int bp = pieceOf(s.combats.front(), base);
+        CHECK(std::any_of(s.combats.front().events.begin(), s.combats.front().events.end(),
+                          [&](const CombatEvent& e) { return e.kind == CombatEvent::Kind::Fire && static_cast<int>(e.piece) == bp; }));
+    }
+}
+
+TEST_CASE("combat: don't get hurt keeps out of reach") {
+    // A fast skirmisher with a long gun against a slow brawler with a short one,
+    // which comes in through a warp point beside it.
+    auto fight = [](std::string_view movement) {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        useStrategy(s, ar.a, {{"Primary Movement Strategy", std::string(movement)}});
+        const VehicleId skirmisher = spawn(s, frigate(s, ar.a, "Skirmisher", 6, {"CT Long Gun", "CT Big Armor"}), ar.loc);
+        const VehicleId brawler = spawn(s, frigate(s, ar.b, "Brawler", 1, {"CT Short Gun", "CT Big Armor"}), ar.loc);
+        warpIn(s, brawler);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        const CombatRecord& rec = s.combats.front();
+        return std::pair{hitsOn(rec, pieceOf(rec, skirmisher)), hitsOn(rec, pieceOf(rec, brawler))};
+    };
+    const auto [evaderHurt, evaderDealt] = fight("Don't Get Hurt");
+    const auto [closerHurt, closerDealt] = fight("Point Blank");
+    CHECK(closerHurt >= 100);          // at point blank the brawler hits nearly every turn
+    CHECK(evaderHurt * 5 <= closerHurt);
+    (void)evaderDealt;
+    (void)closerDealt;
+}
+
+TEST_CASE("combat: don't get hurt runs from the mass of enemies, spreading from its friends") {
+    // Spec 04 §16.1: the square within its movement that is farthest by
+    // weighted straight-line distance (10 per hostile piece, 3 per own piece),
+    // taken or not, ties to the smallest column; always the full move.
+    Arena ar = makeArena(5);
+    GameState& s = ar.s;
+    useStrategy(s, ar.a, {{"Primary Movement Strategy", "Don't Get Hurt"}});
+    const VehicleId runner = spawn(s, frigate(s, ar.a, "Runner", 4, {"CT Big Armor"}), ar.loc);
+    const VehicleId hunter = spawn(s, design(s, ar.b, "Hunter", "Test Station", {"Test Bridge", "CT Big Armor"}), ar.loc);
+    warpIn(s, hunter);
+    combat::TacticalBattle b(combatRules(), s, combat::TacticalBattle::Setup{ar.loc, std::vector<VehicleId>{}, {ar.a}});
+    REQUIRE(b.phaseEmpire() == ar.a);
+    int ri = -1, hi = -1;
+    for (size_t i = 0; i < b.pieces().size(); ++i) {
+        if (b.pieces()[i].vehicle == runner) ri = static_cast<int>(i);
+        if (b.pieces()[i].vehicle == hunter) hi = static_cast<int>(i);
+    }
+    REQUIRE(ri >= 0);
+    REQUIRE(hi >= 0);
+    const combat::TacticalPiece r0 = b.pieces()[static_cast<size_t>(ri)];
+    const combat::TacticalPiece h = b.pieces()[static_cast<size_t>(hi)];
+    const int mp = r0.movement;
+    REQUIRE(mp > 0);
+    // The best square by the rule, worked out here: hostile pieces (the hunter) weigh 10, own ones (the runner itself) 3.
+    auto score = [&](int x, int y) {
+        auto dist = [](int64_t w, int dx, int dy) {
+            const double d = std::sqrt(static_cast<double>(dx * dx + dy * dy));
+            return static_cast<int64_t>(std::floor(static_cast<double>(w) * d + 1e-9));
+        };
+        return dist(10, h.x - x, h.y - y) + dist(3, r0.x - x, r0.y - y);
+    };
+    int bx = -1, by = -1;
+    int64_t best = -1;
+    for (int x = std::max(0, r0.x - mp); x <= std::min(combat::kCombatMapWidth - 1, r0.x + mp); ++x)
+        for (int y = std::max(0, r0.y - mp); y <= std::min(combat::kCombatMapHeight - 1, r0.y + mp); ++y)
+            if (score(x, y) > best) {
+                best = score(x, y);
+                bx = x;
+                by = y;
+            }
+    REQUIRE(b.submit(combat::TacticalOrder{combat::TacticalOrder::Kind::Auto, ar.a, ri}).empty());
+    const combat::TacticalPiece& r1 = b.pieces()[static_cast<size_t>(ri)];
+    CHECK(r1.x == bx);
+    CHECK(r1.y == by);
+    CHECK(std::max(std::abs(r1.x - r0.x), std::abs(r1.y - r0.y)) == mp);   // the full move, away from the hunter
+    CHECK(std::max(std::abs(r1.x - h.x), std::abs(r1.y - h.y)) > std::max(std::abs(r0.x - h.x), std::abs(r0.y - h.y)));
+}
+
+TEST_CASE("combat: kamikaze ships and drones ram") {
+    {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        useStrategy(s, ar.a, {{"Primary Movement Strategy", "Ram"}});
+        const DesignId rammerDesign = frigate(s, ar.a, "Rammer", 4, {"Test Warhead"});
+        const VehicleId rammer = spawn(s, rammerDesign, ar.loc);
+        const VehicleId hulk = spawn(s, design(s, ar.b, "Hulk", "Test Station", {"Test Bridge", "CT Big Armor"}), ar.loc);
+        warpIn(s, hulk);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        // The target takes 60 % of the rammer's 120 structure plus its 60-point warhead;
+        // the rammer takes the hulk's structure plus that warhead and does not survive (spec 04 §10.3).
+        REQUIRE(s.combats.size() == 1);
+        const CombatRecord& rec = s.combats.front();
+        CHECK(hitsOn(rec, pieceOf(rec, hulk)) == 72 + 60);
+        CHECK(hitsOn(rec, pieceOf(rec, rammer)) == 0);   // the return blow is no weapon hit
+        CHECK(s.vehicle(rammer)->count == 0);
+        // The recoil has no attacker: nobody is credited with the rammer (spec 04 §10.3).
+        CHECK(s.design(s.vehicle(hulk)->design).enemyTonnageDestroyed == 0);
+        CHECK(s.design(rammerDesign).enemyTonnageDestroyed == 0);   // the hulk survived
+    }
+    {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        useStrategy(s, ar.a, {{"Primary Movement Strategy", "Don't Get Hurt"}});   // the carrier keeps away
+        // Drones move by their strategies like any piece; Ram makes them ram (spec 04 §16.1).
+        s.empire(ar.a).strategies.push_back(testStrategy("Drone Attack", {{"Primary Movement Strategy", "Ram"}}));
+        const DesignId drone = design(s, ar.a, "Dart", "Test Drone Hull", {"Test Engine", "Test Engine", "Test Warhead"});
+        s.design(drone).strategy = 1;
+        const VehicleId carrier = spawn(s, frigate(s, ar.a, "Drone Carrier", 1, {"CT Drone Bay", "CT Big Armor"}), ar.loc);
+        s.vehicle(carrier)->cargo.units.push_back({drone, 2});
+        const VehicleId hulk = spawn(s, design(s, ar.b, "Hulk", "Test Station", {"Test Bridge", "CT Big Armor"}), ar.loc);
+        warpIn(s, hulk);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE(s.combats.size() == 1);
+        const CombatRecord& rec = s.combats.front();
+        // Every drone is a group of its own (spec 04 §10.7): each strikes with its warhead,
+        // then with 60 % of its own 30 hit points.
+        int groups = 0;
+        for (const CombatEvent& e : rec.events)
+            if (e.kind == CombatEvent::Kind::Launch && rec.pieces[e.piece].kind == CombatPiece::Kind::UnitGroup) {
+                CHECK(e.amount == 1);
+                ++groups;
+            }
+        CHECK(groups == 2);
+        CHECK(hitsOn(rec, pieceOf(rec, hulk)) == 2 * (60 + 18));
+        CHECK(s.vehicle(carrier)->cargo.unitCount(drone) == 0);
+        CHECK(s.design(drone).lost == 2);   // spent by their ram
+    }
+}
+
+// ---- Ground combat ------------------------------------------------------------------------------------------
+
+TEST_CASE("combat: landing troops needs a hostile, uncontested planet") {
+    Arena ar = makeArena(7, 3);
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    Colony& target = homeworld(s, ar.b);
+    const Location there = locationOf(s.galaxy, target.planet);
+    target.population = {{ar.b, 100}};
+    const DesignId troopA = design(s, ar.a, "Trooper A", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor"});
+    const DesignId troopC = design(s, ar.c, "Trooper C", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor"});
+    const VehicleId transportA = spawn(s, frigate(s, ar.a, "Transport A", 1, {"Test Cargo Bay"}), there);
+    const VehicleId transportC = spawn(s, frigate(s, ar.c, "Transport C", 1, {"Test Cargo Bay"}), there);
+    s.vehicle(transportA)->cargo.units.push_back({troopA, 4});
+    s.vehicle(transportC)->cargo.units.push_back({troopC, 4});
+
+    setTreaty(s, ar.a, ar.b, Treaty::NonAggression);
+    CHECK(combat::landTroops(r, s, transportA, target.planet, troopA, 4) == 0);
+    CHECK(target.militia == -1);
+    setTreaty(s, ar.a, ar.b, Treaty::War);
+    CHECK(combat::landTroops(r, s, transportA, target.planet, troopA, 3) == 3);
+    CHECK(s.vehicle(transportA)->cargo.unitCount(troopA) == 1);
+    // Landed troops are kept apart from the cargo, whose units serve the owner (spec 04 §13).
+    CHECK(target.landedTroops == std::vector<UnitStack>{{troopA, 3}});
+    CHECK(target.cargo.unitCount(troopA) == 0);
+    CHECK(target.invader == ar.a);
+    CHECK(target.militia == 5);   // the first landing raises the militia pool: 100M / 20
+    CHECK(combat::invaders(r, s, target) == std::vector<EmpireId>{ar.a});
+    // A third empire may not land on a contested planet.
+    CHECK(combat::landTroops(r, s, transportC, target.planet, troopC, 4) == 0);
+    // Wrong sector.
+    s.vehicle(transportA)->location = ar.loc;
+    CHECK(combat::landTroops(r, s, transportA, target.planet, troopA, 1) == 0);
+}
+
+TEST_CASE("combat: troops land and fight for the owner of the ship that drops them") {
+    Arena ar = makeArena(7, 3);
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    Colony& target = homeworld(s, ar.b);
+    const Location there = locationOf(s.galaxy, target.planet);
+    target.population = {{ar.b, 100}};
+    // A captured C's transport, troops and all: they are A's now (spec 04 §13, Q29).
+    const DesignId troopC = design(s, ar.c, "Trooper C", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor"});
+    const VehicleId prize = spawn(s, frigate(s, ar.c, "Prize", 1, {"Test Cargo Bay"}), there);
+    s.vehicle(prize)->cargo.units.push_back({troopC, 4});
+    s.vehicle(prize)->owner = ar.a;
+    CHECK(combat::landTroops(r, s, prize, target.planet, troopC, 4) == 4);
+    CHECK(target.invader == ar.a);
+    CHECK(combat::invaders(r, s, target) == std::vector<EmpireId>{ar.a});
+    // B's own troops of a captured A design, stored on B's planet, serve B: no invasion of their own.
+    Colony& home = homeworld(s, ar.a);
+    const DesignId troopA = design(s, ar.a, "Trooper A", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor"});
+    Colony& bHome = target;
+    bHome.cargo.units.push_back({troopA, 2});
+    CHECK(combat::invaders(r, s, bHome) == std::vector<EmpireId>{ar.a});   // only the landed ones
+    CHECK(combat::invaders(r, s, home).empty());
+}
+
+TEST_CASE("combat: ground combat captures a planet") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    Colony& target = homeworld(s, ar.b);
+    const ObjectId planet = target.planet;
+    target.population = {{ar.b, 20}};   // one militia unit
+    QueueItem item;
+    item.kind = QueueItem::Kind::Facility;
+    target.queue.items.push_back(item);
+    target.queue.onHold = true;
+    target.queue.repeat = true;
+    target.queue.autoWaypoint = 2;
+    target.queue.emergency = true;
+    target.queue.emergencyTurns = 3;
+    target.queue.slowTurns = 1;
+    const size_t facilities = target.facilities.size();
+    const DesignId trooper = design(s, ar.a, "Trooper", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor"});
+    const VehicleId transport = spawn(s, frigate(s, ar.a, "Transport", 1, {"Test Cargo Bay"}), locationOf(s.galaxy, planet));
+    s.vehicle(transport)->cargo.units.push_back({trooper, 10});
+    REQUIRE(combat::landTroops(r, s, transport, planet, trooper, 10) == 10);
+
+    // The attacker's own step fights nothing: the fight is the colony owner's (spec 04 §13).
+    TurnContext attackerStep = context(s);
+    combat::runGroundCombat(attackerStep, ar.a);
+    CHECK(s.colony(planet)->owner == ar.b);
+    CHECK(s.colony(planet)->landedTroops == std::vector<UnitStack>{{trooper, 10}});
+    TurnContext ctx = context(s);
+    combat::runGroundCombat(ctx, ar.b);
+    const Colony* after = s.colony(planet);
+    REQUIRE(after != nullptr);
+    CHECK(after->owner == ar.a);
+    CHECK(after->homeworld);  // a captured capital stays a capital (spec 02 §2, confirmed: binary)
+    // The queue gets the clear of a treaty transfer: the items, On Hold, Repeat
+    // Build and the waypoint go; emergency mode and its counter stay, so slow
+    // mode carries over to the captor (spec 02 §6.4, confirmed: binary).
+    CHECK(after->queue.items.empty());
+    CHECK_FALSE(after->queue.onHold);
+    CHECK_FALSE(after->queue.repeat);
+    CHECK(after->queue.autoWaypoint == -1);
+    CHECK(after->queue.emergency);
+    CHECK(after->queue.emergencyTurns == 3);
+    CHECK(after->queue.slowTurns == 1);
+    CHECK(after->facilities.size() == facilities);   // no facilities are lost in ground combat
+    CHECK(after->totalPopulation() == 20);            // the population now serves the captor
+    CHECK(after->cargo.unitCount(trooper) > 0);   // the surviving invaders join the cargo
+    CHECK(after->landedTroops.empty());
+    CHECK_FALSE(after->invader.valid());
+    CHECK(after->militia == -1);
+    CHECK(combat::invaders(r, s, *after).empty());
+    // The two capture events and no planet-lost event (spec 02 §2, confirmed: binary).
+    CHECK(moodCount(ctx, ar.b, "Any Our Planet Captured") == 1);
+    CHECK(moodCount(ctx, ar.b, "Homeworld Lost") == 0);
+    CHECK(moodCount(ctx, ar.b, "Any Planet Lost") == 0);
+    CHECK(moodCount(ctx, ar.a, "Any Enemy Planet Captured") == 1);
+    CHECK(std::any_of(s.empire(ar.a).log.begin(), s.empire(ar.a).log.end(), [](const LogEntry& l) { return l.category == LogCategory::Combat; }));
+    // Both histories list the capture under the other empire, at the planet.
+    for (auto [owner, other] : {std::pair{ar.a, ar.b}, std::pair{ar.b, ar.a}}) {
+        const auto& record = s.empire(owner).historyEvents;
+        REQUIRE(record.size() == 1);
+        CHECK(record[0].empire == other);
+        CHECK(record[0].location == std::optional<Location>(locationOf(s.galaxy, planet)));
+    }
+}
+
+TEST_CASE("combat: ground rounds carry damage and multiply by the ground percentage") {
+    // Troops with a +120 scope always hit (60 + 50 - 0 >= 100). Three rifles of 8
+    // make 24 a round; times 30 % that is 7, carried back as 23, and so on: the
+    // single militia unit (30 hit points) falls in round 5 (spec 04 §13).
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    Colony& target = homeworld(s, ar.b);
+    const ObjectId planet = target.planet;
+    target.population = {{ar.b, 20}};
+    const DesignId trooper = design(s, ar.a, "Marksman", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor", "CT Troop Scope"});
+    target.landedTroops = {{trooper, 3}};
+    target.invader = ar.a;
+    target.cargo = {};
+    target.militia = 1;
+    combat::detail::GroundFight fight;
+    fight.attacker = ar.a;
+    fight.defender = ar.b;
+    fight.invaders = &target.landedTroops;
+    fight.cargo = &target.cargo;
+    fight.population = &target.population;
+    fight.militia = &target.militia;
+    Rng rng(4);
+    const combat::detail::GroundOutcome o = combat::detail::fightGround(combatRules(), s, combat::loadSettings(combatRules()), fight, rng);
+    // The attackers' side of the fight, worked out with the same arithmetic.
+    const int racial = combat::detail::groundModifier(combatRules(), s.empire(ar.a));
+    int expected = 0;
+    int64_t carry = 0;
+    for (int round = 1; round <= 10 && expected == 0; ++round) {
+        const int64_t base = xmath::pctTrunc(24 + carry, 30);
+        const int64_t total = base + xmath::pctRound(base, racial);
+        if (total >= 30) expected = round;
+        carry = (xmath::Ext(total) / xmath::percent(30)).trunc();
+    }
+    CHECK(expected >= 4);
+    CHECK(o.captured);
+    CHECK(o.rounds == expected);
+    CHECK(o.militiaLost == 1);
+    CHECK(o.attackersLost == 0);
+    CHECK(target.militia == 0);   // the survivors are the new pool
+    CHECK(s.colony(planet)->landedTroops == std::vector<UnitStack>{{trooper, 3}});
+    CHECK((xmath::Ext(7) / xmath::percent(30)).trunc() == 23);
+}
+
+TEST_CASE("combat: militia repel a small invasion") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    Colony& target = homeworld(s, ar.b);
+    const ObjectId planet = target.planet;
+    target.population = {{ar.b, 2000}};   // 100 militia
+    const DesignId trooper = design(s, ar.a, "Trooper", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor"});
+    target.cargo = {};
+    target.landedTroops = {{trooper, 2}};
+    target.invader = ar.a;
+    const DesignId guard = design(s, ar.b, "Guard", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor"});
+    target.cargo.units.push_back({guard, 1});
+    TurnContext ctx = context(s);
+    combat::runGroundCombat(ctx, ar.b);
+    const Colony* after = s.colony(planet);
+    REQUIRE(after != nullptr);
+    CHECK(after->owner == ar.b);
+    CHECK(after->landedTroops.empty());
+    CHECK(s.design(trooper).lost == 2);
+    CHECK(combat::invaders(r, s, *after).empty());
+    CHECK(after->militia == -1);   // the invasion is over
+    CHECK(after->totalPopulation() == 2000);   // militia losses cost no population
+    // At peace by the owner's step: no fight; the landed troops join the colony's
+    // cargo and serve its owner, and the invasion ends (spec 04 §13).
+    target.landedTroops = {{trooper, 2}};
+    target.invader = ar.a;
+    target.militia = 100;
+    setTreaty(s, ar.a, ar.b, Treaty::NonAggression);
+    TurnContext calm = context(s);
+    combat::runGroundCombat(calm, ar.b);
+    const Colony* joined = s.colony(planet);
+    CHECK(joined->owner == ar.b);
+    CHECK(joined->cargo.unitCount(trooper) == 2);
+    CHECK(joined->landedTroops.empty());
+    CHECK_FALSE(joined->invader.valid());
+    CHECK(joined->militia == -1);
+    CHECK(s.design(trooper).lost == 2);   // nobody fought
+}
+
+TEST_CASE("combat: troops dropped during a space battle fight at once") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    useStrategy(s, ar.a, {{"Primary Movement Strategy", "Drop Troops (if carrying)"}, {"Secondary Movement Strategy", "Don't Get Hurt"}});
+    Colony& target = homeworld(s, ar.b);
+    const ObjectId planet = target.planet;
+    const Location there = locationOf(s.galaxy, planet);
+    target.population = {{ar.b, 20}};
+    const DesignId trooper = design(s, ar.a, "Trooper", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor", "CT Troop Scope"});
+    const VehicleId transport = spawn(s, frigate(s, ar.a, "Lander", 3, {"Test Cargo Bay"}), there);
+    s.vehicle(transport)->cargo.units.push_back({trooper, 8});
+    TurnContext ctx = context(s);
+    combat::resolveSpaceCombat(ctx, there);
+    CHECK(s.vehicle(transport)->cargo.unitCount(trooper) == 0);
+    // The ground combat was fought in the middle of the battle and the planet changed sides.
+    REQUIRE(s.colony(planet) != nullptr);
+    CHECK(s.colony(planet)->owner == ar.a);
+    CHECK(s.colony(planet)->cargo.unitCount(trooper) > 0);
+    REQUIRE(s.combats.size() == 1);
+    CHECK(countEvents(s.combats.front(), CombatEvent::Kind::Launch) >= 1);
+    CHECK(countEvents(s.combats.front(), CombatEvent::Kind::Captured) == 1);
+    CHECK(moodCount(ctx, ar.b, "Any Our Planet Captured") == 1);
+    // The Ground Combat window's record: both sides as the fight began, and what was left.
+    const CombatRecord& rec = s.combats.front();
+    REQUIRE(rec.grounds.size() == 1);
+    const GroundCombat& g = rec.grounds.front();
+    CHECK(g.planet == planet);
+    CHECK(g.attacker == ar.a);
+    CHECK(g.defender == ar.b);
+    CHECK(g.population == 20);
+    CHECK(g.captured);
+    CHECK(g.rounds >= 1);
+    CHECK(rec.pieces[g.planetPiece].planet == planet);
+    CHECK(rec.pieces[g.troopShip].vehicle == transport);
+    REQUIRE(g.attackers == std::vector<UnitStack>{{trooper, 8}});
+    REQUIRE(g.attackersLeft.size() == 1);
+    CHECK(g.attackersLeft.front().count == s.colony(planet)->cargo.unitCount(trooper));
+    CHECK(g.militia == 1);   // 20M: one militia unit
+    CHECK(g.militiaLeft == 0);
+}
+
+// ---- Determinism --------------------------------------------------------------------------------------------
+
+TEST_CASE("combat: battles are deterministic") {
+    auto run = [] {
+        Arena ar = makeArena(21);
+        GameState& s = ar.s;
+        const DesignId fighter = design(s, ar.a, "Wasp", "Test Fighter Hull", {"Test Fighter Engine", "Test Fighter Gun", "CT Fighter Fuel"});
+        const VehicleId carrier = spawn(s, frigate(s, ar.a, "Carrier", 2, {"Test Fighter Bay", "Test Laser", "Test Shield"}), ar.loc);
+        s.vehicle(carrier)->cargo.units.push_back({fighter, 3});
+        spawn(s, frigate(s, ar.a, "Escort", 3, {"Test Laser", "Test Laser", "Test Armor Plate"}), ar.loc);
+        const VehicleId raider = spawn(s, frigate(s, ar.b, "Raider", 3, {"CT Torpedo", "Test Laser", "Test Armor Plate"}), ar.loc);
+        spawn(s, frigate(s, ar.b, "Picket", 2, {"CT PD", "Test Disruptor", "Test Armor Plate"}), ar.loc);
+        arriveFrom(s, raider, 0, -1);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        return std::move(ar.s);
+    };
+    const GameState x = run();
+    const GameState y = run();
+    REQUIRE(x.combats.size() == 1);
+    REQUIRE(y.combats.size() == 1);
+    const auto& ex = x.combats.front().events;
+    const auto& ey = y.combats.front().events;
+    REQUIRE(ex.size() == ey.size());
+    CHECK(ex.size() > 10);
+    for (size_t i = 0; i < ex.size(); ++i) {
+        CHECK(ex[i].kind == ey[i].kind);
+        CHECK(ex[i].round == ey[i].round);
+        CHECK(ex[i].piece == ey[i].piece);
+        CHECK(ex[i].target == ey[i].target);
+        CHECK(ex[i].x == ey[i].x);
+        CHECK(ex[i].y == ey[i].y);
+        CHECK(ex[i].amount == ey[i].amount);
+    }
+    REQUIRE(x.vehicles.size() == y.vehicles.size());
+    for (size_t i = 0; i < x.vehicles.size(); ++i) {
+        CHECK(x.vehicles[i].damage == y.vehicles[i].damage);
+        CHECK(x.vehicles[i].count == y.vehicles[i].count);
+        CHECK(x.vehicles[i].cargo.units == y.vehicles[i].cargo.units);
+    }
+    CHECK(x.rng == y.rng);
+}
+
+// ---- Turn pipeline ------------------------------------------------------------------------------------------
+
+TEST_CASE("combat: ground combat runs in the turn pipeline") {
+    Arena ar = makeArena();
+    GameState& s = ar.s;
+    const Rules& r = combatRules();
+    Colony& target = homeworld(s, ar.b);
+    const ObjectId planet = target.planet;
+    target.population = {{ar.b, 10}};   // no militia below 20M
+    const DesignId trooper = design(s, ar.a, "Trooper", "Test Troop Hull", {"Test Troop Rifle", "Test Troop Armor"});
+    target.landedTroops = {{trooper, 10}};
+    target.invader = ar.a;
+    std::vector<EmpireOrders> none;
+    TurnOptions opts;
+    opts.aiForMissing = false;
+    processTurn(r, s, none, opts);
+    CHECK(s.colony(planet)->owner == ar.a);
+}
+
+// ---- Installed data (opt-in: OPENSE4_CLASSIC_DATA=auto or a data directory) --------------------------------
+
+namespace {
+
+const Rules* installedRules() {
+    static const std::unique_ptr<Rules> rules = []() -> std::unique_ptr<Rules> {
+        const char* env = std::getenv("OPENSE4_CLASSIC_DATA");
+        if (!env) return nullptr;
+        auto dir = ruleset::findInstalledDataDir(std::string_view(env) == "auto" ? std::filesystem::path{} : std::filesystem::path(env));
+        if (!dir) return nullptr;
+        auto loaded = ruleset::loadRuleset(*dir);
+        if (!loaded.ruleset) return nullptr;
+        return std::make_unique<Rules>(std::move(*loaded.ruleset), dir->parent_path());
+    }();
+    return rules.get();
+}
+
+} // namespace
+
+TEST_CASE("installed data set: combat identifiers and strategies parse (opt-in)") {
+    const Rules* r = installedRules();
+    if (!r) return;
+    int weapons = 0;
+    for (const ruleset::Component& c : r->data().components) {
+        if (!c.isWeapon()) continue;
+        ++weapons;
+        INFO(c.name);
+        const combat::DamageType t = combat::parseDamageType(c.weapon.damageType);
+        CHECK(datafile::keysEqual(combat::identifier(t), c.weapon.damageType));
+        CHECK(combat::parseWeaponTargets(c.weapon.targets) != 0);
+    }
+    CHECK(weapons > 50);
+    REQUIRE(r->data().combatStrategies.size() >= 5);
+    for (const ruleset::CombatStrategy& raw : r->data().combatStrategies) {
+        INFO(raw.name);
+        const combat::Strategy st = combat::parseStrategy(raw);
+        CHECK(st.targeting[0] != combat::TargetKey::None);
+        for (size_t c = 0; c < combat::kTargetCategories; ++c) CHECK(st.typePriority[c] > 0);
+    }
+}
+
+TEST_CASE("installed data set: a battle between starting warships (opt-in)") {
+    const Rules* r = installedRules();
+    if (!r) return;
+    GameSetup setup;
+    setup.seed = 5;
+    setup.options.systemCount = 20;
+    setup.options.startTechLevel = 2;
+    for (size_t i = 0; i < 2; ++i) {
+        EmpireSetup e;
+        e.preset = r->racePresets()[i * 5 % r->racePresets().size()].folder;
+        setup.empires.push_back(e);
+    }
+    auto game = createGame(*r, setup);
+    REQUIRE(game.has_value());
+    GameState& s = *game;
+    setTreaty(s, EmpireId{0u}, EmpireId{1u}, Treaty::War);
+    const Location where = locationOf(s.galaxy, homeworld(s, EmpireId{1u}).planet);
+    // The Design minister's attack ship may carry special weapons; give it the first plain direct-fire gun instead.
+    std::optional<uint32_t> plainGun;
+    for (uint32_t c = 0; c < r->data().components.size() && !plainGun; ++c) {
+        const ruleset::Component& comp = r->component(c);
+        if (comp.weapon.kind == WeaponKind::DirectFire && datafile::keysEqual(comp.weapon.damageType, "Normal") &&
+            (comp.vehicles & ruleset::maskOf(VehicleType::Ship)) &&
+            (combat::parseWeaponTargets(comp.weapon.targets) & combat::kTargetShips))
+            plainGun = c;
+    }
+    REQUIRE(plainGun.has_value());
+    for (uint32_t e = 0; e < 2; ++e) {
+        ai::designMinisterRun(*r, s, EmpireId{e});  // as a Quick Start player's designs
+        std::optional<Design> d;
+        for (DesignId id : s.empire(EmpireId{e}).designs)
+            if (s.design(id).designType == "Attack Ship") d = s.design(id);
+        REQUIRE(d.has_value());
+        d->name = std::format("Test Warship {}", e);
+        for (DesignEntry& entry : d->entries)
+            if (r->component(entry.component).isWeapon()) entry = {*plainGun, -1};
+        const DesignId id = addDesign(s, *d);
+        for (int k = 0; k < 3; ++k) movement::spawnVehicle(*r, s, EmpireId{e}, id, where);
+    }
+    CHECK(combat::combatPossible(*r, s, where));
+    TurnContext ctx{*r, s, {}, {}, {}};
+    combat::resolveSpaceCombat(ctx, where);
+    REQUIRE(s.combats.size() == 1);
+    const CombatRecord& rec = s.combats.front();
+    CHECK(countEvents(rec, CombatEvent::Kind::Fire) > 0);
+    CHECK(countEvents(rec, CombatEvent::Kind::Hit) > 0);
+    for (const CombatEvent& e : rec.events) {
+        CHECK(e.round <= 30);
+        CHECK(e.x < combat::kCombatMapWidth);
+        CHECK(e.y < combat::kCombatMapHeight);
+    }
+    // The homeworld is a 4x4 piece; the system's other objects in its sector are obstacles.
+    CHECK(std::any_of(rec.pieces.begin(), rec.pieces.end(), [](const CombatPiece& p) { return p.kind == CombatPiece::Kind::Planet; }));
+}
+
+
+TEST_CASE("combat: a battle that decloaks a piece runs the first-contact check; one that decloaks nothing does not") {
+    for (const bool cloaked : {false, true}) {
+        CAPTURE(cloaked);
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        for (Empire& e : s.empires)
+            for (Relation& rel : e.relations) rel.contact = false;  // nobody has met yet
+        // A's uncloaked spotter sees B's ship, so the battle starts either way;
+        // its cloaked companion is what the battle decloaks.
+        spawn(s, frigate(s, ar.a, "Spotter", 1, {"CT Big Gun"}), ar.loc);
+        const VehicleId lurker = spawn(s, frigate(s, ar.a, "Lurker", 1, {"CT Big Gun", "CT Cloak"}), ar.loc);
+        if (cloaked) s.vehicle(lurker)->status = VehicleStatus::Cloaked;
+        spawn(s, frigate(s, ar.b, "Target", 1, {}), ar.loc);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE_FALSE(s.combats.empty());
+        // Any decloak, the start of a battle included, runs the check (spec 05 §3.1).
+        CHECK(s.empire(ar.a).relation(ar.b).contact == cloaked);
+        CHECK(s.empire(ar.b).relation(ar.a).contact == cloaked);
+    }
+}
+
+TEST_CASE("combat: each hit's event tells whether it reached structure and whether the target survived (spec 06 §7 Q77)") {
+    SUBCASE("the shields take every hit") {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        // A's gun does 10 a hit against B's 60 points of shields.
+        spawn(s, frigate(s, ar.a, "Gunner", 1, {"CT Gun", "CT Always Hit"}), ar.loc);
+        const VehicleId shielded = spawn(s, frigate(s, ar.b, "Shielded", 1, {"Test Shield", "Test Shield", "Test Shield"}), ar.loc);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE_FALSE(s.combats.empty());
+        const CombatRecord& rec = s.combats.back();
+        const int sp = pieceOf(rec, shielded);
+        int hits = 0;
+        for (const CombatEvent& e : rec.events)
+            if (e.kind == CombatEvent::Kind::Hit && int(e.target) == sp) {
+                ++hits;
+                if (hits == 1) CHECK((e.flags & CombatEvent::kStructure) == 0);   // the first is absorbed whole
+            }
+        CHECK(hits > 0);
+    }
+    SUBCASE("a big gun reaches structure and destroys") {
+        Arena ar = makeArena();
+        GameState& s = ar.s;
+        spawn(s, frigate(s, ar.a, "Hunter", 1, {"CT Big Gun", "CT Always Hit"}), ar.loc);
+        const VehicleId prey = spawn(s, frigate(s, ar.b, "Prey", 1, {}), ar.loc);
+        TurnContext ctx = context(s);
+        combat::resolveSpaceCombat(ctx, ar.loc);
+        REQUIRE_FALSE(s.combats.empty());
+        const CombatRecord& rec = s.combats.back();
+        const int pp = pieceOf(rec, prey);
+        bool structure = false, killed = false;
+        for (const CombatEvent& e : rec.events)
+            if (e.kind == CombatEvent::Kind::Hit && int(e.target) == pp) {
+                structure = structure || (e.flags & CombatEvent::kStructure) != 0;
+                killed = killed || (e.flags & CombatEvent::kDestroyed) != 0;
+            }
+        CHECK(structure);
+        CHECK(killed == (s.vehicle(prey)->count == 0));
+    }
+}

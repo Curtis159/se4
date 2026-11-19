@@ -168,3 +168,20 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .simulator-sides{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.simulator-side{border:1px solid #30445d;border-radius:10px;padding:10px;min-width:0}.simulator-side>select,.simulator-side details select{width:100%;margin:6px 0}.simulator-side input[type=number]{width:75px}.simulator-item{border-top:1px solid #30445d;padding:10px 0;margin-top:8px}.simulator-item>strong{display:block}.fleet-member{display:flex;gap:8px;align-items:center;justify-content:space-between}@media(max-width:540px){.simulator-sides{gap:6px}.simulator-side{padding:7px}.simulator-item strong{font-size:12px}}
 
 #update-message{flex-basis:100%;margin:0;font-size:12px;line-height:1.4}#app-build{display:block;padding:8px 14px;color:var(--muted);font-size:11px}.app-update button[hidden]{display:none}
+
+/* Build 30: shared icon controls and phone-safe scores. */
+#game-content,.system-board,.sector-detail,.status-overview{min-width:0;max-width:100%}
+.icon-controls{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px;margin:12px 0;align-items:stretch}
+.icon-controls .icon-control{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;min-width:0;min-height:74px;padding:7px 4px;margin:0;border-radius:7px;text-align:center;line-height:1.2}
+.control-icon{display:block;float:none;width:34px;height:34px;object-fit:contain;margin:0;background:transparent;flex:none}
+.control-label{font-size:12px;overflow-wrap:anywhere}
+.ship-action-bar.icon-controls{grid-template-columns:repeat(auto-fit,minmax(72px,1fr))}
+.planet-indicators{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:5px 0}
+.planet-indicator{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:26px;background:#0c1727;border:1px solid var(--edge);border-radius:5px}
+.planet-status-icon{width:22px;height:22px;object-fit:contain;margin:0;float:none;background:transparent}
+.status-table.scores-table{width:100%;min-width:0;max-width:100%;table-layout:fixed;border-collapse:collapse}
+.scores-table th,.scores-table td{white-space:normal;overflow-wrap:anywhere;padding:9px;text-align:left}
+.scores-table th:first-child{width:62%}.scores-table td:last-child,.scores-table thead th:last-child{text-align:right;font-variant-numeric:tabular-nums}
+@media(max-width:700px){.status-subnav.icon-controls{grid-template-columns:repeat(3,minmax(0,1fr))}.icon-controls .icon-control{min-height:68px}.control-label{font-size:11px}.ship-action-bar.icon-controls{grid-template-columns:repeat(3,minmax(0,1fr))}}
+
+.save-dialog{width:min(420px,calc(100vw - 28px));max-width:100%;padding:20px;border:1px solid var(--edge);border-radius:12px;background:var(--panel);color:var(--ink)}.save-dialog::backdrop{background:#0009}.save-dialog h2{margin:0 0 14px}.save-dialog label{display:grid;gap:7px}.save-dialog input{width:100%}.save-dialog-actions{display:flex;justify-content:flex-end;gap:8px}.save-dialog-actions button:last-child{background:#2869ad}.save-name-error{color:#ff9393;font-size:12px}

@@ -120,6 +120,7 @@ void CombatPlayback::apply(const game::CombatEvent& e) {
     if (!validPiece(e.piece)) return;
     Piece& p = pieces_[e.piece];
     switch (e.kind) {
+        case Kind::RoundEnd: break;
         case Kind::Move:
             if (e.x != p.x || e.y != p.y) p.heading = headingOf(e.x - p.x, e.y - p.y);
             p.fromX = p.x;
@@ -276,6 +277,7 @@ std::vector<AnimationFrame> CombatPlayback::framesOf(size_t i) const {
         return record_ && p < record_->pieces.size() ? record_->pieces[p].kind : game::CombatPiece::Kind::Vehicle;
     };
     switch (e.kind) {
+        case Kind::RoundEnd: break;
         case Kind::Move:
         case Kind::Seeker: {
             if (!known) break;

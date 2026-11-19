@@ -9,10 +9,9 @@ export function turnTasks(s,{readNews=0,ignored=[]}={}){
  for(const colony of s.colonies){
   if(colony.population===0)continue;
   for(const yard of colony.yards||[])if(!yard.queue.length&&!yard.onHold&&!yard.doNothing&&yard.rate.some(n=>n>0))tasks.push({id:'yard:'+colony.planet+':'+yard.lane,label:s.designs.some(d=>['ship','base'].includes(d.vehicleType))?'Set shipyard queue':'Design a ship',detail:colony.name,tab:s.designs.some(d=>['ship','base'].includes(d.vehicleType))?'maps':'designs',...(s.designs.some(d=>['ship','base'].includes(d.vehicleType))?{planet:colony.planet}:{})});
-  if(colony.queue.length||colony.laborFocusActive||colony.onHold||!colony.constructionRate.some(n=>n>0))continue;
-  const facility=colony.facilities<colony.facilitySlots&&s.catalog.facilities.length>0;
-  const vehicle=s.designs.some(d=>(s.splitConstruction?!['ship','base'].includes(d.vehicleType):(colony.canBuildShips||!['ship','base'].includes(d.vehicleType))));
-  if(facility||vehicle)tasks.push({id:'colony:'+colony.planet,label:'Set planet queue',detail:colony.name,tab:'maps',planet:colony.planet});
+  if(colony.queue.length||colony.laborFocusActive)continue;
+  const full=colony.facilities>=colony.facilitySlots;
+  tasks.push({id:'colony:'+colony.planet,label:full?'Choose planet focus':'Build a facility',detail:colony.name,tab:'maps',planet:colony.planet});
  }
  for(const ship of s.ships)if(ship.hasYard&&!ship.yardOnHold&&!ship.yardDoNothing&&!ship.yardQueue.length&&ship.yardRate.some(n=>n>0))tasks.push({id:'shipyard:'+ship.id,label:'Set shipyard queue',detail:ship.name,tab:'maps',ship:ship.id});
  return tasks.filter(t=>!ignored.includes(t.id));

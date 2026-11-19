@@ -3814,12 +3814,10 @@ void Battle::setPlayers(std::vector<EmpireId> players, std::optional<std::vector
 }
 
 void Battle::advance(bool onePhase) {
-    // The counter starts at 1 and the battle ends when it reaches the setting:
-    // one turn fewer than `Number Of Space Combat Turns` (confirmed: binary). It
-    // also ends as soon as no two empires that still have pieces are hostile.
+    // Play the configured number of complete rounds, unless no hostile sides remain.
     while (stage_ == Stage::Between) {
         if (!roundOpen_) {
-            if (round_ >= cs_.spaceTurns) {
+            if (round_ > cs_.spaceTurns) {
                 round_ = lastRound();
                 stage_ = Stage::Finished;
                 return;
@@ -3829,6 +3827,10 @@ void Battle::advance(bool onePhase) {
             phaseIndex_ = 0;
         }
         if (phaseIndex_ >= order_.size()) {
+            // Preserve quiet rounds in saved replays as well as active ones.
+            CombatEvent boundary; boundary.kind = Ev::RoundEnd;
+            boundary.round = static_cast<uint8_t>(round_);
+            rec_.events.push_back(boundary);
             roundOpen_ = false;
             ++round_;
             if (strategic_) {
@@ -3837,7 +3839,7 @@ void Battle::advance(bool onePhase) {
                 // regeneration, movement), and only then checks its end (spec 04 §4,
                 // §19.2 Q70, confirmed: binary).
                 beginRound();
-                if (round_ >= cs_.spaceTurns || over()) {
+                if (round_ > cs_.spaceTurns || over()) {
                     round_ = std::min(round_ - 1, lastRound());
                     stage_ = Stage::Finished;
                     return;
